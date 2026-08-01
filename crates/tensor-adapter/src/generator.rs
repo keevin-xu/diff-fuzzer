@@ -172,6 +172,26 @@ mod tests {
         assert_eq!(from(1234), from(1234));
     }
 
+    /// Determinism over a *sequence*, which is the form that actually matters.
+    ///
+    /// The test above draws one case from a fresh generator. A campaign instead draws
+    /// thousands from a single advancing generator, so what must be reproducible is the
+    /// whole stream: case 900 of a run has to be the same case every time, or replaying
+    /// a run to reach a finding would not work.
+    #[test]
+    fn one_seed_produces_the_same_sequence_of_cases() {
+        let sequence = |seed| {
+            let generator = TensorOpGenerator::default();
+            let mut rng = SeededRng::from_seed(seed);
+            (0..200)
+                .map(|_| generator.generate(&mut rng))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sequence(9), sequence(9));
+        assert_ne!(sequence(9), sequence(10));
+    }
+
     #[test]
     fn different_seeds_produce_different_cases() {
         let generator = TensorOpGenerator::default();
