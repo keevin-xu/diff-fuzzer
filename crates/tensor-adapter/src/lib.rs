@@ -17,8 +17,10 @@
 //! backend, canonicalising what comes back, and — replacing the placeholder generator
 //! here — building cases that satisfy each operation's own rules.
 
+pub mod backends;
 pub mod generator;
 pub mod input;
 
+pub use backends::{BurnBackend, LibTorchBackend, NdArrayBackend, libtorch, ndarray};
 pub use generator::FixedAddGenerator;
 pub use input::{Matrix, OpKind, TensorOp};
