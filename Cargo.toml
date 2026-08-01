@@ -46,3 +46,8 @@ rand = "0.10.2"
 rand_chacha = "0.10.0"
 # Derives the boilerplate (Display, Error) for error enums.
 thiserror = "2.0.19"
+# Structured logging. The engine only *emits* events; whether anything listens is the
+# calling program's business, which is why the library takes the facade and not a
+# subscriber. Every event carries the seed, so a log line is always actionable.
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"

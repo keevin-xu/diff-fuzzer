@@ -13,3 +13,9 @@ repository.workspace = true
 diff-fuzzer-core = { path = "../diff-fuzzer-core" }
 # Version and feature selection live in the root Cargo.toml's [workspace.dependencies].
 burn.workspace = true
+
+[dev-dependencies]
+# Only the examples need to *listen* to log events — a library emits them and lets the
+# calling program decide what to do with them. A dev-dependency is not compiled into
+# anything this crate publishes.
+tracing-subscriber.workspace = true
