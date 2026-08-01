@@ -10,6 +10,7 @@ use diff_fuzzer_core::{
     DifferentialOracle, Generator, Implementation, NormalizedRunner, Runner, SeededRng, Verdict,
     driver::run_once,
 };
+use std::collections::BTreeMap;
 use tensor_adapter::{
     Bounds, CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, libtorch, ndarray,
 };
@@ -97,6 +98,64 @@ fn no_generated_case_is_skipped() {
             panic!("seed {seed} was skipped: {reason}");
         }
     }
+}
+
+/// The real validity check: tens of thousands of cases, from seeds spread across the
+/// whole 64-bit range rather than a tidy run starting at zero.
+///
+/// Seed choice matters more than it looks. Seeds `0..n` are adjacent numbers, and a
+/// generator with a subtle dependence on seed *magnitude* — or one accidentally
+/// producing similar cases for nearby seeds — would sail through a small sequential
+/// run and fail in a real campaign, where seeds are arbitrary. So this samples three
+/// widely separated regions.
+///
+/// Any failure is reported grouped by operation, because the fix is virtually always a
+/// constraint in one operation's module rather than something general.
+#[test]
+fn tens_of_thousands_of_cases_all_execute() {
+    const SEQUENTIAL: u64 = 30_000;
+    const SCATTERED: u64 = 10_000;
+    const HIGH: u64 = 10_000;
+
+    let generator = TensorOpGenerator::default();
+    let (cpu, torch) = (ndarray(), libtorch());
+
+    // Three regions: low sequential, scattered across the range by a large odd stride,
+    // and the very top of the range.
+    let seeds = (0..SEQUENTIAL)
+        .chain((0..SCATTERED).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+        .chain((0..HIGH).map(|i| u64::MAX - i));
+
+    let mut failures: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    let mut executed = 0usize;
+
+    for seed in seeds {
+        let case = generator.generate(&mut SeededRng::from_seed(seed));
+        executed += 1;
+
+        for (backend_name, result) in [("cpu", cpu.run(&case)), ("libtorch", torch.run(&case))] {
+            if let Err(error) = result {
+                failures
+                    .entry(case.name())
+                    .or_default()
+                    .push(format!("seed {seed} on {backend_name}: {error}"));
+            }
+        }
+    }
+
+    let total_failures: usize = failures.values().map(Vec::len).sum();
+    assert_eq!(
+        total_failures,
+        0,
+        "{total_failures} of {executed} cases failed to execute.\n{}",
+        failures
+            .iter()
+            .map(|(op, errors)| format!("  {op}: {} failures, e.g. {}", errors.len(), errors[0]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    assert_eq!(executed as u64, SEQUENTIAL + SCATTERED + HIGH);
 }
 
 /// Narrow bounds must stay valid too. Degenerate shapes — every dimension of length
