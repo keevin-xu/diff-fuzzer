@@ -2,7 +2,28 @@
 
 > to be updated
 
-A **differential testing + fuzzing framework**, written in **Rust**, whose first target is **deep-learning / tensor libraries**. This folder currently contains the *complete plan* for the project. No implementation code exists yet — the next step is for a fresh Claude Code instance to build it, phase by phase, following these documents.
+A **differential testing + fuzzing framework**, written in **Rust**, whose first target is **deep-learning / tensor libraries**.
+
+## Status
+
+The pipeline runs end to end on a single hardcoded operation: a seed produces a test case, the case runs on two `burn` backends (pure-Rust CPU and libtorch), both results are converted into a comparable form, and an oracle returns a verdict — reproducibly, with the seed attached to every log line and every finding.
+
+A deliberately faulty backend is kept in the codebase and the test suite fails if the tool does not catch it. Without that, "no divergences found" would be indistinguishable from a comparison that had quietly stopped working.
+
+```
+$ cargo run -p tensor-adapter --example differential
+seed 0   -> agree
+seed 7 replayed identically: true
+
+with a deliberately faulty backend:
+divergence: burn-ndarray+fault(0.5) disagreed with burn-ndarray
+  burn-ndarray:            values: [11.0, 22.0, 33.0, 44.0]
+  burn-ndarray+fault(0.5): values: [11.5, 22.0, 33.0, 44.0]
+```
+
+Known limitations, all scheduled: results are compared for **exact equality** (wrong for floating point — two correct backends routinely differ in the last bits), `NaN` is currently treated as disagreeing with itself, and the generator produces **one** fixed case rather than varied valid operations.
+
+**Build:** `cargo test` — libtorch is downloaded automatically by the build, so there is nothing to install.
 
 ## What this project is
 

@@ -23,8 +23,8 @@ pub mod input;
 pub mod normalize;
 pub mod testing;
 
-pub use backends::{BurnBackend, LibTorchBackend, NdArrayBackend, libtorch, ndarray};
+pub use backends::{BurnBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, libtorch, ndarray};
 pub use generator::FixedAddGenerator;
-pub use input::{Matrix, OpKind, TensorOp};
+pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use testing::FaultyBackend;

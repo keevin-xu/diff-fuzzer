@@ -12,8 +12,8 @@
 
 use crate::backends::BurnBackend;
 use crate::input::TensorOp;
+use burn::tensor::TensorData;
 use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
 use diff_fuzzer_core::{Implementation, RunError};
 
 /// A backend that computes correctly, then corrupts one number.
@@ -39,7 +39,7 @@ impl<B: Backend> FaultyBackend<B> {
 
 impl<B: Backend> Implementation for FaultyBackend<B> {
     type In = TensorOp;
-    type Out = Tensor<B, 2>;
+    type Out = TensorData;
 
     fn name(&self) -> &str {
         &self.name
@@ -51,9 +51,8 @@ impl<B: Backend> Implementation for FaultyBackend<B> {
         // which is what makes a caught divergence attributable to the fault.
         let correct = self.inner.run(input)?;
 
-        let shape = correct.dims();
+        let shape = correct.shape.clone();
         let mut values = correct
-            .into_data()
             .to_vec::<f32>()
             .expect("backends are instantiated with f32 elements");
 
@@ -61,10 +60,7 @@ impl<B: Backend> Implementation for FaultyBackend<B> {
             *first += self.bias;
         }
 
-        Ok(Tensor::<B, 2>::from_data(
-            TensorData::new(values, shape),
-            self.inner.device(),
-        ))
+        Ok(TensorData::new(values, shape))
     }
 }
 
@@ -73,22 +69,22 @@ mod tests {
     use super::*;
     use crate::backends::{libtorch, ndarray};
     use crate::generator::FixedAddGenerator;
-    use crate::input::TensorOp as Case;
     use crate::normalize::{CanonicalTensor, TensorNormalizer};
     use diff_fuzzer_core::{
         DifferentialOracle, NormalizedRunner, Runner, Verdict, driver::run_once,
     };
 
-    type Oracle = DifferentialOracle<Case, CanonicalTensor>;
+    type Oracle = DifferentialOracle<TensorOp, CanonicalTensor>;
+    type AnyRunner<'a> = &'a dyn Runner<In = TensorOp, Canon = CanonicalTensor>;
 
     /// The control case: two genuinely correct backends must agree, so that a
     /// divergence in the test below is attributable to the injected fault and not to
     /// the two backends simply disagreeing about everything.
     #[test]
     fn two_correct_backends_agree() {
-        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer::new());
-        let torch = NormalizedRunner::new(libtorch(), TensorNormalizer::new());
-        let runners: [&dyn Runner<In = Case, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
+        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
+        let runners: [AnyRunner; 2] = [&cpu, &torch];
 
         let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
         assert_eq!(outcome.verdict, Verdict::Agree);
@@ -99,10 +95,9 @@ mod tests {
     /// anything, and every clean run it reports is worthless.
     #[test]
     fn an_injected_fault_is_caught() {
-        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer::new());
-        let faulty =
-            NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer::new());
-        let runners: [&dyn Runner<In = Case, Canon = CanonicalTensor>; 2] = [&correct, &faulty];
+        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+        let runners: [AnyRunner; 2] = [&correct, &faulty];
 
         let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
 
@@ -123,25 +118,22 @@ mod tests {
     /// resembles a real finding, where the two sides are genuinely different systems.
     #[test]
     fn a_fault_is_caught_across_different_backends() {
-        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer::new());
-        let faulty_torch = NormalizedRunner::new(
-            FaultyBackend::new(libtorch(), -2.0),
-            TensorNormalizer::new(),
-        );
-        let runners: [&dyn Runner<In = Case, Canon = CanonicalTensor>; 2] = [&cpu, &faulty_torch];
+        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let faulty_torch =
+            NormalizedRunner::new(FaultyBackend::new(libtorch(), -2.0), TensorNormalizer);
+        let runners: [AnyRunner; 2] = [&cpu, &faulty_torch];
 
         let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
         assert!(matches!(outcome.verdict, Verdict::Diverged(_)));
     }
 
-    /// A caught divergence must be reproducible from its seed. A finding that cannot
-    /// be replayed is a defect in this tool, not a discovery about anything else.
+    /// A caught divergence must be reproducible from its seed. A finding that cannot be
+    /// replayed is a defect in this tool, not a discovery about anything else.
     #[test]
     fn a_caught_divergence_replays_from_its_seed() {
-        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer::new());
-        let faulty =
-            NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer::new());
-        let runners: [&dyn Runner<In = Case, Canon = CanonicalTensor>; 2] = [&correct, &faulty];
+        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+        let runners: [AnyRunner; 2] = [&correct, &faulty];
 
         let first = run_once(4242, &FixedAddGenerator, &runners, &Oracle::new());
         let replay = run_once(4242, &FixedAddGenerator, &runners, &Oracle::new());
@@ -152,14 +144,13 @@ mod tests {
 
     /// A fault too small to change the result must not be reported. Today this holds
     /// only because the values are integers and `0.0` changes nothing exactly — once
-    /// comparison moves to a tolerance, this test becomes the place where "how small
-    /// is too small" is actually decided.
+    /// comparison moves to a tolerance, this test becomes the place where "how small is
+    /// too small" is actually decided.
     #[test]
     fn a_zero_fault_is_not_a_divergence() {
-        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer::new());
-        let unfaulty =
-            NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.0), TensorNormalizer::new());
-        let runners: [&dyn Runner<In = Case, Canon = CanonicalTensor>; 2] = [&correct, &unfaulty];
+        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let unfaulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.0), TensorNormalizer);
+        let runners: [AnyRunner; 2] = [&correct, &unfaulty];
 
         let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
         assert_eq!(outcome.verdict, Verdict::Agree);

@@ -6,7 +6,7 @@
 //! easier to reason about while it is being built. Real generation — choosing an
 //! operation, then arguments satisfying that operation's rules — comes next.
 
-use crate::input::{Matrix, TensorOp};
+use crate::input::{BinaryOp, TensorOp, TensorValue};
 use diff_fuzzer_core::{Generator, SeededRng};
 
 /// Always produces the same small elementwise `add`.
@@ -29,9 +29,10 @@ impl Generator for FixedAddGenerator {
     /// because it is part of the trait's contract, and because every later generator
     /// will need it.
     fn generate(&self, _rng: &mut SeededRng) -> TensorOp {
-        TensorOp::add(
-            Matrix::new(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-            Matrix::new(2, 2, vec![10.0, 20.0, 30.0, 40.0]),
+        TensorOp::binary(
+            BinaryOp::Add,
+            TensorValue::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
+            TensorValue::new(vec![2, 2], vec![10.0, 20.0, 30.0, 40.0]),
         )
     }
 }
@@ -39,17 +40,21 @@ impl Generator for FixedAddGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::OpKind;
 
     #[test]
     fn produces_the_documented_case() {
         let mut rng = SeededRng::from_seed(0);
         let case = FixedAddGenerator.generate(&mut rng);
 
-        assert_eq!(case.op, OpKind::Add);
-        assert_eq!(case.lhs.shape(), [2, 2]);
-        assert_eq!(case.lhs.data(), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(case.rhs.data(), &[10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(case.name(), "add");
+        assert_eq!(case.rank(), 2);
+
+        let TensorOp::Binary { lhs, rhs, .. } = &case else {
+            panic!("expected a binary operation, got {case:?}");
+        };
+        assert_eq!(lhs.shape(), &[2, 2]);
+        assert_eq!(lhs.data(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(rhs.data(), &[10.0, 20.0, 30.0, 40.0]);
     }
 
     /// The real generator's central guarantee is that a seed determines the case

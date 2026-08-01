@@ -26,8 +26,8 @@ fn main() {
     // two have the same type from the driver's point of view, despite producing
     // different kinds of tensor internally — which is why the driver takes a list and
     // not exactly two arguments.
-    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer::new());
-    let torch = NormalizedRunner::new(libtorch(), TensorNormalizer::new());
+    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
 
     let oracle: DifferentialOracle<TensorOp, CanonicalTensor> = DifferentialOracle::new();
@@ -54,7 +54,7 @@ fn main() {
     // Two correct backends agreeing proves very little on its own — a comparison that
     // had quietly stopped working would report exactly the same thing. So: introduce a
     // backend known to be wrong by a fixed amount, and confirm it gets caught.
-    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer::new());
+    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
     let with_fault: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &faulty];
 
     println!("\nwith a deliberately faulty backend:");
