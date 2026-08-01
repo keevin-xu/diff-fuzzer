@@ -20,7 +20,9 @@
 pub mod backends;
 pub mod generator;
 pub mod input;
+pub mod normalize;
 
 pub use backends::{BurnBackend, LibTorchBackend, NdArrayBackend, libtorch, ndarray};
 pub use generator::FixedAddGenerator;
 pub use input::{Matrix, OpKind, TensorOp};
+pub use normalize::{CanonicalTensor, TensorNormalizer};
