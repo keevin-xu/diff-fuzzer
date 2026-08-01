@@ -1,0 +1,18 @@
+[workspace]
+# The two crates that make up this project. `fuzz/` is deliberately NOT a member —
+# cargo-fuzz crates are built separately with nightly (PHASE-6, step 6.1).
+members = ["crates/diff-fuzzer-core", "crates/tensor-adapter"]
+
+# Resolver 3 is the current dependency resolver (required for edition 2024).
+# A virtual workspace (one with no [package] of its own) must state it explicitly.
+resolver = "3"
+
+# Fields shared by every crate in the workspace, so they are declared once here and
+# inherited with `edition.workspace = true` in each crate's Cargo.toml. When we add
+# dependencies (step 0.6) a [workspace.dependencies] table will go here too, so that
+# `burn`'s version is pinned in exactly one place.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kevinxu/diff-fuzzer"

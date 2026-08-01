@@ -1,0 +1,10 @@
+[package]
+name = "tensor-adapter"
+description = "The DL/tensor adapter: valid-op generation, burn backend implementations, and output normalization."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# burn + burn-ndarray arrive in step 0.6, burn-tch in step 0.7.
