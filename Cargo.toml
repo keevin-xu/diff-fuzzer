@@ -26,6 +26,13 @@ repository = "https://github.com/kevinxu/diff-fuzzer"
 [workspace.dependencies]
 # `default-features = false` drops burn's training stack (train/dataset/vision/rl).
 # We only ever build and compare individual tensor ops, so none of that is needed.
-# Backends are opt-in features: "ndarray" is the pure-Rust CPU side of the
-# differential; "tch" (libtorch) gets added alongside it next.
-burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray"] }
+# Backends are opt-in features, and both sides of the differential are enabled here:
+#   "ndarray" — pure-Rust CPU kernels
+#   "tch"     — libtorch (PyTorch's C++ library) via the `tch` bindings
+# burn-tch enables tch's `download-libtorch` feature, so the libtorch binaries are
+# fetched by the build script; no manual install and no LIBTORCH/DYLD_LIBRARY_PATH.
+burn = { version = "0.21.0", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tch",
+] }
