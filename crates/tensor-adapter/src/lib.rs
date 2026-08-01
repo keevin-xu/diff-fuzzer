@@ -13,9 +13,12 @@
 //!
 //! ## Status
 //!
-//! Stub only (PHASE-0, step 0.5). The modules below are created in later phases:
-//!
-//! - `ops/`      — one module per operation, each encoding its own constraints  (PHASE-2)
-//! - `generator` — correct-by-construction op generation from a seed            (PHASE-2)
-//! - `backends`  — `impl Implementation` for each burn backend                  (PHASE-1→7)
-//! - `normalize` — tensor output canonicalization                               (PHASE-1→4)
+//! A test case can be described and produced. Still to come: executing one on each
+//! backend, canonicalising what comes back, and — replacing the placeholder generator
+//! here — building cases that satisfy each operation's own rules.
+
+pub mod generator;
+pub mod input;
+
+pub use generator::FixedAddGenerator;
+pub use input::{Matrix, OpKind, TensorOp};

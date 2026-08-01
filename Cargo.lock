@@ -4800,6 +4800,7 @@ name = "tensor-adapter"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "diff-fuzzer-core",
 ]
 
 [[package]]

@@ -7,5 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The dependency arrow points this way and never the other way: the adapter knows
+# about the engine, the engine knows nothing about tensors. That is enforced by cargo,
+# not by discipline — a `use tensor_adapter::...` inside the engine would not compile.
+diff-fuzzer-core = { path = "../diff-fuzzer-core" }
 # Version and feature selection live in the root Cargo.toml's [workspace.dependencies].
 burn.workspace = true
