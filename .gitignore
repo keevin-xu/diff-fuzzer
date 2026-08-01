@@ -1,0 +1,39 @@
+# ── Rust build artifacts ─────────────────────────────
+/target/
+**/target/
+
+# ── cargo-fuzz (libFuzzer) generated outputs ─────────
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# ── Native libs (libtorch etc. — never commit) ───────
+/libtorch/
+*.dylib
+*.so
+*.so.*
+*.dll
+
+# ── Handoff / backup cruft ───────────────────────────
+_to_delete/
+*.tar.gz
+
+# ── OS / editor ──────────────────────────────────────
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# ── Env / secrets ────────────────────────────────────
+.env
+.env.*
+
+# NOTE: Cargo.lock is intentionally NOT ignored — commit it.
+#   Reproducibility is a core project value (pinned deps -> reproducible divergences).
+# NOTE: findings/*.json are intentionally NOT ignored — reproducible bug reports
+#   are valuable artifacts worth version-controlling.
+*.md
+skills/
+!README.md
