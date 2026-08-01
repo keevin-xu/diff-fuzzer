@@ -17,7 +17,7 @@
 //! writing new implementations of `Generator`, `Implementation` and `Normalizer` —
 //! not touching this file.
 
-use crate::report::DivergenceReport;
+use crate::report::Divergence;
 use crate::rng::SeededRng;
 
 /// Marker for "this type is a test case".
@@ -146,7 +146,10 @@ pub enum Verdict {
     /// The results are consistent. The overwhelmingly common outcome.
     Agree,
     /// The results disagree in a way worth reporting.
-    Diverged(DivergenceReport),
+    ///
+    /// Carries only what disagreed. The seed and other run context are attached by
+    /// the driver, which owns those facts — see [`crate::report`].
+    Diverged(Divergence),
     /// This case was not judged, and the reason why.
     ///
     /// Skipping is a first-class outcome, not an error: an input one side cannot run,

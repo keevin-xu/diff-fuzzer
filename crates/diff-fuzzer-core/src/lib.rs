@@ -18,6 +18,7 @@
 //! runs a case end to end, the tolerance-based comparison that replaces exact
 //! equality, shrinking a failure to its smallest form, and writing findings to disk.
 
+pub mod oracle;
 pub mod report;
 pub mod rng;
 pub mod traits;
@@ -25,7 +26,8 @@ pub mod traits;
 // Re-exported at the crate root so users write `diff_fuzzer_core::Oracle` rather than
 // `diff_fuzzer_core::traits::Oracle`. Module structure is our business; the names are
 // what callers care about.
-pub use report::DivergenceReport;
+pub use oracle::DifferentialOracle;
+pub use report::Divergence;
 pub use rng::SeededRng;
 pub use traits::{
     Generator, Implementation, Input, NamedOutput, Normalizer, Oracle, RunError, Verdict,
