@@ -2,22 +2,31 @@
 //!
 //! The reusable, **target-agnostic** engine for differential testing.
 //!
-//! This crate knows nothing about tensors, SQL, or any other kind of software under
-//! test. It only knows the trait seams defined in [`traits`] (PHASE-1): given some
-//! way to *generate* an input, *run* it on several implementations, and *normalize*
-//! the results, it can drive the loop, ask an oracle whether the results diverged,
-//! shrink any divergence to a minimal case, and report it.
+//! The idea it implements: run the same input through two systems that are supposed
+//! to behave identically, and if they disagree, at least one of them is wrong. That
+//! sidesteps the usual obstacle to testing complex software — knowing what the
+//! correct answer *is* — because a disagreement is evidence on its own.
 //!
-//! Domain knowledge lives in per-target adapter crates instead — `tensor-adapter`
-//! is the first one. See `planning/03-ARCHITECTURE.md`.
+//! This crate knows nothing about tensors, or databases, or anything else. It knows
+//! only the traits in [`traits`]: given a way to generate an input, run it, and
+//! canonicalise the results, it can drive the loop and ask an oracle for a verdict.
+//! Domain knowledge lives in adapter crates on the far side of those traits.
 //!
 //! ## Status
 //!
-//! Stub only (PHASE-0, step 0.5). The modules below are created in later phases:
-//!
-//! - `traits`    — Input, Implementation, Generator, Normalizer, Oracle, Verdict  (PHASE-1)
-//! - `rng`       — SeededRng, the single source of randomness                     (PHASE-1)
-//! - `tolerance` — allclose-style comparison + TolerancePolicy                    (PHASE-3/4)
-//! - `oracle`    — DifferentialOracle (and, much later, a metamorphic one)        (PHASE-1→3)
-//! - `minimize`  — ddmin-style shrinking                                          (PHASE-5)
-//! - `report`    — DivergenceReport + emitter                                     (PHASE-5)
+//! Trait seams and seeded randomness are in place. Still to come: the driver that
+//! runs a case end to end, the tolerance-based comparison that replaces exact
+//! equality, shrinking a failure to its smallest form, and writing findings to disk.
+
+pub mod report;
+pub mod rng;
+pub mod traits;
+
+// Re-exported at the crate root so users write `diff_fuzzer_core::Oracle` rather than
+// `diff_fuzzer_core::traits::Oracle`. Module structure is our business; the names are
+// what callers care about.
+pub use report::DivergenceReport;
+pub use rng::SeededRng;
+pub use traits::{
+    Generator, Implementation, Input, NamedOutput, Normalizer, Oracle, RunError, Verdict,
+};

@@ -36,3 +36,13 @@ burn = { version = "0.21.0", default-features = false, features = [
     "ndarray",
     "tch",
 ] }
+
+# Engine dependencies.
+# `rand` supplies the RNG traits; `rand_chacha` supplies ChaCha8Rng specifically,
+# whose output is guaranteed stable across releases — unlike rand's own StdRng,
+# which is explicitly allowed to change algorithm. A saved seed has to mean the
+# same thing forever, so the guarantee is the point.
+rand = "0.10.2"
+rand_chacha = "0.10.0"
+# Derives the boilerplate (Display, Error) for error enums.
+thiserror = "2.0.19"

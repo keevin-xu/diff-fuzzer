@@ -8,4 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# None yet. Engine dependencies (rand, serde, thiserror) arrive in PHASE-1.
+# Versions live in the root Cargo.toml's [workspace.dependencies].
+rand.workspace = true
+rand_chacha.workspace = true
+thiserror.workspace = true
