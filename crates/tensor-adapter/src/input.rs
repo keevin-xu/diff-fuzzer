@@ -75,7 +75,7 @@ impl TensorValue {
 }
 
 /// Operations taking one tensor and returning one of the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Neg,
     Abs,
@@ -89,7 +89,7 @@ pub enum UnaryOp {
 }
 
 /// Operations taking two tensors of the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -99,7 +99,7 @@ pub enum BinaryOp {
 }
 
 /// Operations collapsing one axis of a tensor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ReduceOp {
     /// Summing many values is where floating-point addition's lack of associativity
     /// shows up: two backends adding in a different order get different last bits.

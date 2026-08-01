@@ -21,6 +21,7 @@ pub mod backends;
 pub mod generator;
 pub mod input;
 pub mod normalize;
+pub mod ops;
 pub mod testing;
 
 pub use backends::{BurnBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, libtorch, ndarray};

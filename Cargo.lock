@@ -4820,6 +4820,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "diff-fuzzer-core",
+ "rand 0.10.2",
  "tracing-subscriber",
 ]
 
