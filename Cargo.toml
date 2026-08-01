@@ -16,3 +16,16 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kevinxu/diff-fuzzer"
+
+# Dependency versions are pinned HERE, once, and referenced by members as
+# `burn.workspace = true`. A divergence report is only meaningful if it names the
+# exact version that produced it, so both crates must never drift apart.
+#
+# Pinned to 0.21.0 (max stable). 0.22.0-pre.1 exists but is a pre-release whose API
+# can shift between builds, which would break reproducibility of saved findings.
+[workspace.dependencies]
+# `default-features = false` drops burn's training stack (train/dataset/vision/rl).
+# We only ever build and compare individual tensor ops, so none of that is needed.
+# Backends are opt-in features: "ndarray" is the pure-Rust CPU side of the
+# differential; "tch" (libtorch) gets added alongside it next.
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray"] }

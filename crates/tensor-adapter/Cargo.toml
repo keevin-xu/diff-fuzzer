@@ -7,4 +7,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# burn + burn-ndarray arrive in step 0.6, burn-tch in step 0.7.
+# Version and feature selection live in the root Cargo.toml's [workspace.dependencies].
+burn.workspace = true

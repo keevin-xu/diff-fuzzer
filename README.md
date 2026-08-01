@@ -1,10 +1,10 @@
-# diff-fuzzer — Planning Package
+# diff-fuzzer
 
 > to be updated
 
 A **differential testing + fuzzing framework**, written in **Rust**, whose first target is **deep-learning / tensor libraries**. This folder currently contains the *complete plan* for the project. No implementation code exists yet — the next step is for a fresh Claude Code instance to build it, phase by phase, following these documents.
 
-## What this project is (one paragraph)
+## What this project is
 
 We generate structured, valid tensor operations (e.g. `matmul`, `softmax`, `conv`), run each one through **two different backends of the same DL framework** (Rust's `burn`: CPU vs. libtorch, later CPU vs. GPU), and **compare the numerical outputs within a tolerance**. When two backends disagree on the same operation, at least one has a bug. This is *differential testing*: it finds bugs without needing to know the "correct" answer. The framework is built with a **shared, reusable core** and **thin per-target adapters**, so that later we can add new oracles (metamorphic) and new software types (SQL engines) without rewriting the engine.
 
