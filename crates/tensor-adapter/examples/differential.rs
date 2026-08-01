@@ -10,7 +10,8 @@
 
 use diff_fuzzer_core::{DifferentialOracle, NormalizedRunner, Runner, Verdict, driver::run_once};
 use tensor_adapter::{
-    CanonicalTensor, FixedAddGenerator, TensorNormalizer, TensorOp, libtorch, ndarray,
+    CanonicalTensor, FaultyBackend, FixedAddGenerator, TensorNormalizer, TensorOp, libtorch,
+    ndarray,
 };
 
 fn main() {
@@ -49,4 +50,16 @@ fn main() {
     let first = run_once(7, &FixedAddGenerator, &runners, &oracle);
     let again = run_once(7, &FixedAddGenerator, &runners, &oracle);
     println!("\nseed 7 replayed identically: {}", first == again);
+
+    // Two correct backends agreeing proves very little on its own — a comparison that
+    // had quietly stopped working would report exactly the same thing. So: introduce a
+    // backend known to be wrong by a fixed amount, and confirm it gets caught.
+    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer::new());
+    let with_fault: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &faulty];
+
+    println!("\nwith a deliberately faulty backend:");
+    match run_once(0, &FixedAddGenerator, &with_fault, &oracle).verdict {
+        Verdict::Diverged(divergence) => print!("{divergence}"),
+        other => println!("  fault NOT caught — the detector is broken: {other:?}"),
+    }
 }

@@ -36,6 +36,12 @@ impl<B: Backend> BurnBackend<B> {
         }
     }
 
+    /// Where this backend's tensors live. Exposed so a wrapper can build tensors on
+    /// the same device as the backend it wraps.
+    pub fn device(&self) -> &B::Device {
+        &self.device
+    }
+
     /// Convert one of our backend-independent matrices into a tensor belonging to
     /// this backend.
     ///
