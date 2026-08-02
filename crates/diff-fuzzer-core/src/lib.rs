@@ -34,7 +34,9 @@ pub use oracle::DifferentialOracle;
 pub use report::Divergence;
 pub use rng::SeededRng;
 pub use runner::{NormalizedRunner, Runner};
-pub use tolerance::{Comparison, Mismatch, Tolerance, compare};
+pub use tolerance::{
+    Agreement, ApproxEq, Comparison, FixedTolerance, Mismatch, Tolerance, TolerancePolicy, compare,
+};
 pub use traits::{
     Generator, Implementation, Input, NamedOutput, Normalizer, Oracle, RunError, Verdict,
 };

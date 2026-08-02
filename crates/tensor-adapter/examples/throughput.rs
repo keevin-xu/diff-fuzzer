@@ -12,8 +12,8 @@
 //! Run with: `cargo run --release -p tensor-adapter --example throughput`
 
 use diff_fuzzer_core::{
-    DifferentialOracle, Generator, Implementation, NormalizedRunner, Normalizer, Oracle, Runner,
-    SeededRng, driver::run_once, traits::NamedOutput,
+    DifferentialOracle, FixedTolerance, Generator, Implementation, NormalizedRunner, Normalizer,
+    Oracle, Runner, SeededRng, Tolerance, driver::run_once, traits::NamedOutput,
 };
 use std::time::Instant;
 use tensor_adapter::{
@@ -60,7 +60,10 @@ fn main() {
     // Comparison alone. Everything the oracle needs is built *before* the clock
     // starts, so this measures the comparison itself rather than the cost of setting
     // it up — otherwise the allocation would be attributed to the wrong stage.
-    let oracle: DifferentialOracle<TensorOp, CanonicalTensor> = DifferentialOracle::new();
+    // Exact comparison for now: the tolerance policy that varies by operation
+    // arrives next.
+    let oracle: DifferentialOracle<TensorOp, CanonicalTensor, FixedTolerance> =
+        DifferentialOracle::new(FixedTolerance(Tolerance::EXACT));
     let prepared: Vec<(TensorOp, [NamedOutput<CanonicalTensor>; 2])> = cases
         .iter()
         .map(|case| {

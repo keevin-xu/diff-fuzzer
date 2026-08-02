@@ -11,7 +11,7 @@
 //! way a project like this drowns in differences that mean nothing.
 
 use burn::tensor::TensorData;
-use diff_fuzzer_core::Normalizer;
+use diff_fuzzer_core::{Agreement, ApproxEq, Normalizer, Tolerance, compare};
 
 /// A tensor result in a form any backend's output can be converted to.
 ///
@@ -57,6 +57,31 @@ impl Normalizer for TensorNormalizer {
             .expect("backends are instantiated with f32 elements");
 
         CanonicalTensor { shape, values }
+    }
+}
+
+/// How two tensor results are compared.
+///
+/// Shape is settled first and separately. Two results of different shapes do not differ
+/// *by an amount* — they differ about what the operation produced, which no tolerance
+/// should ever absorb however loose. Only once the shapes match does the question
+/// become numeric.
+impl ApproxEq for CanonicalTensor {
+    fn approx_compare(&self, other: &Self, tolerance: Tolerance) -> Agreement {
+        if self.shape != other.shape {
+            return Agreement::Structural {
+                reason: format!("shapes differ: {:?} vs {:?}", self.shape, other.shape),
+            };
+        }
+
+        // Equal shapes imply equal element counts, since the shape determines them —
+        // an invariant established when the value was constructed.
+        let comparison = compare(&self.values, &other.values, tolerance);
+        if comparison.agrees() {
+            Agreement::Agree(comparison)
+        } else {
+            Agreement::Disagree(comparison)
+        }
     }
 }
 

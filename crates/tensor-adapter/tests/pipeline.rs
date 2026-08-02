@@ -7,8 +7,8 @@
 //! equality, which is the wrong tool for floating-point results and is replaced later.
 
 use diff_fuzzer_core::{
-    DifferentialOracle, Generator, Implementation, NormalizedRunner, Runner, SeededRng, Verdict,
-    driver::run_once,
+    DifferentialOracle, FixedTolerance, Generator, Implementation, NormalizedRunner, Runner,
+    SeededRng, Tolerance, Verdict, driver::run_once,
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
@@ -90,7 +90,10 @@ fn no_generated_case_is_skipped() {
     let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [AnyRunner; 2] = [&cpu, &torch];
-    let oracle: DifferentialOracle<TensorOp, CanonicalTensor> = DifferentialOracle::new();
+    // Exact comparison for now: the tolerance policy that varies by operation
+    // arrives next.
+    let oracle: DifferentialOracle<TensorOp, CanonicalTensor, FixedTolerance> =
+        DifferentialOracle::new(FixedTolerance(Tolerance::EXACT));
 
     for seed in 0..1_000 {
         let outcome = run_once(seed, &generator, &runners, &oracle);

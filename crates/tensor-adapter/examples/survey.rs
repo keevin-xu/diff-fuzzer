@@ -11,7 +11,8 @@
 //! Run with: `cargo run --release -p tensor-adapter --example survey`
 
 use diff_fuzzer_core::{
-    DifferentialOracle, Generator, NormalizedRunner, Runner, SeededRng, Verdict, driver::run_once,
+    DifferentialOracle, FixedTolerance, Generator, NormalizedRunner, Runner, SeededRng, Tolerance,
+    Verdict, driver::run_once,
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
@@ -32,7 +33,10 @@ fn main() {
     let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
-    let oracle: DifferentialOracle<TensorOp, CanonicalTensor> = DifferentialOracle::new();
+    // Exact comparison for now: the tolerance policy that varies by operation
+    // arrives next.
+    let oracle: DifferentialOracle<TensorOp, CanonicalTensor, FixedTolerance> =
+        DifferentialOracle::new(FixedTolerance(Tolerance::EXACT));
 
     let mut totals = Tally::default();
     let mut per_operation: BTreeMap<&str, Tally> = BTreeMap::new();

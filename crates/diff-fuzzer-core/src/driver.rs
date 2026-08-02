@@ -87,6 +87,7 @@ mod tests {
     use super::*;
     use crate::oracle::DifferentialOracle;
     use crate::runner::NormalizedRunner;
+    use crate::tolerance::{FixedTolerance, Tolerance};
     use crate::traits::{Implementation, Input, Normalizer, RunError};
 
     #[derive(Clone, Debug, PartialEq)]
@@ -112,12 +113,12 @@ mod tests {
     }
     impl Implementation for Adder {
         type In = Number;
-        type Out = u32;
+        type Out = Vec<f32>;
         fn name(&self) -> &str {
             self.name
         }
-        fn run(&self, input: &Number) -> Result<u32, RunError> {
-            Ok(input.0 + self.offset)
+        fn run(&self, input: &Number) -> Result<Vec<f32>, RunError> {
+            Ok(vec![(input.0 + self.offset) as f32])
         }
     }
 
@@ -125,11 +126,11 @@ mod tests {
     struct Refuses;
     impl Implementation for Refuses {
         type In = Number;
-        type Out = u32;
+        type Out = Vec<f32>;
         fn name(&self) -> &str {
             "refuses"
         }
-        fn run(&self, _input: &Number) -> Result<u32, RunError> {
+        fn run(&self, _input: &Number) -> Result<Vec<f32>, RunError> {
             Err(RunError::Unsupported {
                 implementation: "refuses".to_string(),
                 reason: "does not do numbers".to_string(),
@@ -139,9 +140,9 @@ mod tests {
 
     struct Identity;
     impl Normalizer for Identity {
-        type Out = u32;
-        type Canon = u32;
-        fn normalize(&self, out: u32) -> u32 {
+        type Out = Vec<f32>;
+        type Canon = Vec<f32>;
+        fn normalize(&self, out: Vec<f32>) -> Vec<f32> {
             out
         }
     }
@@ -150,8 +151,10 @@ mod tests {
         NormalizedRunner::new(Adder { name, offset }, Identity)
     }
 
-    fn oracle() -> DifferentialOracle<Number, u32> {
-        DifferentialOracle::new()
+    fn oracle() -> DifferentialOracle<Number, Vec<f32>, FixedTolerance> {
+        // Exact comparison: these test systems produce whole numbers, so any
+        // difference is a real one rather than rounding.
+        DifferentialOracle::new(FixedTolerance(Tolerance::EXACT))
     }
 
     #[test]

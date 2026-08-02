@@ -8,7 +8,10 @@
 //!
 //! Run with: `cargo run -p tensor-adapter --example differential`
 
-use diff_fuzzer_core::{DifferentialOracle, NormalizedRunner, Runner, Verdict, driver::run_once};
+use diff_fuzzer_core::{
+    DifferentialOracle, FixedTolerance, NormalizedRunner, Runner, Tolerance, Verdict,
+    driver::run_once,
+};
 use tensor_adapter::{
     CanonicalTensor, FaultyBackend, FixedAddGenerator, TensorNormalizer, TensorOp, libtorch,
     ndarray,
@@ -30,7 +33,10 @@ fn main() {
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
 
-    let oracle: DifferentialOracle<TensorOp, CanonicalTensor> = DifferentialOracle::new();
+    // Exact comparison for now: the tolerance policy that varies by operation
+    // arrives next.
+    let oracle: DifferentialOracle<TensorOp, CanonicalTensor, FixedTolerance> =
+        DifferentialOracle::new(FixedTolerance(Tolerance::EXACT));
 
     for seed in 0..3 {
         let outcome = run_once(seed, &FixedAddGenerator, &runners, &oracle);

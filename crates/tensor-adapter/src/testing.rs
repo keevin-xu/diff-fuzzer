@@ -71,10 +71,11 @@ mod tests {
     use crate::generator::FixedAddGenerator;
     use crate::normalize::{CanonicalTensor, TensorNormalizer};
     use diff_fuzzer_core::{
-        DifferentialOracle, NormalizedRunner, Runner, Verdict, driver::run_once,
+        DifferentialOracle, FixedTolerance, NormalizedRunner, Runner, Tolerance, Verdict,
+        driver::run_once,
     };
 
-    type Oracle = DifferentialOracle<TensorOp, CanonicalTensor>;
+    type Oracle = DifferentialOracle<TensorOp, CanonicalTensor, FixedTolerance>;
     type AnyRunner<'a> = &'a dyn Runner<In = TensorOp, Canon = CanonicalTensor>;
 
     /// The control case: two genuinely correct backends must agree, so that a
@@ -86,7 +87,12 @@ mod tests {
         let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&cpu, &torch];
 
-        let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
+        let outcome = run_once(
+            1,
+            &FixedAddGenerator,
+            &runners,
+            &Oracle::new(FixedTolerance(Tolerance::EXACT)),
+        );
         assert_eq!(outcome.verdict, Verdict::Agree);
     }
 
@@ -99,7 +105,12 @@ mod tests {
         let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&correct, &faulty];
 
-        let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
+        let outcome = run_once(
+            1,
+            &FixedAddGenerator,
+            &runners,
+            &Oracle::new(FixedTolerance(Tolerance::EXACT)),
+        );
 
         let Verdict::Diverged(divergence) = outcome.verdict else {
             panic!("the injected fault was not caught");
@@ -123,7 +134,12 @@ mod tests {
             NormalizedRunner::new(FaultyBackend::new(libtorch(), -2.0), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&cpu, &faulty_torch];
 
-        let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
+        let outcome = run_once(
+            1,
+            &FixedAddGenerator,
+            &runners,
+            &Oracle::new(FixedTolerance(Tolerance::EXACT)),
+        );
         assert!(matches!(outcome.verdict, Verdict::Diverged(_)));
     }
 
@@ -135,8 +151,18 @@ mod tests {
         let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&correct, &faulty];
 
-        let first = run_once(4242, &FixedAddGenerator, &runners, &Oracle::new());
-        let replay = run_once(4242, &FixedAddGenerator, &runners, &Oracle::new());
+        let first = run_once(
+            4242,
+            &FixedAddGenerator,
+            &runners,
+            &Oracle::new(FixedTolerance(Tolerance::EXACT)),
+        );
+        let replay = run_once(
+            4242,
+            &FixedAddGenerator,
+            &runners,
+            &Oracle::new(FixedTolerance(Tolerance::EXACT)),
+        );
 
         assert!(matches!(first.verdict, Verdict::Diverged(_)));
         assert_eq!(first, replay);
@@ -152,7 +178,12 @@ mod tests {
         let unfaulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.0), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&correct, &unfaulty];
 
-        let outcome = run_once(1, &FixedAddGenerator, &runners, &Oracle::new());
+        let outcome = run_once(
+            1,
+            &FixedAddGenerator,
+            &runners,
+            &Oracle::new(FixedTolerance(Tolerance::EXACT)),
+        );
         assert_eq!(outcome.verdict, Verdict::Agree);
     }
 }
