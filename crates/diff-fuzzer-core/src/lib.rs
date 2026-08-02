@@ -35,7 +35,8 @@ pub use report::{Divergence, Finding, FindingsLog, read_findings};
 pub use rng::SeededRng;
 pub use runner::{NormalizedRunner, Runner};
 pub use tolerance::{
-    Agreement, ApproxEq, Comparison, FixedTolerance, Mismatch, Tolerance, TolerancePolicy, compare,
+    Agreement, ApproxEq, Comparison, FixedTolerance, Mismatch, Special, Tolerance, TolerancePolicy,
+    compare,
 };
 pub use traits::{
     Generator, Implementation, Input, NamedOutput, Normalizer, Oracle, RunError, Verdict,

@@ -53,25 +53,14 @@ impl Tolerance {
     /// that changed with argument order would be indefensible in a bug report, so the
     /// larger magnitude sets the scale and the comparison is symmetric.
     pub fn agree(&self, a: f32, b: f32) -> bool {
-        // Both NaN counts as agreement: each system was asked something undefined and
-        // both said so. This is deliberately *not* what `==` does, since NaN is not
-        // equal to itself, and relying on `==` would report two backends correctly
-        // producing NaN as a disagreement.
-        if a.is_nan() && b.is_nan() {
-            return true;
+        match Special::classify(a, b) {
+            Some(special) => special.agrees(),
+            None => self.finite_agree(a, b),
         }
-        // One NaN and one number is a genuine disagreement: they disagree about
-        // whether the answer exists at all.
-        if a.is_nan() || b.is_nan() {
-            return false;
-        }
-        // Infinities must match exactly, sign included. An infinity against a finite
-        // number is a real difference no tolerance should absorb — and `inf - inf` is
-        // NaN, so the arithmetic below could not judge it anyway.
-        if a.is_infinite() || b.is_infinite() {
-            return a == b;
-        }
+    }
 
+    /// Compare two values already known to be finite.
+    fn finite_agree(&self, a: f32, b: f32) -> bool {
         // Widened to f64 for the arithmetic. The difference between two nearly equal
         // f32 values loses precision when computed in f32, which would make the error
         // measurement itself unreliable — a poor property for the number a bug report
@@ -79,6 +68,78 @@ impl Tolerance {
         let (a, b) = (a as f64, b as f64);
         let difference = (a - b).abs();
         difference <= self.atol + self.rtol * a.abs().max(b.abs())
+    }
+}
+
+/// How a pair of values was judged when at least one of them was not finite.
+///
+/// Broken out as a named type rather than left as branches inside the comparison,
+/// because these are **policy decisions, not arithmetic**, and policy must be auditable.
+/// Naming each case lets the comparison count how often each was taken — and that
+/// matters, because two of them are effectively *exclusions*: a pair where both sides
+/// produced `NaN` is recorded as agreement without any numeric comparison having
+/// happened. Exclusions that nobody counts are how a tool quietly stops testing
+/// anything while continuing to report success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Special {
+    /// Both undefined. **Treated as agreement**: each system was asked something with no
+    /// answer and both said so, which is consistent behaviour.
+    ///
+    /// Note this is deliberately *not* what `==` does — `NaN != NaN` — so relying on
+    /// equality would report two backends correctly producing `NaN` as a disagreement.
+    ///
+    /// It is also the weakest form of agreement there is, and worth counting: a result
+    /// that is entirely `NaN` on both sides has told us nothing about either
+    /// implementation.
+    BothUndefined,
+    /// One produced a number, the other did not. **A real disagreement** — they differ
+    /// about whether an answer exists at all, which is more fundamental than differing
+    /// about its value.
+    OneUndefined,
+    /// Both overflowed the same way. **Agreement**, and equally uninformative: two
+    /// systems agreeing that a result is beyond representation says little about their
+    /// arithmetic.
+    SameInfinity,
+    /// Infinities of opposite sign, or an infinity against a finite number. **A real
+    /// disagreement that no tolerance may absorb** — and one the arithmetic could not
+    /// judge anyway, since `inf - inf` is `NaN`.
+    ConflictingInfinity,
+}
+
+impl Special {
+    /// Classify a pair, or `None` if both are finite and ordinary comparison applies.
+    pub fn classify(a: f32, b: f32) -> Option<Self> {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => return Some(Special::BothUndefined),
+            (true, false) | (false, true) => return Some(Special::OneUndefined),
+            (false, false) => {}
+        }
+
+        if a.is_infinite() || b.is_infinite() {
+            // Equality here is exact and correct: it requires the same sign as well as
+            // both being infinite.
+            return Some(if a == b {
+                Special::SameInfinity
+            } else {
+                Special::ConflictingInfinity
+            });
+        }
+
+        None
+    }
+
+    /// Whether this outcome counts as the two systems agreeing.
+    pub fn agrees(self) -> bool {
+        matches!(self, Special::BothUndefined | Special::SameInfinity)
+    }
+
+    /// Whether this outcome was reached *without comparing any arithmetic*.
+    ///
+    /// Both forms of agreement here are vacuous: nothing was learned about either
+    /// implementation's numerics. A result made entirely of these has been checked in
+    /// name only, which is worth being able to detect.
+    pub fn is_vacuous(self) -> bool {
+        self.agrees()
     }
 }
 
@@ -178,11 +239,28 @@ pub struct Comparison {
     pub max_relative_error: f64,
     /// The single worst element that exceeded the tolerance.
     pub worst: Option<Mismatch>,
+    /// How many elements agreed **without any arithmetic being compared** — both `NaN`,
+    /// or both the same infinity.
+    ///
+    /// Counted rather than silently passed. These are exclusions wearing the costume of
+    /// agreement, and a comparison made mostly of them has verified very little.
+    pub vacuous_agreements: usize,
 }
 
 impl Comparison {
     pub fn agrees(&self) -> bool {
         self.mismatches == 0
+    }
+
+    /// Did this comparison actually examine any arithmetic?
+    ///
+    /// False when every element was excluded by a special-value rule — a result that is
+    /// entirely `NaN` or entirely infinite on both sides. Such a case *agrees*, but the
+    /// agreement is empty: neither implementation was tested. Distinguishing it from a
+    /// genuine pass is what stops a run of undefined results from being counted as
+    /// evidence that anything works.
+    pub fn examined_any_arithmetic(&self) -> bool {
+        self.total > self.vacuous_agreements
     }
 }
 
@@ -207,6 +285,7 @@ pub fn compare(left: &[f32], right: &[f32], tolerance: Tolerance) -> Comparison 
         max_absolute_error: 0.0,
         max_relative_error: 0.0,
         worst: None,
+        vacuous_agreements: 0,
     };
 
     // Tracked separately from the maxima above: those describe the whole result, while
@@ -214,6 +293,14 @@ pub fn compare(left: &[f32], right: &[f32], tolerance: Tolerance) -> Comparison 
     let mut worst_failing_error = f64::NEG_INFINITY;
 
     for (index, (&a, &b)) in left.iter().zip(right).enumerate() {
+        // Record when an element was settled by a special-value rule rather than by
+        // comparing numbers, so the vacuous portion of a result stays visible.
+        if let Some(special) = Special::classify(a, b)
+            && special.is_vacuous()
+        {
+            comparison.vacuous_agreements += 1;
+        }
+
         let (absolute_error, relative_error) = errors(a, b);
 
         // Non-finite errors would poison the maxima, so they are excluded from the
@@ -339,9 +426,130 @@ mod tests {
         }
     }
 
-    // The NaN and infinity rules below are provisional. They are the obviously
-    // defensible defaults, and the full policy — including precision differences and
-    // legitimately non-deterministic operations — is the subject of its own phase.
+    /// Every combination of special values, in one table.
+    ///
+    /// Table-driven on purpose: the point is *exhaustiveness*. A policy about undefined
+    /// results is exactly the kind that gets one case wrong and stays wrong, because the
+    /// wrong case is rare in practice and silent when it happens.
+    #[test]
+    fn every_special_value_combination_is_classified() {
+        let nan = f32::NAN;
+        let pos = f32::INFINITY;
+        let neg = f32::NEG_INFINITY;
+
+        let cases: [(f32, f32, Option<Special>); 14] = [
+            // Both undefined — agreement, and vacuous.
+            (nan, nan, Some(Special::BothUndefined)),
+            // One undefined — a real disagreement, whichever side it is on.
+            (nan, 1.0, Some(Special::OneUndefined)),
+            (1.0, nan, Some(Special::OneUndefined)),
+            (nan, 0.0, Some(Special::OneUndefined)),
+            // Undefined against infinite is still "one has no answer". The NaN rule is
+            // checked first, deliberately: not-a-number is a stronger statement than
+            // out-of-range.
+            (nan, pos, Some(Special::OneUndefined)),
+            (neg, nan, Some(Special::OneUndefined)),
+            // Same overflow — agreement, and equally vacuous.
+            (pos, pos, Some(Special::SameInfinity)),
+            (neg, neg, Some(Special::SameInfinity)),
+            // Opposite overflow, or overflow against a number — real disagreements.
+            (pos, neg, Some(Special::ConflictingInfinity)),
+            (neg, pos, Some(Special::ConflictingInfinity)),
+            (pos, 1.0, Some(Special::ConflictingInfinity)),
+            (1.0, neg, Some(Special::ConflictingInfinity)),
+            // Ordinary values are not special at all.
+            (1.0, 1.0, None),
+            (0.0, -0.0, None),
+        ];
+
+        for (a, b, expected) in cases {
+            assert_eq!(
+                Special::classify(a, b),
+                expected,
+                "classifying {a} against {b}"
+            );
+        }
+    }
+
+    /// Which classifications count as agreement, stated once so the policy can be read
+    /// off in one place rather than inferred from the comparison's control flow.
+    #[test]
+    fn the_agreement_policy_is_explicit() {
+        assert!(Special::BothUndefined.agrees());
+        assert!(Special::SameInfinity.agrees());
+        assert!(!Special::OneUndefined.agrees());
+        assert!(!Special::ConflictingInfinity.agrees());
+
+        // Both forms of agreement are reached without comparing arithmetic.
+        assert!(Special::BothUndefined.is_vacuous());
+        assert!(Special::SameInfinity.is_vacuous());
+        assert!(!Special::OneUndefined.is_vacuous());
+        assert!(!Special::ConflictingInfinity.is_vacuous());
+    }
+
+    /// No tolerance, however enormous, may absorb a disagreement about whether a result
+    /// exists or is in range. These are not differences of degree.
+    #[test]
+    fn special_disagreements_survive_any_tolerance() {
+        let enormous = Tolerance::new(1e30, 1e30);
+
+        assert!(!enormous.agree(f32::NAN, 1.0));
+        assert!(!enormous.agree(1.0, f32::NAN));
+        assert!(!enormous.agree(f32::INFINITY, f32::NEG_INFINITY));
+        assert!(!enormous.agree(f32::INFINITY, 1.0));
+        assert!(!enormous.agree(f32::NAN, f32::INFINITY));
+    }
+
+    /// And no tolerance, however strict, may *break* an agreement between two systems
+    /// that both correctly reported no answer.
+    #[test]
+    fn special_agreements_survive_exact_comparison() {
+        assert!(Tolerance::EXACT.agree(f32::NAN, f32::NAN));
+        assert!(Tolerance::EXACT.agree(f32::INFINITY, f32::INFINITY));
+        assert!(Tolerance::EXACT.agree(f32::NEG_INFINITY, f32::NEG_INFINITY));
+    }
+
+    /// The auditability requirement: a result made entirely of undefined values
+    /// *agrees*, but nothing was actually tested. That has to be distinguishable from a
+    /// genuine pass, or a run where every case overflowed would look like success.
+    #[test]
+    fn an_entirely_undefined_result_agrees_but_examines_nothing() {
+        let undefined = [f32::NAN, f32::NAN, f32::INFINITY];
+        let comparison = compare(&undefined, &undefined, Tolerance::EXACT);
+
+        assert!(comparison.agrees());
+        assert_eq!(comparison.vacuous_agreements, 3);
+        assert!(
+            !comparison.examined_any_arithmetic(),
+            "a result of nothing but undefined values verified nothing"
+        );
+    }
+
+    #[test]
+    fn a_partly_undefined_result_still_examines_the_rest() {
+        let left = [f32::NAN, 1.0, 2.0];
+        let right = [f32::NAN, 1.0, 2.0];
+        let comparison = compare(&left, &right, Tolerance::EXACT);
+
+        assert_eq!(comparison.vacuous_agreements, 1);
+        assert!(comparison.examined_any_arithmetic());
+    }
+
+    #[test]
+    fn an_ordinary_result_has_no_vacuous_agreements() {
+        let comparison = compare(&[1.0, 2.0], &[1.0, 2.0], Tolerance::EXACT);
+        assert_eq!(comparison.vacuous_agreements, 0);
+        assert!(comparison.examined_any_arithmetic());
+    }
+
+    /// An empty result examines nothing either — there was nothing to examine. Worth
+    /// pinning so the check is about *content*, not just about special values.
+    #[test]
+    fn an_empty_result_examines_nothing() {
+        let comparison = compare(&[], &[], Tolerance::EXACT);
+        assert!(comparison.agrees());
+        assert!(!comparison.examined_any_arithmetic());
+    }
 
     #[test]
     fn two_nans_agree() {
