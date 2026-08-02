@@ -107,12 +107,47 @@ impl TolerancePolicy<TensorOp> for TensorTolerancePolicy {
         match input.class() {
             OpClass::CorrectlyRounded => Tolerance::EXACT,
 
-            // Two units in the last place: one for each side's own rounding.
-            OpClass::Approximated => Tolerance::new(2.0 * EPSILON, 0.0),
+            OpClass::Approximated => approximated_tolerance(input),
 
             OpClass::Accumulating => accumulating_tolerance(input),
         }
     }
+}
+
+/// Tolerance for an approximated function, scaled by how hard the function is to
+/// evaluate at the argument it was given.
+///
+/// The governing idea is the **condition number**: how much a small relative
+/// perturbation of the input is magnified in the output. For `exp(x)` it is `|x|`,
+/// because `exp(x + d) = exp(x) * e^d` — a tiny error in the argument becomes a relative
+/// error of roughly `d` in the result. Implementations reduce the argument before
+/// approximating (`x = k*ln2 + r`), and the error in that reduction grows with `|x|`, so
+/// two libraries drift further apart the larger the argument.
+///
+/// Hence `(1 + |x|) * eps` for one implementation — a rounding step plus the
+/// condition-number term — doubled because two implementations may sit on opposite sides
+/// of the true value.
+///
+/// **This replaces a fixed `2 * eps`, which was wrong in an instructive way.** That
+/// constant was derived from data measured with `|x| <= 10`, and it held perfectly
+/// there. Run at `|x| <= 1000` it produced 235 false positives, because it did not
+/// scale with the thing that actually drives the error. *Fixed thresholds inherit the
+/// scope of the evidence they were derived from* — the same trap the accumulating class
+/// avoided by being computed per case from the outset.
+///
+/// The bound is deliberately looser than measurement at small arguments (roughly 20x the
+/// worst observed at `|x| <= 10`). That gap is honest: the model bounds what is
+/// *permissible* for a function the standard does not require to be correctly rounded,
+/// while measurement shows what these two particular libraries *happen* to do today. A
+/// threshold tightened to the latter would be fitted to an implementation detail.
+fn approximated_tolerance(input: &TensorOp) -> Tolerance {
+    let largest = match input {
+        TensorOp::Unary { arg, .. } => largest_magnitude(arg.data()),
+        // Every approximated operation is unary; anything else is misclassified.
+        other => unreachable!("{} is not an approximated unary operation", other.name()),
+    };
+
+    Tolerance::new(2.0 * (1.0 + largest) * EPSILON, 0.0)
 }
 
 /// Tolerance for an operation that sums `terms` values of magnitude up to `largest`.
@@ -197,13 +232,56 @@ mod tests {
     }
 
     #[test]
-    fn exp_is_allowed_two_rounding_steps() {
+    fn exp_is_allowed_at_least_two_rounding_steps() {
         let tolerance = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1.0)));
 
         assert_eq!(tolerance.atol, 0.0);
         // Comfortably above the measured ceiling of one unit in the last place.
         assert!(tolerance.rtol > f32::EPSILON as f64);
         assert!(tolerance.rtol < 1e-6);
+    }
+
+    /// The fix for the 235 false positives found at wide bounds: `exp`'s allowance must
+    /// grow with the argument, because that is what drives its error. A fixed constant
+    /// is only valid over the range of arguments it was measured on.
+    #[test]
+    fn exp_tolerance_scales_with_argument_magnitude() {
+        let small = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1.0)));
+        let large = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1000.0)));
+
+        assert!(large.rtol > small.rtol * 100.0, "{large:?} vs {small:?}");
+        // Still an entirely relative allowance — `exp` of a large argument is large, so
+        // an absolute floor would be meaningless here.
+        assert_eq!(large.atol, 0.0);
+    }
+
+    /// The derived bound must cover what was actually measured at wide bounds, with
+    /// margin. If this fails, either the model is wrong or something is happening that
+    /// is not rounding.
+    #[test]
+    fn the_exp_bound_covers_the_measured_worst_case_at_large_arguments() {
+        let tolerance = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1000.0)));
+
+        // Measured worst relative error for `exp` across 4,000 wide-bounds cases.
+        let measured_worst = 1.633e-4;
+        assert!(
+            tolerance.rtol > measured_worst,
+            "derived rtol {:e} does not cover measured {:e}",
+            tolerance.rtol,
+            measured_worst
+        );
+        // And is not absurdly loose: within an order of magnitude of what occurs.
+        assert!(tolerance.rtol < measured_worst * 10.0);
+    }
+
+    /// The argument's magnitude drives the allowance, not the tensor's size — twice as
+    /// many values of the same magnitude are no harder to evaluate.
+    #[test]
+    fn exp_tolerance_ignores_how_many_values_there_are() {
+        let few = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[2], 5.0)));
+        let many = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[64], 5.0)));
+
+        assert_eq!(few.rtol, many.rtol);
     }
 
     /// The derived bound must cover what was actually measured, with margin. If this
