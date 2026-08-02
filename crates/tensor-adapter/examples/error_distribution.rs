@@ -13,7 +13,7 @@
 
 use diff_fuzzer_core::{Generator, Implementation, Normalizer, SeededRng, Tolerance, compare};
 use std::collections::BTreeMap;
-use tensor_adapter::{TensorNormalizer, TensorOpGenerator, libtorch, ndarray};
+use tensor_adapter::{Bounds, TensorNormalizer, TensorOpGenerator, libtorch, ndarray};
 
 const CASES: u64 = 20_000;
 
@@ -52,11 +52,25 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 fn main() {
-    let generator = TensorOpGenerator::default();
+    // `wide` widens shapes and value magnitudes, to check whether a tolerance derived
+    // from data measured at one scale still holds at another.
+    let wide = std::env::args().any(|a| a == "wide");
+    let bounds = if wide {
+        Bounds {
+            max_rank: 3,
+            max_dim: 64,
+            magnitude: 1000.0,
+        }
+    } else {
+        Bounds::default()
+    };
+    let cases = if wide { 4_000 } else { CASES };
+
+    let generator = TensorOpGenerator::new(bounds);
     let (cpu, torch) = (ndarray(), libtorch());
     let mut per_operation: BTreeMap<&str, Errors> = BTreeMap::new();
 
-    for seed in 0..CASES {
+    for seed in 0..cases {
         let case = generator.generate(&mut SeededRng::from_seed(seed));
 
         let left = TensorNormalizer.normalize(cpu.run(&case).expect("valid case"));
@@ -90,7 +104,10 @@ fn main() {
         }
     }
 
-    println!("{CASES} cases, burn-ndarray vs burn-tch\n");
+    println!(
+        "{cases} cases, |value| <= {}, dim <= {}, burn-ndarray vs burn-tch\n",
+        bounds.magnitude, bounds.max_dim
+    );
     println!("relative error per operation (worst element of each case)\n");
     println!(
         "  {:<8} {:>6} {:>11} {:>11} {:>11} {:>11}",
