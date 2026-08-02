@@ -373,6 +373,120 @@ mod tests {
         assert!(Tolerance::EXACT.agree(0.0, -0.0));
     }
 
+    /// The comparison is `<=`, so a difference landing exactly on the threshold agrees.
+    /// Pinning which side of the boundary is inclusive matters: an off-by-one-bit change
+    /// here would shift every borderline verdict in the project without failing anything
+    /// else.
+    #[test]
+    fn a_difference_exactly_at_the_threshold_agrees() {
+        // Purely absolute, so the arithmetic is exact and the test is not itself subject
+        // to rounding: threshold is atol = 0.5, difference is exactly 0.5.
+        let tolerance = Tolerance::new(0.0, 0.5);
+        assert!(tolerance.agree(1.0, 1.5));
+        // Just beyond it does not.
+        assert!(!tolerance.agree(1.0, 1.5000001));
+    }
+
+    /// Under exact comparison, adjacent representable numbers must be reported as
+    /// different — one unit in the last place is the smallest disagreement that exists,
+    /// and exact comparison exists precisely to catch it.
+    #[test]
+    fn one_unit_in_the_last_place_is_caught_by_exact_comparison() {
+        let value = 1.0_f32;
+        let next = f32::from_bits(value.to_bits() + 1);
+
+        assert_ne!(value, next);
+        assert!(!Tolerance::EXACT.agree(value, next));
+        // And the smallest tolerance that covers it is one epsilon.
+        assert!(Tolerance::new(f32::EPSILON as f64, 0.0).agree(value, next));
+    }
+
+    /// Subnormals — numbers too small for the normal representation, which trade
+    /// precision for range. They appear in practice: `exp` of a large negative argument
+    /// lands here. Relative comparison degrades in this region, which is another reason
+    /// an absolute floor is not optional.
+    #[test]
+    fn subnormal_values_are_handled() {
+        let tiny = 4.5e-39_f32; // below f32::MIN_POSITIVE (~1.18e-38)
+        let next = f32::from_bits(tiny.to_bits() + 1);
+
+        assert!(
+            tiny > 0.0,
+            "the test value must actually be subnormal-range"
+        );
+        assert!(!Tolerance::EXACT.agree(tiny, next));
+        // An absolute floor far below anything meaningful still covers them, because
+        // the gap between adjacent subnormals is minuscule in absolute terms.
+        assert!(Tolerance::new(0.0, 1e-40).agree(tiny, next));
+    }
+
+    /// Values of opposite sign. The scale is the larger magnitude, so this must not
+    /// accidentally cancel into a small denominator.
+    #[test]
+    fn values_of_opposite_sign_are_compared_by_magnitude() {
+        let tolerance = Tolerance::new(0.5, 0.0);
+        // Difference is 2.0, larger magnitude is 1.0, so the threshold is 0.5.
+        assert!(!tolerance.agree(1.0, -1.0));
+        // Both near zero and both tiny: still a real difference relative to their size.
+        assert!(!tolerance.agree(1e-10, -1e-10));
+    }
+
+    /// Two zeros are identical, and the relative error of identical values is zero
+    /// rather than an undefined division.
+    #[test]
+    fn two_zeros_agree_with_no_undefined_arithmetic() {
+        let comparison = compare(&[0.0, -0.0], &[0.0, 0.0], Tolerance::EXACT);
+        assert!(comparison.agrees());
+        assert_eq!(comparison.max_relative_error, 0.0);
+        assert!(comparison.max_relative_error.is_finite());
+    }
+
+    /// Very large finite values must still be comparable — the relative term has to do
+    /// the work there, since no sane absolute floor would.
+    #[test]
+    fn very_large_values_are_compared_relatively() {
+        let huge = 3.0e38_f32; // near f32::MAX
+        let slightly_more = huge * (1.0 + 1e-7);
+
+        assert!(slightly_more.is_finite(), "test value must not overflow");
+        assert!(Tolerance::new(1e-6, 0.0).agree(huge, slightly_more));
+        assert!(!Tolerance::new(1e-9, 0.0).agree(huge, slightly_more));
+    }
+
+    // `ApproxEq` for `Vec<f32>` is what the engine's own tests compare through, so its
+    // three outcomes are worth exercising directly rather than only via the oracle.
+
+    #[test]
+    fn approx_compare_reports_agreement() {
+        let a = vec![1.0, 2.0];
+        assert!(matches!(
+            a.approx_compare(&a.clone(), Tolerance::EXACT),
+            Agreement::Agree(_)
+        ));
+    }
+
+    #[test]
+    fn approx_compare_reports_disagreement_with_the_comparison() {
+        let outcome = vec![1.0, 2.0].approx_compare(&vec![1.0, 9.0], Tolerance::EXACT);
+
+        let Agreement::Disagree(comparison) = outcome else {
+            panic!("expected disagreement, got {outcome:?}");
+        };
+        assert_eq!(comparison.mismatches, 1);
+        assert_eq!(comparison.worst.expect("a worst element").index, 1);
+    }
+
+    /// Different lengths are structural, and no tolerance may absorb them.
+    #[test]
+    fn approx_compare_reports_a_length_difference_as_structural() {
+        let outcome = vec![1.0].approx_compare(&vec![1.0, 2.0], Tolerance::new(1e30, 1e30));
+
+        let Agreement::Structural { reason } = outcome else {
+            panic!("a length difference was absorbed by tolerance: {outcome:?}");
+        };
+        assert!(reason.contains("lengths differ"), "{reason}");
+    }
+
     #[test]
     fn comparing_equal_results_reports_no_mismatches() {
         let values = [1.0, 2.0, 3.0];
