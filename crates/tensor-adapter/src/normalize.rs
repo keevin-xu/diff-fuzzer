@@ -15,15 +15,28 @@ use diff_fuzzer_core::{Agreement, ApproxEq, Normalizer, Tolerance, compare};
 
 /// A tensor result in a form any backend's output can be converted to.
 ///
-/// Shape is kept alongside the values because a flat list alone would make a 2x3 and a
-/// 3x2 result indistinguishable — and two backends returning the same numbers in a
-/// different shape is a real disagreement, in fact a louder one than a numeric
-/// difference, since they disagree about the operation's meaning rather than its
-/// arithmetic.
+/// Three parts, and the first two exist to stop the third from being compared when it
+/// should not be.
+///
+/// **Shape**, because a flat list alone would make a 2x3 and a 3x2 result
+/// indistinguishable — and two backends returning the same numbers in a different shape
+/// is a real disagreement, in fact a louder one than a numeric difference, since they
+/// disagree about the operation's meaning rather than its arithmetic.
+///
+/// **Dtype**, recorded as the backend actually reported it, *before* any conversion.
+/// Values are then converted to a single common precision so that comparison is
+/// meaningful — but the original type is kept, because converting first and comparing
+/// afterwards would silently absorb a genuine disagreement about what type the operation
+/// returns. Normalising a difference away and never mentioning it is how a tool stops
+/// noticing things.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalTensor {
     pub shape: Vec<usize>,
-    /// Values in row-major order.
+    /// The element type the backend produced, before conversion to the comparison
+    /// precision.
+    pub dtype: String,
+    /// Values in row-major order, converted to `f32` — the common precision at which
+    /// comparison happens.
     pub values: Vec<f32>,
 }
 
@@ -48,15 +61,25 @@ impl Normalizer for TensorNormalizer {
         // to hold on to, since a canonical result should not depend on burn's types.
         let shape = out.shape.to_vec();
 
-        // This cannot fail today: every backend in use is instantiated with `f32`, so
-        // the extraction always matches. Adding a backend with a different element
-        // type is the change that would make this fallible, and would mean this trait
-        // needs to return a `Result`.
-        let values = out
-            .to_vec::<f32>()
-            .expect("backends are instantiated with f32 elements");
+        // Recorded before conversion, so a backend that returned a different element
+        // type can still be caught saying so.
+        let dtype = format!("{:?}", out.dtype);
 
-        CanonicalTensor { shape, values }
+        // Converted rather than extracted. Reading `f32` out of a result that is not
+        // `f32` would fail, and previously did so by panicking — which turns a
+        // *finding* (two backends disagreeing about the result type) into a crash of
+        // the tool. Converting always succeeds, and the dtype recorded above is what
+        // preserves the difference for the comparison to notice.
+        let values = out
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("values were just converted to f32");
+
+        CanonicalTensor {
+            shape,
+            dtype,
+            values,
+        }
     }
 }
 
@@ -71,6 +94,17 @@ impl ApproxEq for CanonicalTensor {
         if self.shape != other.shape {
             return Agreement::Structural {
                 reason: format!("shapes differ: {:?} vs {:?}", self.shape, other.shape),
+            };
+        }
+
+        // Element type is settled before the numbers are, and for the same reason as
+        // shape: two backends returning different types for the same operation disagree
+        // about what it *produces*, not about the value it computed. The values have
+        // already been converted to a common precision, so a numeric comparison here
+        // would succeed and quietly hide it.
+        if self.dtype != other.dtype {
+            return Agreement::Structural {
+                reason: format!("element types differ: {} vs {}", self.dtype, other.dtype),
             };
         }
 
@@ -101,12 +135,71 @@ mod tests {
     }
 
     #[test]
-    fn normalizing_keeps_shape_and_values() {
+    fn normalizing_keeps_shape_dtype_and_values() {
         let out = ndarray().run(&case()).unwrap();
         let canon = TensorNormalizer.normalize(out);
 
         assert_eq!(canon.shape, vec![2, 2]);
         assert_eq!(canon.values, vec![11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(canon.dtype, "F32");
+    }
+
+    /// Both backends must report the same element type. They are configured with the
+    /// same one, so a difference here would be genuinely surprising — which is exactly
+    /// why it is worth asserting rather than assuming.
+    #[test]
+    fn both_backends_report_the_same_element_type() {
+        let case = case();
+        let from_cpu = TensorNormalizer.normalize(ndarray().run(&case).unwrap());
+        let from_torch = TensorNormalizer.normalize(libtorch().run(&case).unwrap());
+
+        assert_eq!(from_cpu.dtype, from_torch.dtype);
+    }
+
+    /// A result of a different element type must not panic during normalisation.
+    ///
+    /// It used to: reading `f32` out of a non-`f32` result failed, which turned a
+    /// *finding* — two backends disagreeing about the result type — into a crash of the
+    /// tool. Conversion makes it a comparison instead.
+    #[test]
+    fn a_different_element_type_is_converted_rather_than_crashing() {
+        let doubles = TensorData::new(vec![1.0f64, 2.0], vec![2]);
+        let canon = TensorNormalizer.normalize(doubles);
+
+        assert_eq!(canon.values, vec![1.0f32, 2.0]);
+        assert_eq!(canon.dtype, "F64");
+    }
+
+    /// ...and having been converted, the difference is still reported, because the
+    /// original type was recorded first. Normalising a difference away and never
+    /// mentioning it is how a tool stops noticing things.
+    #[test]
+    fn an_element_type_difference_is_reported_as_structural() {
+        let floats = TensorNormalizer.normalize(TensorData::new(vec![1.0f32, 2.0], vec![2]));
+        let doubles = TensorNormalizer.normalize(TensorData::new(vec![1.0f64, 2.0], vec![2]));
+
+        // The values are identical after conversion, so a purely numeric comparison
+        // would report agreement.
+        assert_eq!(floats.values, doubles.values);
+
+        let outcome = floats.approx_compare(&doubles, Tolerance::new(1e30, 1e30));
+        let Agreement::Structural { reason } = outcome else {
+            panic!("an element-type difference was absorbed: {outcome:?}");
+        };
+        assert!(reason.contains("element types differ"), "{reason}");
+    }
+
+    /// Shape is checked before element type, so a case differing in both reports the
+    /// more fundamental disagreement first.
+    #[test]
+    fn a_shape_difference_is_reported_before_an_element_type_difference() {
+        let a = TensorNormalizer.normalize(TensorData::new(vec![1.0f32], vec![1]));
+        let b = TensorNormalizer.normalize(TensorData::new(vec![1.0f64, 2.0], vec![2]));
+
+        let Agreement::Structural { reason } = a.approx_compare(&b, Tolerance::EXACT) else {
+            panic!("expected a structural difference");
+        };
+        assert!(reason.contains("shapes differ"), "{reason}");
     }
 
     /// Two different backends, two different execution paths, one common form — and on
