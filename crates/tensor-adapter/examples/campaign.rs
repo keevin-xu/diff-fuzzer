@@ -24,7 +24,8 @@
 //! ```
 
 use diff_fuzzer_core::{
-    DifferentialOracle, Generator, NormalizedRunner, Runner, SeededRng, Verdict, driver::run_once,
+    DifferentialOracle, Finding, FindingsLog, Generator, NormalizedRunner, Runner, SeededRng,
+    Verdict, driver::run_once,
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
@@ -36,6 +37,10 @@ use tensor_adapter::{
 /// thousands of cases has a policy problem, not a discovery — and scrolling past all of
 /// them helps nobody.
 const MAX_PRINTED: usize = 20;
+
+/// How much of each recorded field to keep. Enough to see the shape of the data and the
+/// first values; far short of a full tensor.
+const FINDING_FIELD_CHARS: usize = 1_000;
 
 #[derive(Default)]
 struct Tally {
@@ -83,6 +88,14 @@ fn main() {
     );
     println!("  burn-ndarray vs burn-tch, tolerance derived per operation\n");
 
+    // Opened up front rather than on the first divergence, so a permissions or path
+    // problem surfaces immediately instead of after an hour of work is already lost.
+    let log_path = format!(
+        "findings/campaign-{}.jsonl",
+        if wide { "wide" } else { "default" }
+    );
+    let mut log = FindingsLog::open(&log_path).expect("findings log is writable");
+
     let mut totals = Tally::default();
     let mut per_operation: BTreeMap<&str, Tally> = BTreeMap::new();
     let mut printed = 0usize;
@@ -110,6 +123,21 @@ fn main() {
             Verdict::Diverged(divergence) => {
                 totals.diverged += 1;
                 entry.diverged += 1;
+
+                // Written before anything is printed. The terminal is where a finding
+                // is noticed; the file is where it survives.
+                //
+                // Truncated, because a wide-bounds case holds tens of thousands of
+                // values and its full text runs to about a megabyte — storing those
+                // verbatim produced a 224 MB log for 235 findings. The seed regenerates
+                // the case exactly, and the summary carries the error magnitudes, which
+                // is what triage actually reads.
+                log.append(&Finding::new(
+                    seed,
+                    case.name(),
+                    divergence.truncated(FINDING_FIELD_CHARS),
+                ))
+                .expect("findings log is writable");
 
                 if printed < MAX_PRINTED {
                     printed += 1;
@@ -150,6 +178,10 @@ fn main() {
     }
 
     println!();
+    if log.written() > 0 {
+        println!("  {} findings written to {log_path}\n", log.written());
+    }
+
     if totals.diverged == 0 {
         println!("  no divergences. The backends agree everywhere the policy allows.");
         println!("  (The injected-fault tests in `cargo test` are what make this claim");

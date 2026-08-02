@@ -50,4 +50,9 @@ thiserror = "2.0.19"
 # calling program's business, which is why the library takes the facade and not a
 # subscriber. Every event carries the seed, so a log line is always actionable.
 tracing = "0.1.44"
+# Serialising findings to disk. A divergence that exists only in a terminal scrollback
+# is not a finding anyone can act on. Both crates are already in the dependency graph
+# via burn, so this costs no extra compilation.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tracing-subscriber = "0.3.23"

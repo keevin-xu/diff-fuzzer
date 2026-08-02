@@ -31,7 +31,7 @@ pub mod traits;
 // what callers care about.
 pub use driver::{RunOutcome, run_once};
 pub use oracle::DifferentialOracle;
-pub use report::Divergence;
+pub use report::{Divergence, Finding, FindingsLog, read_findings};
 pub use rng::SeededRng;
 pub use runner::{NormalizedRunner, Runner};
 pub use tolerance::{

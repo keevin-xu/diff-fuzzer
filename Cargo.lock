@@ -1813,6 +1813,8 @@ version = "0.1.0"
 dependencies = [
  "rand 0.10.2",
  "rand_chacha 0.10.0",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
 ]
