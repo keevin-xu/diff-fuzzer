@@ -23,6 +23,7 @@ pub mod input;
 pub mod normalize;
 pub mod ops;
 pub mod testing;
+pub mod tolerance;
 
 pub use backends::{BurnBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, libtorch, ndarray};
 pub use generator::{FixedAddGenerator, TensorOpGenerator};
@@ -30,3 +31,4 @@ pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use ops::Bounds;
 pub use testing::FaultyBackend;
+pub use tolerance::{OpClass, TensorTolerancePolicy};

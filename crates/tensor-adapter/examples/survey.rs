@@ -11,12 +11,12 @@
 //! Run with: `cargo run --release -p tensor-adapter --example survey`
 
 use diff_fuzzer_core::{
-    DifferentialOracle, FixedTolerance, Generator, NormalizedRunner, Runner, SeededRng, Tolerance,
-    Verdict, driver::run_once,
+    DifferentialOracle, Generator, NormalizedRunner, Runner, SeededRng, Verdict, driver::run_once,
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, libtorch, ndarray,
+    CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy,
+    libtorch, ndarray,
 };
 
 const CASES: u64 = 5_000;
@@ -33,10 +33,9 @@ fn main() {
     let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
-    // Exact comparison for now: the tolerance policy that varies by operation
-    // arrives next.
-    let oracle: DifferentialOracle<TensorOp, CanonicalTensor, FixedTolerance> =
-        DifferentialOracle::new(FixedTolerance(Tolerance::EXACT));
+    // Tolerance is chosen per case from the operation and the size of its arguments.
+    let oracle: DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy> =
+        DifferentialOracle::new(TensorTolerancePolicy);
 
     let mut totals = Tally::default();
     let mut per_operation: BTreeMap<&str, Tally> = BTreeMap::new();
@@ -72,7 +71,7 @@ fn main() {
 
     let elapsed = started.elapsed();
 
-    println!("{CASES} cases, exact comparison, burn-ndarray vs burn-tch\n");
+    println!("{CASES} cases, derived per-operation tolerance, burn-ndarray vs burn-tch\n");
     println!(
         "  agreed   {:>6}  ({:.1}%)",
         totals.agreed,
