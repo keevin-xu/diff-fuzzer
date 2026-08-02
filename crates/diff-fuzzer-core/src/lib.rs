@@ -23,6 +23,7 @@ pub mod oracle;
 pub mod report;
 pub mod rng;
 pub mod runner;
+pub mod tolerance;
 pub mod traits;
 
 // Re-exported at the crate root so users write `diff_fuzzer_core::Oracle` rather than
@@ -33,6 +34,7 @@ pub use oracle::DifferentialOracle;
 pub use report::Divergence;
 pub use rng::SeededRng;
 pub use runner::{NormalizedRunner, Runner};
+pub use tolerance::{Comparison, Mismatch, Tolerance, compare};
 pub use traits::{
     Generator, Implementation, Input, NamedOutput, Normalizer, Oracle, RunError, Verdict,
 };
