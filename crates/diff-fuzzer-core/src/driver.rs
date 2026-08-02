@@ -11,7 +11,7 @@
 
 use crate::rng::SeededRng;
 use crate::runner::Runner;
-use crate::traits::{Generator, NamedOutput, Oracle, Verdict};
+use crate::traits::{Generator, NamedOutput, Oracle, SkipReason, Verdict};
 
 /// What one test case produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +64,7 @@ where
     // Report *why* there was nothing to compare. Without this, a run where every
     // system failed would look identical to one where everything agreed.
     let verdict = if outputs.len() < 2 && !failures.is_empty() {
-        Verdict::Skipped(failures.join("; "))
+        Verdict::Skipped(SkipReason::CouldNotRun { failures })
     } else {
         oracle.check(&input, &outputs)
     };
@@ -75,7 +75,7 @@ where
         Verdict::Diverged(divergence) => {
             tracing::info!(seed, summary = %divergence.summary, "divergence")
         }
-        Verdict::Skipped(reason) => tracing::debug!(seed, %reason, "skipped"),
+        Verdict::Skipped(reason) => tracing::debug!(seed, reason = %reason, "skipped"),
         Verdict::Agree => tracing::debug!(seed, "agreed"),
     }
 
@@ -206,7 +206,15 @@ mod tests {
         let Verdict::Skipped(reason) = outcome.verdict else {
             panic!("expected a skip");
         };
-        assert!(reason.contains("does not do numbers"), "{reason}");
+        // The specific reason matters: "could not run" is a different situation from
+        // "nothing to compare", and conflating them would hide which one occurred.
+        let SkipReason::CouldNotRun { failures } = &reason else {
+            panic!("expected a could-not-run skip, got {reason:?}");
+        };
+        assert!(
+            failures.iter().any(|f| f.contains("does not do numbers")),
+            "{failures:?}"
+        );
     }
 
     /// With three systems, one refusing still leaves two to compare — so the case is

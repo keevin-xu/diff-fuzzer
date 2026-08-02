@@ -39,5 +39,6 @@ pub use tolerance::{
     compare,
 };
 pub use traits::{
-    Generator, Implementation, Input, NamedOutput, Normalizer, Oracle, RunError, Verdict,
+    Generator, Implementation, Input, NamedOutput, Normalizer, Oracle, RunError, SkipReason,
+    Verdict,
 };

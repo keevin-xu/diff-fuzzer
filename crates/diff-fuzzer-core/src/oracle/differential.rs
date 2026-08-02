@@ -14,7 +14,7 @@
 
 use crate::report::Divergence;
 use crate::tolerance::{Agreement, ApproxEq, Comparison, TolerancePolicy};
-use crate::traits::{Input, NamedOutput, Oracle, Verdict};
+use crate::traits::{Input, NamedOutput, Oracle, SkipReason, Verdict};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
@@ -51,10 +51,9 @@ where
         // skip and not a failure: one side legitimately being unable to run an input is
         // expected, and comparing an answer against no answer would be meaningless.
         if outputs.len() < 2 {
-            return Verdict::Skipped(format!(
-                "need at least two results to compare, got {}",
-                outputs.len()
-            ));
+            return Verdict::Skipped(SkipReason::TooFewResults {
+                available: outputs.len(),
+            });
         }
 
         let tolerance = self.policy.tolerance_for(input);
@@ -66,12 +65,24 @@ where
         let reference = &outputs[0];
         let mut complaints: Vec<String> = Vec::new();
 
+        // Whether any comparison actually examined arithmetic. A result that is entirely
+        // undefined on both sides agrees without checking anything, and reporting that as
+        // a pass would inflate the evidence a campaign appears to provide.
+        let mut examined_arithmetic = false;
+        let mut vacuous_elements = 0usize;
+
         for candidate in &outputs[1..] {
             match reference
                 .output
                 .approx_compare(&candidate.output, tolerance)
             {
-                Agreement::Agree(_) => {}
+                Agreement::Agree(comparison) => {
+                    if comparison.examined_any_arithmetic() {
+                        examined_arithmetic = true;
+                    } else {
+                        vacuous_elements = vacuous_elements.max(comparison.total);
+                    }
+                }
                 Agreement::Structural { reason } => complaints.push(format!(
                     "{} vs {}: {reason}",
                     reference.implementation, candidate.implementation
@@ -86,7 +97,15 @@ where
         }
 
         if complaints.is_empty() {
-            return Verdict::Agree;
+            // Agreement reached without comparing a single number is not a pass. It is a
+            // case that went unjudged, and saying so keeps the distinction visible.
+            return if examined_arithmetic {
+                Verdict::Agree
+            } else {
+                Verdict::Skipped(SkipReason::NothingComparable {
+                    elements: vacuous_elements,
+                })
+            };
         }
 
         Verdict::Diverged(Divergence {
@@ -280,14 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn one_result_is_skipped_not_compared() {
-        assert!(matches!(
-            check(&[output("a", vec![1.0, 2.0])]),
-            Verdict::Skipped(_)
-        ));
-    }
-
-    #[test]
     fn no_results_are_skipped() {
         assert!(matches!(check(&[]), Verdict::Skipped(_)));
     }
@@ -321,13 +332,54 @@ mod tests {
         );
     }
 
-    /// Two implementations both producing an undefined result agree. Relying on `==`
-    /// would report this as a disagreement, since NaN is not equal to itself.
+    /// Two implementations both producing an undefined result do **not** disagree —
+    /// relying on `==` would say they did, since NaN is not equal to itself — but nor is
+    /// it a pass. Nothing was compared, so the case is recorded as unjudged.
+    ///
+    /// The distinction matters at volume: a campaign in which every case overflowed
+    /// would otherwise report a wall of green while having verified nothing.
     #[test]
-    fn two_undefined_results_agree() {
+    fn an_entirely_undefined_result_is_skipped_rather_than_passed() {
+        let verdict = check(&[
+            output("a", vec![f32::NAN, f32::INFINITY]),
+            output("b", vec![f32::NAN, f32::INFINITY]),
+        ]);
+
+        let Verdict::Skipped(SkipReason::NothingComparable { elements }) = verdict else {
+            panic!("expected a nothing-comparable skip, got {verdict:?}");
+        };
+        assert_eq!(elements, 2);
+    }
+
+    /// But a result that is only *partly* undefined was still partly checked, and that
+    /// counts as a genuine pass. Skipping it would discard real evidence.
+    #[test]
+    fn a_partly_undefined_result_still_agrees() {
         assert_eq!(
-            check(&[output("a", vec![f32::NAN]), output("b", vec![f32::NAN])]),
+            check(&[
+                output("a", vec![f32::NAN, 1.0]),
+                output("b", vec![f32::NAN, 1.0]),
+            ]),
             Verdict::Agree
+        );
+    }
+
+    /// An undefined result on one side only remains a divergence — they disagree about
+    /// whether an answer exists, which the skip path must not swallow.
+    #[test]
+    fn an_undefined_result_on_one_side_still_diverges() {
+        assert!(matches!(
+            check(&[output("a", vec![f32::NAN]), output("b", vec![1.0])]),
+            Verdict::Diverged(_)
+        ));
+    }
+
+    #[test]
+    fn too_few_results_names_how_many_there_were() {
+        let verdict = check(&[output("a", vec![1.0])]);
+        assert_eq!(
+            verdict,
+            Verdict::Skipped(SkipReason::TooFewResults { available: 1 })
         );
     }
 }

@@ -140,10 +140,70 @@ pub trait Oracle {
     fn check(&self, input: &Self::In, outputs: &[NamedOutput<Self::Canon>]) -> Verdict;
 }
 
+/// Why a case was not judged.
+///
+/// Every variant is a case the tool deliberately declined to have an opinion about, and
+/// the reason is carried so that decision stays visible. **Silent exclusions are how a
+/// fuzzer hides real bugs from its own operator** — a skip that leaves no trace is
+/// indistinguishable from a pass, so a growing category of quietly-skipped cases could
+/// hollow out a campaign without changing anything anyone looks at.
+///
+/// These categories come from practice rather than guesswork: the first three were each
+/// discovered by hitting them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Fewer than two results survived, so there was nothing to compare against.
+    TooFewResults { available: usize },
+
+    /// One or more implementations could not run the case at all.
+    ///
+    /// Not evidence of being wrong: being unable to attempt an input is a legitimate
+    /// answer, and comparing an answer against no answer would be meaningless.
+    CouldNotRun { failures: Vec<String> },
+
+    /// Every element was settled by a special-value rule, so no arithmetic was compared.
+    ///
+    /// A result that is entirely undefined on both sides *agrees*, but the agreement is
+    /// empty — neither implementation was actually exercised. Counting that as a pass
+    /// would inflate the evidence a campaign appears to provide, so it is recorded as
+    /// what it is: a case that went unjudged.
+    NothingComparable { elements: usize },
+
+    /// The operation is known to vary legitimately, so a difference here would not be a
+    /// bug.
+    ///
+    /// Nothing uses this yet. It is the slot for behaviour that is genuinely
+    /// unspecified — the clearest example being GPU reductions, which use atomics and so
+    /// may sum in a different order on every run.
+    KnownLegal { class: String, detail: String },
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::TooFewResults { available } => {
+                write!(f, "need at least two results to compare, got {available}")
+            }
+            SkipReason::CouldNotRun { failures } => {
+                write!(f, "could not run: {}", failures.join("; "))
+            }
+            SkipReason::NothingComparable { elements } => write!(
+                f,
+                "all {elements} elements were undefined or infinite on both sides; \
+                 no arithmetic was compared"
+            ),
+            SkipReason::KnownLegal { class, detail } => {
+                write!(f, "{class} may legitimately vary: {detail}")
+            }
+        }
+    }
+}
+
 /// An oracle's judgement on one test case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// The results are consistent. The overwhelmingly common outcome.
+    /// The results are consistent, **and something was actually checked**. The
+    /// overwhelmingly common outcome.
     Agree,
     /// The results disagree in a way worth reporting.
     ///
@@ -152,12 +212,6 @@ pub enum Verdict {
     Diverged(Divergence),
     /// This case was not judged, and the reason why.
     ///
-    /// Skipping is a first-class outcome, not an error: an input one side cannot run,
-    /// or an operation whose result is legitimately allowed to vary, must be excluded
-    /// explicitly rather than counted as a disagreement. Carrying the reason keeps
-    /// that auditable — silent exclusions are how real bugs get hidden.
-    ///
-    /// A plain `String` for now; this becomes a proper enum once the real categories
-    /// are known from practice rather than guessed at.
-    Skipped(String),
+    /// Skipping is a first-class outcome, not an error.
+    Skipped(SkipReason),
 }
