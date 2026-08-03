@@ -23,7 +23,9 @@ divergence: burn-ndarray+fault(0.5) disagreed with burn-ndarray
 
 Results are compared within a **tolerance derived per operation** rather than exactly. The seven operations IEEE-754 requires to be correctly rounded are held to bit-for-bit equality; `exp` is allowed a rounding step; and summation and matrix multiplication get an allowance computed from each case's own shapes and values. Across **1,000,000 generated cases the two backends agree everywhere the policy permits**.
 
-Known limitations, all scheduled: `exp`'s allowance does not yet scale with argument magnitude (diagnosed, with a validated model); `NaN`/infinity handling is provisional; and the generator restricts operand domains, so undefined results do not yet occur.
+Every threshold is **derived from IEEE-754 and the standard error bounds, then checked against measurement** — never tuned until the output looked clean. The operations the standard requires to be correctly rounded are held to bit-for-bit equality; `exp` is bounded by its condition number; summation and matrix multiplication get an allowance computed from each case's own shapes and values. Undefined and infinite results have an explicit policy, and cases where nothing numeric could be compared are reported as unjudged rather than counted as passes. See `POLICY.md` for the full statement, including what the comparison is blind to.
+
+Known limitations, all scheduled: no minimisation yet, so a divergence is reported at whatever size it was generated; the fuzzing is seed-driven rather than coverage-guided; and only one backend pair is tested.
 
 **Build:** `cargo test` — libtorch is downloaded automatically by the build, so there is nothing to install.
 
