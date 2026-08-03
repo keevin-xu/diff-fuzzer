@@ -294,7 +294,7 @@ fn right_operand_rules(kind: BinaryOp) -> ValueRules {
 /// but structure kept), so the search reaches a readable case quickly and only falls
 /// back to gentler moves when the drastic ones destroy the failure.
 fn simpler_values(data: &[f32], rules: ValueRules) -> Vec<Vec<f32>> {
-    let mut out = Vec::new();
+    let mut out: Vec<Vec<f32>> = Vec::new();
 
     if rules.allow_zero {
         out.push(vec![0.0; data.len()]);
@@ -334,7 +334,56 @@ fn simpler_values(data: &[f32], rules: ValueRules) -> Vec<Vec<f32>> {
         out.push(smaller);
     }
 
+    // **Keep only what is strictly simpler.** `Shrink` requires it, and the moves above
+    // do not guarantee it on their own: offered against data that is already all zeros,
+    // "replace with ones" proposes something *more* complex, and since zeros are then
+    // offered straight back the search oscillates between the two until a budget stops
+    // it. Discarding an identical candidate is not enough — the cycle is between two
+    // different values.
+    //
+    // Found by the step budget firing on a case that should have finished, which is
+    // precisely the failure the budget exists to make visible rather than silent.
+    let current = complexity(data);
+    out.retain(|candidate| complexity(candidate) < current);
+
     out
+}
+
+/// How complex a set of values is, for deciding what counts as simpler.
+///
+/// Ordered lexicographically: **form first, then magnitude.** Form is what a reader
+/// notices — `[0.0, 0.0]` is obviously incidental in a way `[0.25, -3.5]` is not — and
+/// magnitude breaks ties so that reducing scale still counts as progress among values of
+/// the same form.
+///
+/// Making this explicit is the point. "Strictly simpler" was previously an assumption
+/// each move was trusted to honour, and one of them did not.
+fn complexity(data: &[f32]) -> (u32, f64) {
+    let form: u32 = data.iter().map(|v| form_rank(*v)).sum();
+    let magnitude: f64 = data
+        .iter()
+        .map(|v| if v.is_finite() { v.abs() as f64 } else { 0.0 })
+        .sum();
+
+    (form, magnitude)
+}
+
+/// How complicated a single value looks, from simplest to least.
+fn form_rank(value: f32) -> u32 {
+    if !value.is_finite() {
+        return 5;
+    }
+    if value == 0.0 {
+        0
+    } else if value == 1.0 {
+        1
+    } else if value == -1.0 {
+        2
+    } else if value.fract() == 0.0 {
+        3
+    } else {
+        4
+    }
 }
 
 impl TensorValue {
@@ -542,6 +591,59 @@ mod tests {
 
         assert!(has_all(0.0), "no all-zero candidate");
         assert!(has_all(1.0), "no all-one candidate");
+    }
+
+    /// **No candidate may equal its parent.** The `Shrink` contract requires strict
+    /// simplification, and an unchanged candidate breaks the search: it is accepted as
+    /// progress, lands back where it started, and repeats until a budget intervenes.
+    ///
+    /// The case that exposed this was one already reduced to all zeros, where "replace
+    /// the values with zeros" proposes exactly what is already there. Cases at rest on
+    /// each simple form are checked here for that reason.
+    #[test]
+    fn no_candidate_equals_its_parent() {
+        let settled = [
+            TensorOp::unary(UnaryOp::Abs, TensorValue::new(vec![2], vec![0.0, 0.0])),
+            TensorOp::unary(UnaryOp::Neg, TensorValue::new(vec![1], vec![1.0])),
+            TensorOp::binary(
+                BinaryOp::Add,
+                TensorValue::new(vec![1], vec![0.0]),
+                TensorValue::new(vec![1], vec![0.0]),
+            ),
+            TensorOp::binary(
+                BinaryOp::Div,
+                TensorValue::new(vec![1], vec![1.0]),
+                TensorValue::new(vec![1], vec![1.0]),
+            ),
+            TensorOp::reduce(ReduceOp::Sum, TensorValue::new(vec![1], vec![0.0]), 0),
+            TensorOp::matmul(
+                TensorValue::new(vec![1, 1], vec![1.0]),
+                TensorValue::new(vec![1, 1], vec![1.0]),
+            ),
+        ];
+
+        for case in settled {
+            for candidate in case.candidates() {
+                assert_ne!(
+                    candidate,
+                    case,
+                    "{} proposed itself, which would loop the search",
+                    case.name()
+                );
+            }
+        }
+    }
+
+    /// A fully settled case must offer nothing at all, which is what lets the search
+    /// finish rather than exhaust a budget.
+    #[test]
+    fn a_fully_reduced_case_offers_no_candidates() {
+        let settled = TensorOp::unary(UnaryOp::Abs, TensorValue::new(vec![1], vec![0.0]));
+        assert!(
+            settled.candidates().is_empty(),
+            "{:?}",
+            settled.candidates()
+        );
     }
 
     /// Shrinking introduces no randomness, so the same case always yields the same
