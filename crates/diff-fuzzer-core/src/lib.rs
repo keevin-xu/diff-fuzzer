@@ -19,6 +19,7 @@
 //! equality, shrinking a failure to its smallest form, and writing findings to disk.
 
 pub mod driver;
+pub mod minimize;
 pub mod oracle;
 pub mod report;
 pub mod rng;
@@ -30,6 +31,7 @@ pub mod traits;
 // `diff_fuzzer_core::traits::Oracle`. Module structure is our business; the names are
 // what callers care about.
 pub use driver::{RunOutcome, run_once};
+pub use minimize::Shrink;
 pub use oracle::DifferentialOracle;
 pub use report::{Divergence, Finding, FindingsLog, read_findings};
 pub use rng::SeededRng;

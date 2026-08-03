@@ -22,6 +22,7 @@ pub mod generator;
 pub mod input;
 pub mod normalize;
 pub mod ops;
+pub mod shrink;
 pub mod testing;
 pub mod tolerance;
 
