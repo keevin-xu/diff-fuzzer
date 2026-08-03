@@ -30,8 +30,8 @@ use diff_fuzzer_core::{
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 use tensor_adapter::{
-    CanonicalTensor, FaultyNdArray, TensorNormalizer, TensorOp, TensorTolerancePolicy,
-    environment, faulty as faulty_backend, libtorch, ndarray,
+    CanonicalTensor, FaultyNdArray, TensorNormalizer, TensorOp, TensorTolerancePolicy, environment,
+    faulty as faulty_backend, libtorch, ndarray,
 };
 
 /// Everything that is expensive to build, constructed once and reused.
@@ -146,9 +146,22 @@ fuzz_target!(|case: TensorOp| {
     // split across two directories is how one set of them gets forgotten.
     //
     // Named by the operation and a hash of the case, since there is no seed to key on.
+    //
+    // Filed under `runs/<run>/<operation>/`. A sustained campaign produces hundreds of
+    // reports, and a few hundred files in one directory is a pile rather than a result:
+    // two campaigns weeks apart become indistinguishable, and the operation — the first
+    // thing anyone wants to sort by — is buried in the filename.
+    //
+    // The run name comes from the environment because **each crash happens in a fresh
+    // process** under `-fork=1`, so the children cannot agree on anything held in memory.
+    // An environment variable is inherited by every child, which makes it the one channel
+    // that survives. (Unlike `DYLD_*` on macOS, which SIP strips — the reason fork mode
+    // was silently spawning children that died before executing anything.)
     let path = format!(
-        "{}/../findings/fuzz-{}-{:x}.json",
+        "{}/../findings/runs/{}/{}/fuzz-{}-{:x}.json",
         env!("CARGO_MANIFEST_DIR"),
+        run_label(),
+        case.name(),
         case.name(),
         case_digest(&case)
     );
@@ -158,6 +171,33 @@ fuzz_target!(|case: TensorOp| {
 
     panic!("divergence in {}: {}", case.name(), report.summary);
 });
+
+/// Which run's directory this process should file its findings under.
+///
+/// Read from `DIFF_FUZZER_RUN`, set once by whoever launches the campaign. When it is
+/// unset the label is `unlabelled` rather than something plausible-looking: an ad-hoc
+/// replay must not be able to quietly deposit its output into a real campaign's results,
+/// and a directory named `unlabelled` says what happened instead of hiding it.
+///
+/// Sanitised to a conservative character set, because the value ends up in a path and an
+/// environment variable is caller-supplied input like any other.
+fn run_label() -> String {
+    let raw = std::env::var("DIFF_FUZZER_RUN").unwrap_or_default();
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(96)
+        .collect();
+
+    // `.` survives the filter because dates and versions want it, which leaves `..` — a
+    // label of `..` would escape the run directory and scatter findings a level up. Any
+    // all-dots label is rejected rather than trusted.
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        "unlabelled".to_string()
+    } else {
+        cleaned
+    }
+}
 
 /// Run a case and return the divergence it produces, if any.
 fn describe(

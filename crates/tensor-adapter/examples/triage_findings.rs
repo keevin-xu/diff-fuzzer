@@ -87,25 +87,39 @@ fn main() {
     report(&groups, &seen);
 }
 
+/// Collect every report at or below `directory`.
+///
+/// **Recursive, because the layout is nested**: the fuzz target files findings under
+/// `runs/<run>/<operation>/`, so a campaign's output is several directories deep. Pointing
+/// this at `findings/` reads everything; pointing it at one run reads that run alone.
+///
+/// The recursion is written with an explicit stack rather than a recursive function — a
+/// findings tree is shallow, but a directory loop through a symlink is not something a
+/// triage tool should die on.
 fn load_all(directory: &str) -> Vec<DivergenceReport<TensorOp>> {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return Vec::new();
-    };
+    let mut reports = Vec::new();
+    let mut pending = vec![std::path::PathBuf::from(directory)];
 
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|e| e == "json"))
-        .filter_map(|path| match load_report(&path) {
-            Ok(report) => Some(report),
-            Err(error) => {
-                // Named rather than silently skipped: an unreadable report is a lost
-                // finding, and losing one quietly is worse than failing loudly.
-                eprintln!("could not read {}: {error}", path.display());
-                None
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "json") {
+                match load_report(&path) {
+                    Ok(report) => reports.push(report),
+                    // Named rather than silently skipped: an unreadable report is a lost
+                    // finding, and losing one quietly is worse than failing loudly.
+                    Err(error) => eprintln!("could not read {}: {error}", path.display()),
+                }
             }
-        })
-        .collect()
+        }
+    }
+
+    reports
 }
 
 /// Recompute a report's signature from its case.

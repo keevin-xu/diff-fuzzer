@@ -1,0 +1,35 @@
+   Compiling diff-fuzzer-fuzz v0.0.0 (/Users/kevinxu/Documents/my-random-documents/projects/diff-fuzzer/fuzz)
+    Finished `release` profile [optimized + debuginfo] target(s) in 24.93s
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.43s
+     Running `fuzz/target/aarch64-apple-darwin/release/tensor_diff -artifact_prefix=/Users/kevinxu/Documents/my-random-documents/projects/diff-fuzzer/fuzz/artifacts/tensor_diff/ -fork=1 -ignore_crashes=1 -max_total_time=14400 -max_len=256 /Users/kevinxu/Documents/my-random-documents/projects/diff-fuzzer/fuzz/corpus/tensor_diff`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 544721411
+INFO: Loaded 1 modules   (280546 inline 8-bit counters): 280546 [0x101d03cf0, 0x101d484d2), 
+INFO: Loaded 1 PC tables (280546 PCs): 280546 [0x101d484d8,0x1021902f8), 
+INFO: -fork=1: fuzzing in separate process(s)
+INFO: -fork=1: 425 seed inputs, starting to fuzz in /var/folders/b3/5d_17bjs3vz80t3w9mqjql440000gn/T//libFuzzerTemp.FuzzWithFork85802.dir
+#8833: cov: 3774 ft: 10024 corp: 425 exec/s: 4416 oom/timeout/crash: 0/0/0 time: 3s job: 1 dft_time: 0
+#19622: cov: 3774 ft: 10024 corp: 425 exec/s: 3596 oom/timeout/crash: 0/0/0 time: 6s job: 2 dft_time: 0
+#33306: cov: 3774 ft: 10024 corp: 425 exec/s: 3421 oom/timeout/crash: 0/0/0 time: 10s job: 3 dft_time: 0
+#49877: cov: 3774 ft: 10024 corp: 425 exec/s: 3314 oom/timeout/crash: 0/0/0 time: 16s job: 4 dft_time: 0
+#72717: cov: 3774 ft: 10024 corp: 425 exec/s: 3806 oom/timeout/crash: 0/0/0 time: 22s job: 5 dft_time: 0
+#96099: cov: 3774 ft: 10024 corp: 425 exec/s: 3340 oom/timeout/crash: 0/0/0 time: 29s job: 6 dft_time: 0
+#123530: cov: 3774 ft: 10024 corp: 425 exec/s: 3428 oom/timeout/crash: 0/0/0 time: 38s job: 7 dft_time: 0
+#158309: cov: 3774 ft: 10024 corp: 425 exec/s: 3864 oom/timeout/crash: 0/0/0 time: 47s job: 8 dft_time: 0
+#193719: cov: 3774 ft: 10024 corp: 425 exec/s: 3541 oom/timeout/crash: 0/0/0 time: 57s job: 9 dft_time: 0
+#229774: cov: 3774 ft: 10024 corp: 425 exec/s: 3277 oom/timeout/crash: 0/0/0 time: 69s job: 10 dft_time: 0
+#269433: cov: 3774 ft: 10024 corp: 425 exec/s: 3304 oom/timeout/crash: 0/0/0 time: 81s job: 11 dft_time: 0
+#313436: cov: 3774 ft: 10024 corp: 425 exec/s: 3384 oom/timeout/crash: 0/0/0 time: 95s job: 12 dft_time: 0
+#365631: cov: 3774 ft: 10024 corp: 425 exec/s: 3728 oom/timeout/crash: 0/0/0 time: 109s job: 13 dft_time: 0
+#412680: cov: 3774 ft: 10024 corp: 425 exec/s: 3136 oom/timeout/crash: 0/0/0 time: 125s job: 14 dft_time: 0
+#467707: cov: 3774 ft: 10024 corp: 425 exec/s: 3439 oom/timeout/crash: 0/0/0 time: 141s job: 15 dft_time: 0
+#526074: cov: 3774 ft: 10024 corp: 425 exec/s: 3433 oom/timeout/crash: 0/0/0 time: 159s job: 16 dft_time: 0
+#580102: cov: 3774 ft: 10024 corp: 425 exec/s: 3001 oom/timeout/crash: 0/0/0 time: 177s job: 17 dft_time: 0
+#650625: cov: 3774 ft: 10024 corp: 425 exec/s: 3711 oom/timeout/crash: 0/0/0 time: 196s job: 18 dft_time: 0
+#716624: cov: 3774 ft: 10024 corp: 425 exec/s: 3299 oom/timeout/crash: 0/0/0 time: 217s job: 19 dft_time: 0
+#790896: cov: 3774 ft: 10024 corp: 425 exec/s: 3536 oom/timeout/crash: 0/0/0 time: 238s job: 20 dft_time: 0
+#863465: cov: 3774 ft: 10024 corp: 425 exec/s: 3298 oom/timeout/crash: 0/0/0 time: 261s job: 21 dft_time: 0
+#930893: cov: 3774 ft: 10024 corp: 425 exec/s: 3548 oom/timeout/crash: 0/0/0 time: 280s job: 22 dft_time: 0
+==92552== ERROR: libFuzzer: deadly signal
+#1013954: cov: 3774 ft: 10024 corp: 425 exec/s: 3460 oom/timeout/crash: 0/0/1 time: 305s job: 23 dft_time: 0
+#1100897: cov: 3774 ft: 10024 corp: 425 exec/s: 3477 oom/timeout/crash: 0/0/1 time: 330s job: 24 dft_time: 0
