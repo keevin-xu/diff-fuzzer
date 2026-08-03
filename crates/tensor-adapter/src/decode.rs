@@ -50,7 +50,12 @@ const DECODE_BOUNDS: Bounds = Bounds {
     // Unused here — special values are selected by the byte layout below rather than by
     // a probability — but the struct requires them.
     special_value_rate: 0.0,
-    restrict_domains: true,
+    // **Unrestricted**, so `sqrt` receives negatives and divisors may be zero. Those
+    // produce `NaN` and infinity, which the comparison has an explicit policy for since
+    // PHASE-4 — and measurement showed the cost is about 0.4% of executions spent on
+    // cases that verify nothing. In exchange the fuzzer explores the overflow region,
+    // which is where the one real finding so far came from.
+    restrict_domains: false,
 };
 
 /// One byte, or zero if the input is exhausted.
@@ -117,6 +122,26 @@ fn tensor(u: &mut Unstructured<'_>, shape: Vec<usize>, domain: Domain) -> Tensor
     TensorValue::new(shape, data)
 }
 
+/// What a unary operation's argument is allowed to be.
+///
+/// Consults `DECODE_BOUNDS` rather than hardcoding the restriction — which it previously
+/// did, so flipping the setting would have had no effect on `sqrt` and quietly done
+/// nothing.
+fn unary_domain(kind: UnaryOp) -> Domain {
+    match kind {
+        UnaryOp::Sqrt if DECODE_BOUNDS.restrict_domains => Domain::NonNegative,
+        _ => Domain::Any,
+    }
+}
+
+/// What a binary operation's right operand is allowed to be.
+fn binary_right_domain(kind: BinaryOp) -> Domain {
+    match kind {
+        BinaryOp::Div if DECODE_BOUNDS.restrict_domains => Domain::NonZero,
+        _ => Domain::Any,
+    }
+}
+
 /// A shape of `rank` dimensions.
 fn shape(u: &mut Unstructured<'_>, rank: usize) -> Vec<usize> {
     (0..rank).map(|_| size(u, DECODE_BOUNDS.max_dim)).collect()
@@ -131,10 +156,7 @@ impl<'a> Arbitrary<'a> for TensorOp {
         Ok(match choice {
             0..=3 => {
                 let kind = [UnaryOp::Neg, UnaryOp::Abs, UnaryOp::Exp, UnaryOp::Sqrt][choice];
-                let domain = match kind {
-                    UnaryOp::Sqrt => Domain::NonNegative,
-                    _ => Domain::Any,
-                };
+                let domain = unary_domain(kind);
                 // Sequential bindings rather than nesting: the order bytes are consumed
                 // in *is* the layout, so making it explicit keeps it stable.
                 let rank = size(u, DECODE_BOUNDS.max_rank);
@@ -147,10 +169,7 @@ impl<'a> Arbitrary<'a> for TensorOp {
                 // One shape, used twice — the constraint cannot be violated because
                 // there is only one shape to violate it with.
                 let shape = shape(u, rank);
-                let right_domain = match kind {
-                    BinaryOp::Div => Domain::NonZero,
-                    _ => Domain::Any,
-                };
+                let right_domain = binary_right_domain(kind);
                 TensorOp::binary(
                     kind,
                     tensor(u, shape.clone(), Domain::Any),
@@ -309,11 +328,18 @@ mod tests {
         }
     }
 
-    /// Domain restrictions hold for decoded cases exactly as they do for generated ones.
-    /// A decoder that quietly ignored them would reintroduce the undefined results the
-    /// restrictions exist to keep out.
+    /// Domain restrictions must hold **as configured**. Asserting a fixed expectation
+    /// would pass whether or not the decoder actually consulted its setting — which it
+    /// previously did not, so flipping `restrict_domains` had no effect and nothing said
+    /// so.
     #[test]
-    fn decoded_cases_respect_operation_domains() {
+    fn decoded_cases_respect_the_configured_domains() {
+        if !DECODE_BOUNDS.restrict_domains {
+            // Unrestricted: undefined results are the point, so there is nothing to
+            // assert beyond validity, which other tests already cover.
+            return;
+        }
+
         for bytes in byte_strings(2_000) {
             match decode(&bytes) {
                 TensorOp::Unary {
@@ -331,6 +357,36 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// With restrictions lifted, the undefined region must actually be reached —
+    /// otherwise the setting would be nominal.
+    #[test]
+    fn unrestricted_decoding_reaches_the_undefined_region() {
+        if DECODE_BOUNDS.restrict_domains {
+            return;
+        }
+
+        let mut saw_negative_sqrt = false;
+        let mut saw_zero_divisor = false;
+
+        for bytes in byte_strings(3_000) {
+            match decode(&bytes) {
+                TensorOp::Unary {
+                    kind: UnaryOp::Sqrt,
+                    arg,
+                } => saw_negative_sqrt |= arg.data().iter().any(|v| *v < 0.0),
+                TensorOp::Binary {
+                    kind: BinaryOp::Div,
+                    rhs,
+                    ..
+                } => saw_zero_divisor |= rhs.data().contains(&0.0),
+                _ => {}
+            }
+        }
+
+        assert!(saw_negative_sqrt, "sqrt never received a negative");
+        assert!(saw_zero_divisor, "div never received a zero divisor");
     }
 
     /// The deliberately interesting values must actually appear, since a fuzzer mapping

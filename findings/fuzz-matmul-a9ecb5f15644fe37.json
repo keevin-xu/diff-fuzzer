@@ -1,0 +1,88 @@
+{
+  "seed": 0,
+  "label": "matmul",
+  "generator": "decoded from fuzzer bytes",
+  "input": {
+    "Matmul": {
+      "lhs": {
+        "shape": [
+          2,
+          8
+        ],
+        "data": [
+          -1e+30,
+          -9.0,
+          -9.0,
+          -1e+30,
+          -1e+30,
+          -1e+30,
+          -1e+30,
+          -9.0,
+          -1e+30,
+          -1e+30,
+          -1e+30,
+          1e+30,
+          -1e+30,
+          -9.0,
+          -9.0,
+          -1e+30
+        ]
+      },
+      "rhs": {
+        "shape": [
+          8,
+          1
+        ],
+        "data": [
+          -1000000100.0,
+          -1000000100.0,
+          -1000000100.0,
+          -1000000100.0,
+          -1000000100.0,
+          -0.0,
+          -1000000100.0,
+          -1000000100.0
+        ]
+      }
+    }
+  },
+  "minimisation": {
+    "steps": 23,
+    "candidates_tried": 261,
+    "stopped": "LocalMinimum",
+    "minimal": true
+  },
+  "outputs": [
+    [
+      "burn-ndarray",
+      "CanonicalTensor { shape: [2, 1], dtype: \"F32\", values: [inf, inf] }"
+    ],
+    [
+      "burn-tch",
+      "CanonicalTensor { shape: [2, 1], dtype: \"F32\", values: [inf, NaN] }"
+    ]
+  ],
+  "tolerance": {
+    "rtol": 1.9073486328125e-6,
+    "atol": 1.5258791245231142e+34
+  },
+  "environment": {
+    "tool": "diff-fuzzer 0.1.0",
+    "platform": "aarch64-macos",
+    "components": [
+      [
+        "burn",
+        "0.21.0"
+      ],
+      [
+        "tch",
+        "0.22.0"
+      ],
+      [
+        "libtorch",
+        "2.9.0"
+      ]
+    ]
+  },
+  "summary": "burn-ndarray vs burn-tch: 1 of 2 elements differ, max relative error 0.000e0, max absolute error 0.000e0, worst at element 1 (inf vs NaN) (rtol 1.9073486328125e-6, atol 1.5258791245231142e34)"
+}
