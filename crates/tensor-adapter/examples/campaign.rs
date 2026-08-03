@@ -24,13 +24,14 @@
 //! ```
 
 use diff_fuzzer_core::{
-    DifferentialOracle, Finding, FindingsLog, Generator, NormalizedRunner, Runner, SeededRng,
-    Verdict, driver::run_once,
+    DifferentialOracle, DivergenceReport, Finding, FindingsLog, Generator, MinimisationRecord,
+    NamedOutput, NormalizedRunner, Oracle, Runner, SeededRng, TolerancePolicy, Verdict,
+    driver::run_once, minimize,
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    Bounds, CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy,
-    libtorch, ndarray,
+    Bounds, CanonicalTensor, FaultyBackend, TensorNormalizer, TensorOp, TensorOpGenerator,
+    TensorTolerancePolicy, environment, libtorch, ndarray,
 };
 
 /// Divergences printed in full before switching to a count. A campaign that flags
@@ -56,6 +57,11 @@ fn main() {
     // `open` lifts the generator's domain restrictions, so `sqrt` receives negatives and
     // divisors may be zero — undefined and infinite results start occurring.
     let open = args.iter().any(|a| a == "open");
+    // `fault` swaps the libtorch backend for one deliberately wrong by a known amount.
+    // The real backends agree on everything the policy permits, so this is how the
+    // reporting path — shrink, describe, save — can be exercised on demand rather than
+    // only when a genuine divergence happens to turn up.
+    let fault = args.iter().any(|a| a == "fault");
 
     // The wider setting exists to stress the accumulating operations. Since the
     // tolerance for those is derived per case from the actual shapes and values, a
@@ -83,19 +89,55 @@ fn main() {
     let generator = TensorOpGenerator::new(bounds);
     let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
-    let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
+    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+
+    let second: &dyn Runner<In = TensorOp, Canon = CanonicalTensor> =
+        if fault { &faulty } else { &torch };
+    let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, second];
+
     let oracle: DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy> =
         DifferentialOracle::new(TensorTolerancePolicy);
 
+    // Does this case diverge? Used both for the campaign's own verdicts and as the
+    // predicate that drives shrinking.
+    //
+    // Note it re-asks the *policy* for each candidate rather than reusing the original
+    // case's tolerance. That is deliberate: a shrunk case is only a legitimate finding if
+    // it diverges under the tolerance that would apply to it. Since the policy tightens
+    // as a case gets smaller, this is the stricter reading of the two.
+    let diverges = |case: &TensorOp| -> bool {
+        let outputs: Vec<NamedOutput<CanonicalTensor>> = runners
+            .iter()
+            .filter_map(|runner| {
+                runner
+                    .run_and_normalize(case)
+                    .ok()
+                    .map(|output| NamedOutput {
+                        implementation: runner.name().to_string(),
+                        output,
+                    })
+            })
+            .collect();
+
+        matches!(oracle.check(case, &outputs), Verdict::Diverged(_))
+    };
+
     println!(
-        "campaign: {cases} cases, {} bounds{} (rank <= {}, dim <= {}, |value| <= {})",
+        "campaign: {cases} cases, {} bounds{}{} (rank <= {}, dim <= {}, |value| <= {})",
         if wide { "wide" } else { "default" },
         if open { ", domains unrestricted" } else { "" },
+        if fault { ", FAULT INJECTED" } else { "" },
         bounds.max_rank,
         bounds.max_dim,
         bounds.magnitude
     );
-    println!("  burn-ndarray vs burn-tch, tolerance derived per operation\n");
+    // Naming the actual pair rather than the usual one: a header that says `burn-tch`
+    // while a fault is injected would misdescribe every finding below it.
+    println!(
+        "  {} vs {}, tolerance derived per operation\n",
+        cpu.name(),
+        second.name()
+    );
 
     // Opened up front rather than on the first divergence, so a permissions or path
     // problem surfaces immediately instead of after an hour of work is already lost.
@@ -134,6 +176,49 @@ fn main() {
             Verdict::Diverged(divergence) => {
                 totals.diverged += 1;
                 entry.diverged += 1;
+
+                // Shrink before recording. A divergence arrives at whatever size the
+                // generator produced — often hundreds of values, nearly all irrelevant —
+                // and nobody can act on that. Doing it here, at the moment of discovery,
+                // means every saved report is already the smallest form we could find.
+                let minimized = minimize(case.clone(), diverges);
+
+                // Re-judge the *minimised* case to describe it. The original's outputs
+                // and summary belong to a case the report no longer contains — pairing a
+                // one-element input with a description of thirty-five values would leave
+                // a reader unable to tell which they were looking at.
+                let shrunk_divergence = match describe(&minimized.input, &runners, &oracle) {
+                    Some(divergence) => divergence,
+                    // Cannot happen — the predicate only accepted candidates that
+                    // diverge — but falling back to the original description is better
+                    // than losing the finding to an assertion.
+                    None => divergence.clone(),
+                };
+
+                let report = DivergenceReport {
+                    seed,
+                    label: case.name().to_string(),
+                    generator: format!("{bounds:?}"),
+                    input: minimized.input.clone(),
+                    minimisation: MinimisationRecord::from(&minimized),
+                    outputs: shrunk_divergence.outputs,
+                    tolerance: TensorTolerancePolicy.tolerance_for(&minimized.input),
+                    environment: environment(),
+                    summary: shrunk_divergence.summary,
+                };
+
+                let report_path = format!("findings/{}", report.filename());
+                report.save(&report_path).expect("report is writable");
+
+                if printed < MAX_PRINTED {
+                    println!(
+                        "  shrank {} values -> {} values in {} reductions ({}), saved to {report_path}",
+                        element_count(&case),
+                        element_count(&minimized.input),
+                        minimized.steps,
+                        minimized.stopped
+                    );
+                }
 
                 // Written before anything is printed. The terminal is where a finding
                 // is noticed; the file is where it survives.
@@ -202,6 +287,42 @@ fn main() {
             "  {} divergences to triage: reproducible? float noise? legal? real?",
             totals.diverged
         );
+    }
+}
+
+/// Run a case and return the divergence it produces, if any.
+///
+/// Used to describe a *shrunk* case, so that every field of a report refers to the same
+/// thing.
+fn describe(
+    case: &TensorOp,
+    runners: &[&dyn Runner<In = TensorOp, Canon = CanonicalTensor>],
+    oracle: &DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy>,
+) -> Option<diff_fuzzer_core::Divergence> {
+    let outputs: Vec<NamedOutput<CanonicalTensor>> = runners
+        .iter()
+        .filter_map(|runner| {
+            runner
+                .run_and_normalize(case)
+                .ok()
+                .map(|output| NamedOutput {
+                    implementation: runner.name().to_string(),
+                    output,
+                })
+        })
+        .collect();
+
+    match oracle.check(case, &outputs) {
+        Verdict::Diverged(divergence) => Some(divergence),
+        _ => None,
+    }
+}
+
+/// How many values a case holds, for reporting what shrinking achieved.
+fn element_count(case: &TensorOp) -> usize {
+    match case {
+        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => arg.len(),
+        TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
     }
 }
 
