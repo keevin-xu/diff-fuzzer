@@ -24,6 +24,7 @@ pub mod decode;
 pub mod environment;
 pub mod generator;
 pub mod input;
+pub mod known;
 pub mod normalize;
 pub mod ops;
 pub mod repro;
@@ -39,6 +40,7 @@ pub use backends::{BurnBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, libto
 pub use environment::{BURN_VERSION, LIBTORCH_VERSION, TCH_VERSION, environment};
 pub use generator::{FixedAddGenerator, TensorOpGenerator};
 pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
+pub use known::{KNOWN, Known, Status, known_issue};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use ops::Bounds;
 pub use signature::signature;

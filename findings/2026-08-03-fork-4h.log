@@ -33,3 +33,32 @@ INFO: -fork=1: 425 seed inputs, starting to fuzz in /var/folders/b3/5d_17bjs3vz8
 ==92552== ERROR: libFuzzer: deadly signal
 #1013954: cov: 3774 ft: 10024 corp: 425 exec/s: 3460 oom/timeout/crash: 0/0/1 time: 305s job: 23 dft_time: 0
 #1100897: cov: 3774 ft: 10024 corp: 425 exec/s: 3477 oom/timeout/crash: 0/0/1 time: 330s job: 24 dft_time: 0
+#1187997: cov: 3774 ft: 10024 corp: 425 exec/s: 3350 oom/timeout/crash: 0/0/1 time: 356s job: 25 dft_time: 0
+#1287477: cov: 3774 ft: 10024 corp: 425 exec/s: 3684 oom/timeout/crash: 0/0/1 time: 384s job: 26 dft_time: 0
+#1373896: cov: 3774 ft: 10024 corp: 425 exec/s: 3086 oom/timeout/crash: 0/0/1 time: 412s job: 27 dft_time: 0
+#1469934: cov: 3774 ft: 10024 corp: 425 exec/s: 3311 oom/timeout/crash: 0/0/1 time: 442s job: 28 dft_time: 0
+#1564284: cov: 3774 ft: 10024 corp: 425 exec/s: 3145 oom/timeout/crash: 0/0/1 time: 472s job: 29 dft_time: 0
+#1673202: cov: 3774 ft: 10024 corp: 425 exec/s: 3513 oom/timeout/crash: 0/0/1 time: 503s job: 30 dft_time: 0
+#1790257: cov: 3774 ft: 10024 corp: 425 exec/s: 3657 oom/timeout/crash: 0/0/1 time: 536s job: 31 dft_time: 0
+#1900866: cov: 3774 ft: 10024 corp: 425 exec/s: 3351 oom/timeout/crash: 0/0/1 time: 569s job: 32 dft_time: 0
+#2020221: cov: 3774 ft: 10024 corp: 425 exec/s: 3510 oom/timeout/crash: 0/0/1 time: 604s job: 33 dft_time: 0
+#2133449: cov: 3774 ft: 10024 corp: 425 exec/s: 3235 oom/timeout/crash: 0/0/1 time: 639s job: 34 dft_time: 0
+#2166000: cov: 3774 ft: 10024 corp: 425 exec/s: 3255 oom/timeout/crash: 0/0/1 time: 649s job: 35 dft_time: 0
+==3192== ERROR: libFuzzer: deadly signal
+#2292003: cov: 3774 ft: 10024 corp: 425 exec/s: 3405 oom/timeout/crash: 0/0/2 time: 687s job: 36 dft_time: 0
+#2418738: cov: 3774 ft: 10024 corp: 425 exec/s: 3335 oom/timeout/crash: 0/0/2 time: 725s job: 37 dft_time: 0
+#2561727: cov: 3774 ft: 10024 corp: 425 exec/s: 3666 oom/timeout/crash: 0/0/2 time: 765s job: 38 dft_time: 0
+#2711544: cov: 3774 ft: 10024 corp: 425 exec/s: 3745 oom/timeout/crash: 0/0/2 time: 805s job: 39 dft_time: 0
+#2859438: cov: 3774 ft: 10024 corp: 425 exec/s: 3607 oom/timeout/crash: 0/0/2 time: 846s job: 40 dft_time: 0
+#3004272: cov: 3774 ft: 10024 corp: 425 exec/s: 3448 oom/timeout/crash: 0/0/2 time: 889s job: 41 dft_time: 0
+#3144761: cov: 3774 ft: 10024 corp: 425 exec/s: 3267 oom/timeout/crash: 0/0/2 time: 932s job: 42 dft_time: 0
+#3145046: cov: 3774 ft: 10024 corp: 425 exec/s: 0 oom/timeout/crash: 0/0/2 time: 933s job: 43 dft_time: 0
+==10261== ERROR: libFuzzer: deadly signal
+#3145122: cov: 3774 ft: 10024 corp: 425 exec/s: 0 oom/timeout/crash: 0/0/3 time: 933s job: 44 dft_time: 0
+==10312== ERROR: libFuzzer: deadly signal
+#3310816: cov: 3774 ft: 10024 corp: 425 exec/s: 3602 oom/timeout/crash: 0/0/4 time: 979s job: 45 dft_time: 0
+#3446751: cov: 3774 ft: 10024 corp: 425 exec/s: 3577 oom/timeout/crash: 0/0/4 time: 1019s job: 46 dft_time: 0
+==11669== ERROR: libFuzzer: deadly signal
+#3603853: cov: 3774 ft: 10024 corp: 425 exec/s: 3272 oom/timeout/crash: 0/0/5 time: 1067s job: 47 dft_time: 0
+#3743646: cov: 3774 ft: 10024 corp: 425 exec/s: 2852 oom/timeout/crash: 0/0/5 time: 1117s job: 48 dft_time: 0
+#3893669: cov: 3774 ft: 10024 corp: 425 exec/s: 3000 oom/timeout/crash: 0/0/5 time: 1167s job: 49 dft_time: 0

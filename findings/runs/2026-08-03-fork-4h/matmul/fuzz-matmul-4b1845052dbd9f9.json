@@ -1,0 +1,118 @@
+{
+  "seed": 0,
+  "label": "matmul",
+  "generator": "decoded from fuzzer bytes",
+  "input": {
+    "Matmul": {
+      "lhs": {
+        "shape": [
+          3,
+          6
+        ],
+        "data": [
+          -7.0,
+          -7.0,
+          -9.0,
+          1e+30,
+          -0.0,
+          10.0,
+          2.0,
+          9.0,
+          -1e+30,
+          -1e+30,
+          -1e+30,
+          -1e+30,
+          -1e+30,
+          -1e+30,
+          6.0,
+          6.0,
+          -7.0,
+          -7.0
+        ]
+      },
+      "rhs": {
+        "shape": [
+          6,
+          6
+        ],
+        "data": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          1e+29,
+          -0.0,
+          -1e+29,
+          -1e+29,
+          -1e+29,
+          -1e+29,
+          -1e+29,
+          -1e+29,
+          -1e+29,
+          -1e+29,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          -1e+29,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  },
+  "minimisation": {
+    "steps": 4,
+    "candidates_tried": 57,
+    "stopped": "LocalMinimum",
+    "minimal": true
+  },
+  "outputs": [
+    [
+      "burn-ndarray",
+      "CanonicalTensor { shape: [3, 6], dtype: \"F32\", values: [-inf, 1.6e30, 7e29, 7e29, -9.0, 7e29, inf, inf, -1.9000001e30, -1.9000001e30, -1.7e30, -1.9000001e30, inf, inf, inf, inf, -inf, inf] }"
+    ],
+    [
+      "burn-tch",
+      "CanonicalTensor { shape: [3, 6], dtype: \"F32\", values: [-inf, 1.6e30, 7e29, 7e29, 0.0, 7e29, inf, inf, -1.9000001e30, -1.9000001e30, -1.7e30, -1.9000001e30, inf, inf, inf, inf, NaN, inf] }"
+    ]
+  ],
+  "tolerance": {
+    "rtol": 1.430511474609375e-6,
+    "atol": 8.583069105963129e+53
+  },
+  "environment": {
+    "tool": "diff-fuzzer 0.1.0",
+    "platform": "aarch64-macos",
+    "components": [
+      [
+        "burn",
+        "0.21.0"
+      ],
+      [
+        "tch",
+        "0.22.0"
+      ],
+      [
+        "libtorch",
+        "2.9.0"
+      ]
+    ]
+  },
+  "summary": "burn-ndarray vs burn-tch: 1 of 18 elements differ, max relative error 1.000e0, max absolute error 9.000e0, worst at element 16 (-inf vs NaN) (rtol 1.430511474609375e-6, atol 8.583069105963129e53)"
+}
