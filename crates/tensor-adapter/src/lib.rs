@@ -18,6 +18,7 @@
 //! here — building cases that satisfy each operation's own rules.
 
 pub mod backends;
+pub mod environment;
 pub mod generator;
 pub mod input;
 pub mod normalize;
@@ -27,6 +28,7 @@ pub mod testing;
 pub mod tolerance;
 
 pub use backends::{BurnBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, libtorch, ndarray};
+pub use environment::{BURN_VERSION, LIBTORCH_VERSION, TCH_VERSION, environment};
 pub use generator::{FixedAddGenerator, TensorOpGenerator};
 pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use normalize::{CanonicalTensor, TensorNormalizer};

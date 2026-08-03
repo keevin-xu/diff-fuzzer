@@ -16,6 +16,8 @@ burn.workspace = true
 # For the RNG traits only. The generator itself is always the engine's `SeededRng`,
 # never one of this crate's own — a second source of randomness would break replay.
 rand.workspace = true
+# A finding must serialise whole, so the case type carries serde derives.
+serde.workspace = true
 
 [dev-dependencies]
 # Only the examples need to *listen* to log events — a library emits them and lets the

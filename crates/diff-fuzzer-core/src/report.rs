@@ -113,6 +113,160 @@ impl Finding {
     }
 }
 
+/// What produced a finding, so a reader can tell whether it applies to them.
+///
+/// A divergence is **version-specific**. "These two backends disagree" is not a claim
+/// about software in general; it is a claim about particular releases on a particular
+/// platform, and a maintainer's first question is which ones. A report that cannot answer
+/// that is asking to be dismissed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Environment {
+    /// The version of this tool.
+    pub tool: String,
+    /// Where it ran — architecture and operating system.
+    pub platform: String,
+    /// The systems under test and their versions, supplied by the adapter, which is the
+    /// only part that knows what they are.
+    pub components: Vec<(String, String)>,
+}
+
+impl Environment {
+    /// Capture what the engine can determine for itself, ready for the adapter to add
+    /// the components it knows about.
+    pub fn detect() -> Self {
+        Self {
+            tool: format!("diff-fuzzer {}", env!("CARGO_PKG_VERSION")),
+            platform: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            components: Vec::new(),
+        }
+    }
+
+    /// Record a system under test and its version.
+    pub fn with(mut self, name: impl Into<String>, version: impl Into<String>) -> Self {
+        self.components.push((name.into(), version.into()));
+        self
+    }
+}
+
+/// How much the failing case was shrunk, and whether shrinking actually finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinimisationRecord {
+    pub steps: usize,
+    pub candidates_tried: usize,
+    pub stopped: crate::minimize::StopReason,
+    /// False when the search ran out of budget — in which case the case is small, but
+    /// **not** minimal, and the report must not imply otherwise.
+    pub minimal: bool,
+}
+
+impl<T> From<&crate::minimize::Minimized<T>> for MinimisationRecord {
+    fn from(minimized: &crate::minimize::Minimized<T>) -> Self {
+        Self {
+            steps: minimized.steps,
+            candidates_tried: minimized.candidates_tried,
+            stopped: minimized.stopped,
+            minimal: minimized.is_minimal(),
+        }
+    }
+}
+
+/// The complete, self-contained record of one divergence.
+///
+/// This is the artifact a maintainer receives, and it is designed around a single
+/// requirement: **it must be actionable without running our generator.** Hence the
+/// `input` field holds the case *itself*, fully serialised, rather than only the seed
+/// that produced it. A seed is meaningless outside the exact generator that made it —
+/// adding one operation reassigns what every seed maps to — so a report carrying only a
+/// seed would quietly rot the first time the generator changed.
+///
+/// The seed is still recorded, because it locates the case within a campaign and lets a
+/// run be replayed in context. It is useful, just not sufficient.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DivergenceReport<In> {
+    /// The seed that produced the original case. Context, not the means of reproduction.
+    pub seed: u64,
+    /// A stable label for grouping — typically the operation's name.
+    pub label: String,
+    /// A description of the generator's configuration. Also context: the input below is
+    /// what actually reproduces the failure.
+    pub generator: String,
+    /// **The minimised case, in full.** Everything needed to reproduce, independent of
+    /// the generator.
+    pub input: In,
+    pub minimisation: MinimisationRecord,
+    /// What each implementation produced.
+    pub outputs: Vec<(String, String)>,
+    /// The tolerance in force. Without it the claim is unfalsifiable — a reader cannot
+    /// tell whether the difference was meaningful or the threshold merely tight.
+    pub tolerance: crate::tolerance::Tolerance,
+    pub environment: Environment,
+    /// A human-readable statement of what disagreed and by how much.
+    pub summary: String,
+}
+
+impl<In: Serialize> DivergenceReport<In> {
+    /// Write the report to `path` as indented JSON.
+    ///
+    /// Indented, unlike the findings log: a log is streamed and scanned in bulk, while a
+    /// report is *read by a person* and quite possibly pasted into an issue.
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    /// A stable filename for this report.
+    ///
+    /// Derived from the label and seed rather than a timestamp or counter, so re-running
+    /// the same campaign overwrites the same file instead of accumulating duplicates of
+    /// one finding.
+    pub fn filename(&self) -> String {
+        format!("{}-{}.json", self.label, self.seed)
+    }
+}
+
+impl<In: std::fmt::Debug> std::fmt::Display for DivergenceReport<In> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "divergence in {} (seed {})", self.label, self.seed)?;
+        writeln!(f, "  {}", self.summary)?;
+        writeln!(
+            f,
+            "  tolerance: rtol {:e}, atol {:e}",
+            self.tolerance.rtol, self.tolerance.atol
+        )?;
+        writeln!(
+            f,
+            "  minimised: {} reductions over {} candidates ({})",
+            self.minimisation.steps, self.minimisation.candidates_tried, self.minimisation.stopped
+        )?;
+        writeln!(f, "  input: {:?}", self.input)?;
+        for (name, output) in &self.outputs {
+            writeln!(f, "  {name}: {output}")?;
+        }
+        write!(
+            f,
+            "  {} on {}",
+            self.environment.tool, self.environment.platform
+        )?;
+        for (name, version) in &self.environment.components {
+            write!(f, ", {name} {version}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Read a saved report back.
+pub fn load_report<In: for<'de> Deserialize<'de>>(
+    path: impl AsRef<Path>,
+) -> std::io::Result<DivergenceReport<In>> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&text)?)
+}
+
 /// Appends findings to a JSON Lines file.
 ///
 /// Each write is flushed immediately. A campaign can run for hours, and losing the last
@@ -337,6 +491,101 @@ mod tests {
     fn short_fields_are_left_alone() {
         let divergence = finding(1, "exp").divergence;
         assert_eq!(divergence.truncated(10_000), divergence);
+    }
+
+    fn report() -> DivergenceReport<Vec<f32>> {
+        DivergenceReport {
+            seed: 4242,
+            label: "matmul".to_string(),
+            generator: "Bounds { max_rank: 4, max_dim: 8 }".to_string(),
+            input: vec![1.0, 2.0],
+            minimisation: MinimisationRecord {
+                steps: 7,
+                candidates_tried: 43,
+                stopped: crate::minimize::StopReason::LocalMinimum,
+                minimal: true,
+            },
+            outputs: vec![
+                ("burn-ndarray".to_string(), "[3.0]".to_string()),
+                ("burn-tch".to_string(), "[3.5]".to_string()),
+            ],
+            tolerance: crate::tolerance::Tolerance::new(1e-6, 1e-9),
+            environment: Environment::detect().with("burn", "0.21.0"),
+            summary: "1 of 1 elements differ".to_string(),
+        }
+    }
+
+    /// **The property that makes a report worth writing.** What is saved can be read
+    /// back identically — including the case itself, which is what lets someone
+    /// reproduce the failure without running our generator at all.
+    #[test]
+    fn a_report_survives_a_round_trip() {
+        let path = temp_path("report");
+        let original = report();
+
+        original.save(&path).unwrap();
+        let loaded: DivergenceReport<Vec<f32>> = load_report(&path).unwrap();
+
+        assert_eq!(loaded, original);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The case must be stored *in full*, not merely referenced by seed. A seed is
+    /// meaningless outside the exact generator that produced it, so a report carrying
+    /// only a seed would rot the moment an operation was added.
+    #[test]
+    fn the_case_itself_is_recorded_not_just_its_seed() {
+        let json = serde_json::to_string(&report()).unwrap();
+
+        assert!(json.contains("\"input\""), "{json}");
+        assert!(
+            json.contains("1.0"),
+            "the values themselves must be present"
+        );
+    }
+
+    /// A report must say which versions it applies to. A divergence is a claim about
+    /// particular releases, and one that cannot say which is easy to dismiss.
+    #[test]
+    fn a_report_records_what_produced_it() {
+        let report = report();
+
+        assert!(report.environment.tool.contains("diff-fuzzer"));
+        assert!(!report.environment.platform.is_empty());
+        assert!(
+            report
+                .environment
+                .components
+                .iter()
+                .any(|(name, _)| name == "burn")
+        );
+    }
+
+    /// Whether shrinking *finished* must be visible, so a report cannot describe a case
+    /// as minimal when the search merely ran out of budget.
+    #[test]
+    fn a_report_says_whether_minimisation_completed() {
+        let unfinished = MinimisationRecord {
+            steps: 200,
+            candidates_tried: 900,
+            stopped: crate::minimize::StopReason::StepBudget,
+            minimal: false,
+        };
+
+        assert!(!unfinished.minimal);
+        assert!(
+            unfinished.stopped.to_string().contains("not minimal"),
+            "{}",
+            unfinished.stopped
+        );
+    }
+
+    /// Filenames derive from the finding, not from the clock, so re-running a campaign
+    /// overwrites the same file rather than accumulating copies of one divergence.
+    #[test]
+    fn report_filenames_are_stable() {
+        assert_eq!(report().filename(), "matmul-4242.json");
+        assert_eq!(report().filename(), report().filename());
     }
 
     #[test]

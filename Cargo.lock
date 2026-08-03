@@ -4823,6 +4823,7 @@ dependencies = [
  "burn",
  "diff-fuzzer-core",
  "rand 0.10.2",
+ "serde",
  "tracing-subscriber",
 ]
 

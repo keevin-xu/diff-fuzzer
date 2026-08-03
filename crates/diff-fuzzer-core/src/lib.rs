@@ -33,7 +33,10 @@ pub mod traits;
 pub use driver::{RunOutcome, run_once};
 pub use minimize::{Budget, Minimized, Shrink, StopReason, minimize, minimize_within};
 pub use oracle::DifferentialOracle;
-pub use report::{Divergence, Finding, FindingsLog, read_findings};
+pub use report::{
+    Divergence, DivergenceReport, Environment, Finding, FindingsLog, MinimisationRecord,
+    load_report, read_findings,
+};
 pub use rng::SeededRng;
 pub use runner::{NormalizedRunner, Runner};
 pub use tolerance::{

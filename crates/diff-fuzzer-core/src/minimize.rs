@@ -85,7 +85,7 @@ impl Default for Budget {
 /// otherwise would overstate the result. A report saying "minimised to two elements"
 /// means something different from "stopped at two elements with reductions still
 /// untried", and the difference is exactly the kind that quietly inflates a claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopReason {
     /// Nothing simpler still fails. The result is minimal for the available moves.
     LocalMinimum,

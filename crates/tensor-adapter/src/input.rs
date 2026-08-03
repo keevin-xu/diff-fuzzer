@@ -22,7 +22,7 @@ use diff_fuzzer_core::Input;
 /// every case. Keeping it as data means one generator can produce vectors, matrices
 /// and batched tensors alike; the cost is a single place where the runtime rank is
 /// turned back into a type, which lives in the backend module.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TensorValue {
     shape: Vec<usize>,
     data: Vec<f32>,
@@ -75,7 +75,7 @@ impl TensorValue {
 }
 
 /// Operations taking one tensor and returning one of the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     Neg,
     Abs,
@@ -89,7 +89,7 @@ pub enum UnaryOp {
 }
 
 /// Operations taking two tensors of the same shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -99,7 +99,7 @@ pub enum BinaryOp {
 }
 
 /// Operations collapsing one axis of a tensor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ReduceOp {
     /// Summing many values is where floating-point addition's lack of associativity
     /// shows up: two backends adding in a different order get different last bits.
@@ -112,7 +112,7 @@ pub enum ReduceOp {
 /// An enum rather than a struct with optional fields, so that each operation carries
 /// precisely its own arguments and nothing else. Adding an operation means adding a
 /// variant, after which the compiler names every place that has to handle it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TensorOp {
     Unary {
         kind: UnaryOp,
