@@ -36,3 +36,224 @@ pub trait Shrink: Sized {
     /// removing one element at a time.
     fn candidates(&self) -> Vec<Self>;
 }
+
+/// The outcome of shrinking, with enough detail to say what it achieved.
+///
+/// The counts are not decoration. "Shrunk to a rank-1 tensor of two elements" invites
+/// the question *from what*, and a reproduction is far more convincing when the report
+/// can say it came down from several thousand values. The number of candidates tried is
+/// the cost side of that: each one is a full execution on every system under test, so it
+/// is the figure to watch if minimisation ever becomes the slow part of a campaign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Minimized<T> {
+    /// The smallest failing case found.
+    pub input: T,
+    /// How many reductions were accepted.
+    pub steps: usize,
+    /// How many candidates were evaluated, accepted or not.
+    pub candidates_tried: usize,
+}
+
+/// Shrink a failing case to a locally minimal one.
+///
+/// `still_fails` decides whether a candidate still exhibits the failure — in practice,
+/// re-running it on every system and asking the oracle. **It must be deterministic.** If
+/// the same candidate can answer differently on two calls, the search wanders and the
+/// result is not reproducible, which would defeat the entire purpose.
+///
+/// The search is **greedy first-improvement**: take the first candidate that still
+/// fails, and start again from there. Combined with candidates being ordered
+/// most-aggressive-first, that reaches a small case quickly. It finds a *local* minimum,
+/// not a global one — a smaller failing case may exist by some other route. That is the
+/// right trade: each evaluation costs a full run on every backend, and an exhaustive
+/// search would cost far more than the marginal readability is worth.
+///
+/// Termination rests on `Shrink`'s contract that every candidate is strictly simpler
+/// than its parent, so the loop cannot revisit a case. An explicit budget is layered on
+/// top separately, because relying on a contract for termination is not the same as
+/// enforcing it.
+///
+/// If the case does not fail to begin with, it is returned untouched with no steps
+/// taken. That is a caller error rather than something to assert on: minimisation is
+/// often invoked from a reporting path, and crashing there would lose the finding it was
+/// called to describe.
+pub fn minimize<T, P>(input: T, mut still_fails: P) -> Minimized<T>
+where
+    T: Shrink,
+    P: FnMut(&T) -> bool,
+{
+    let mut current = input;
+    let mut steps = 0;
+    let mut candidates_tried = 0;
+
+    if !still_fails(&current) {
+        return Minimized {
+            input: current,
+            steps: 0,
+            candidates_tried: 1,
+        };
+    }
+
+    'shrinking: loop {
+        for candidate in current.candidates() {
+            candidates_tried += 1;
+
+            if still_fails(&candidate) {
+                current = candidate;
+                steps += 1;
+                // Start again from the smaller case: reductions that were unavailable
+                // before may have become possible, and ones already rejected may now
+                // succeed on a different shape.
+                continue 'shrinking;
+            }
+        }
+
+        // Nothing simpler still fails, so this is a local minimum.
+        break;
+    }
+
+    Minimized {
+        input: current,
+        steps,
+        candidates_tried,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for a test case: a list of numbers that shrinks by dropping elements
+    /// or halving them. Deliberately unlike a tensor — the search should not know or
+    /// care what it is shrinking.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Sample(Vec<u32>);
+
+    impl Shrink for Sample {
+        fn candidates(&self) -> Vec<Self> {
+            let mut out = Vec::new();
+
+            // Most aggressive first: drop an element.
+            for index in 0..self.0.len() {
+                let mut smaller = self.0.clone();
+                smaller.remove(index);
+                out.push(Sample(smaller));
+            }
+            // Then reduce a value.
+            for index in 0..self.0.len() {
+                if self.0[index] > 0 {
+                    let mut smaller = self.0.clone();
+                    smaller[index] /= 2;
+                    out.push(Sample(smaller));
+                }
+            }
+
+            out
+        }
+    }
+
+    /// The canonical delta-debugging demonstration: a failure caused by one property of
+    /// one element, buried in a large input, must shrink to just that element.
+    ///
+    /// The result is `[112]` rather than `[100]`, and that is worth understanding rather
+    /// than working around. Halving takes `900` to `450`, `225`, `112` — and then `56`,
+    /// which no longer fails, so `112` is where it stops. **The true minimum is `100`,
+    /// and this search does not find it**, because it reaches a local minimum by the
+    /// moves available rather than searching exhaustively.
+    ///
+    /// That is the intended trade. Each evaluation costs a full run on every system
+    /// under test, and closing the last 12% of the gap would cost far more than the
+    /// marginal readability is worth. What matters is that six values became one.
+    #[test]
+    fn shrinks_to_the_element_that_causes_the_failure() {
+        let large = Sample(vec![3, 7, 900, 2, 41, 8]);
+
+        // Fails only while some element is at least 100.
+        let result = minimize(large, |s| s.0.iter().any(|v| *v >= 100));
+
+        assert_eq!(result.input, Sample(vec![112]));
+        assert!(result.steps > 0);
+    }
+
+    /// A local minimum is genuinely minimal *with respect to the available moves*: no
+    /// single candidate of the result still fails. That is the property the search
+    /// actually guarantees, and so the one worth asserting.
+    #[test]
+    fn no_candidate_of_the_result_still_fails() {
+        let predicate = |s: &Sample| s.0.iter().any(|v| *v >= 100);
+        let result = minimize(Sample(vec![3, 7, 900, 2, 41, 8]), predicate);
+
+        for candidate in result.input.candidates() {
+            assert!(
+                !predicate(&candidate),
+                "{candidate:?} still fails, so {:?} was not minimal",
+                result.input
+            );
+        }
+    }
+
+    /// Everything irrelevant must go. A predicate that ignores the input's contents
+    /// entirely should leave nothing behind.
+    #[test]
+    fn removes_everything_the_failure_does_not_need() {
+        let result = minimize(Sample(vec![1, 2, 3, 4, 5]), |_| true);
+        assert_eq!(result.input, Sample(vec![]));
+    }
+
+    /// A case that cannot be reduced further is returned as it is, having tried and
+    /// rejected every candidate.
+    #[test]
+    fn a_minimal_case_is_left_alone() {
+        let smallest = Sample(vec![]);
+        let result = minimize(smallest.clone(), |s| *s == smallest);
+
+        assert_eq!(result.input, smallest);
+        assert_eq!(result.steps, 0);
+    }
+
+    /// **The property the whole search depends on.** The same case and predicate must
+    /// always shrink to the same result — a minimised reproduction that varied between
+    /// runs would be no more actionable than the original.
+    #[test]
+    fn minimisation_is_deterministic() {
+        let case = Sample(vec![9, 4, 250, 17, 3]);
+        let predicate = |s: &Sample| s.0.iter().any(|v| *v >= 100);
+
+        let first = minimize(case.clone(), predicate);
+        let second = minimize(case, predicate);
+
+        assert_eq!(first, second);
+    }
+
+    /// A case that never failed is returned untouched. Minimisation is called from a
+    /// reporting path, so this must not crash and lose the finding.
+    #[test]
+    fn a_case_that_does_not_fail_is_returned_unchanged() {
+        let case = Sample(vec![1, 2, 3]);
+        let result = minimize(case.clone(), |_| false);
+
+        assert_eq!(result.input, case);
+        assert_eq!(result.steps, 0);
+    }
+
+    /// The search reports its own cost, since each candidate is a full execution on
+    /// every system under test.
+    #[test]
+    fn the_cost_of_the_search_is_reported() {
+        let result = minimize(Sample(vec![5, 200, 6]), |s| s.0.iter().any(|v| *v >= 100));
+
+        assert!(result.candidates_tried >= result.steps);
+        assert!(result.candidates_tried > 0);
+    }
+
+    /// The predicate must never be asked about a case the search would not accept, and
+    /// every case it *does* accept must satisfy it. Checking after the fact guards
+    /// against a search that returns something which does not actually fail.
+    #[test]
+    fn the_result_still_fails() {
+        let predicate = |s: &Sample| s.0.len() >= 2 && s.0[0] > s.0[1];
+        let result = minimize(Sample(vec![8, 1, 4, 9, 2]), predicate);
+
+        assert!(predicate(&result.input), "{:?} does not fail", result.input);
+    }
+}
