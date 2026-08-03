@@ -16,8 +16,8 @@ use diff_fuzzer_core::{
     load_report, minimize,
 };
 use tensor_adapter::{
-    BinaryOp, CanonicalTensor, FaultyBackend, TensorNormalizer, TensorOp, TensorValue, environment,
-    libtorch, ndarray, repro::reproduce,
+    BinaryOp, CanonicalTensor, FaultyBackend, ReduceOp, TensorNormalizer, TensorOp, TensorValue,
+    UnaryOp, environment, libtorch, ndarray, repro::reproduce,
 };
 
 type AnyRunner<'a> = &'a dyn Runner<In = TensorOp, Canon = CanonicalTensor>;
@@ -44,6 +44,29 @@ fn large_case() -> TensorOp {
         )
     };
     TensorOp::binary(BinaryOp::Add, values(1.0), values(2.0))
+}
+
+/// A tensor of `shape` where every value is `fill`.
+fn filled(shape: &[usize], fill: f32) -> TensorValue {
+    let count = shape.iter().product();
+    TensorValue::new(shape.to_vec(), vec![fill; count])
+}
+
+/// The largest absolute disagreement this case produces, or `None` if it agrees.
+///
+/// Used as a **signature**: the injected fault offsets one value by a known amount, so
+/// this number identifies *which* bug a case exhibits, and it must survive shrinking.
+fn worst_absolute_error(case: &TensorOp) -> Option<f64> {
+    let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+
+    let a = correct.run_and_normalize(case).ok()?;
+    let b = faulty.run_and_normalize(case).ok()?;
+
+    match a.approx_compare(&b, TOLERANCE) {
+        Agreement::Disagree(comparison) => Some(comparison.max_absolute_error),
+        _ => None,
+    }
 }
 
 fn element_count(case: &TensorOp) -> usize {
@@ -205,6 +228,120 @@ fn a_report_that_no_longer_diverges_is_reported_as_such() {
         "{}",
         outcome.detail
     );
+}
+
+/// Shrinking must work for **every** operation class, not just the elementwise one that
+/// happens to be easiest. Each class has its own constraints — a reduction's axis, a
+/// matrix multiplication's shared dimension — and a shrinker can quite easily work for
+/// one shape of case while producing nothing usable for another.
+#[test]
+fn every_operation_class_shrinks() {
+    let cases = [
+        TensorOp::unary(UnaryOp::Neg, filled(&[4, 6], 1.5)),
+        TensorOp::binary(BinaryOp::Mul, filled(&[3, 5], 2.0), filled(&[3, 5], 3.0)),
+        TensorOp::reduce(ReduceOp::Sum, filled(&[4, 5, 6], 1.0), 2),
+        TensorOp::matmul(filled(&[4, 5], 1.0), filled(&[5, 6], 2.0)),
+    ];
+
+    for case in cases {
+        let before = element_count(&case);
+        let name = case.name();
+
+        assert!(still_diverges(&case), "{name}: the fault was not caught");
+        let minimized = minimize(case, still_diverges);
+        let after = element_count(&minimized.input);
+
+        assert!(
+            after < before,
+            "{name} did not shrink at all: {before} values"
+        );
+        assert!(
+            minimized.is_minimal(),
+            "{name} stopped early: {}",
+            minimized.stopped
+        );
+        assert!(
+            still_diverges(&minimized.input),
+            "{name} shrank into a case that no longer diverges"
+        );
+    }
+}
+
+/// **Shrinking must not change what the bug is.**
+///
+/// The risk is subtle and specific: a smaller case can still diverge while diverging for
+/// a *different reason* than the original, and the resulting "minimal reproduction" then
+/// sends a maintainer after the wrong thing. Here the injected fault offsets one value by
+/// a known amount, so the signature is the absolute error — it must survive shrinking
+/// unchanged.
+#[test]
+fn shrinking_preserves_the_nature_of_the_divergence() {
+    const BIAS: f32 = 0.5;
+
+    let original = TensorOp::binary(BinaryOp::Add, filled(&[3, 4], 2.0), filled(&[3, 4], 5.0));
+    let before = worst_absolute_error(&original).expect("the original diverges");
+
+    let minimized = minimize(original, still_diverges);
+    let after = worst_absolute_error(&minimized.input).expect("the minimised case diverges");
+
+    assert!(
+        (before - BIAS as f64).abs() < 1e-6,
+        "unexpected original error {before}"
+    );
+    assert!(
+        (after - before).abs() < 1e-6,
+        "the error changed from {before} to {after}: shrinking found a different bug"
+    );
+}
+
+/// A fault far smaller than the injected one must still be caught and shrunk. If only
+/// obvious faults survived minimisation, the mechanism would be useless for the subtle
+/// divergences that actually need shrinking to be understood.
+#[test]
+fn a_small_fault_is_still_caught_and_shrunk() {
+    let tiny = |case: &TensorOp| -> bool {
+        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 1e-4), TensorNormalizer);
+
+        let (Ok(a), Ok(b)) = (
+            correct.run_and_normalize(case),
+            faulty.run_and_normalize(case),
+        ) else {
+            return false;
+        };
+        !matches!(a.approx_compare(&b, TOLERANCE), Agreement::Agree(_))
+    };
+
+    let original = TensorOp::unary(UnaryOp::Abs, filled(&[5, 5], 3.0));
+    assert!(tiny(&original), "a small fault went undetected");
+
+    let minimized = minimize(original, tiny);
+    assert!(element_count(&minimized.input) <= 2);
+    assert!(tiny(&minimized.input));
+}
+
+/// A fault on the *other* side of the comparison shrinks identically. Nothing about
+/// minimisation may depend on which implementation happens to be wrong — in a real
+/// finding, we do not know.
+#[test]
+fn a_fault_on_either_implementation_shrinks_the_same_way() {
+    let against_libtorch = |case: &TensorOp| -> bool {
+        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let faulty = NormalizedRunner::new(FaultyBackend::new(libtorch(), 0.5), TensorNormalizer);
+
+        let (Ok(a), Ok(b)) = (cpu.run_and_normalize(case), faulty.run_and_normalize(case)) else {
+            return false;
+        };
+        !matches!(a.approx_compare(&b, TOLERANCE), Agreement::Agree(_))
+    };
+
+    let minimized = minimize(
+        TensorOp::binary(BinaryOp::Sub, filled(&[4, 4], 7.0), filled(&[4, 4], 2.0)),
+        against_libtorch,
+    );
+
+    assert!(element_count(&minimized.input) <= 4);
+    assert!(against_libtorch(&minimized.input));
 }
 
 /// A report carries everything a stranger needs: the case itself, the tolerance it was
