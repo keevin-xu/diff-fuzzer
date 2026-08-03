@@ -18,6 +18,13 @@ burn.workspace = true
 rand.workspace = true
 # A finding must serialise whole, so the case type carries serde derives.
 serde.workspace = true
+# Only needed to decode fuzzer bytes into cases. Optional, so an ordinary build of this
+# library does not pull in a fuzzing dependency it will never use.
+arbitrary = { version = "1.4.2", optional = true }
+
+[features]
+# Enables `arbitrary::Arbitrary for TensorOp` — see `src/decode.rs`.
+fuzzing = ["dep:arbitrary"]
 
 [dev-dependencies]
 # Only the examples need to *listen* to log events — a library emits them and lets the

@@ -4820,6 +4820,7 @@ dependencies = [
 name = "tensor-adapter"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "burn",
  "diff-fuzzer-core",
  "rand 0.10.2",

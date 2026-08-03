@@ -24,14 +24,14 @@
 #![no_main]
 
 use diff_fuzzer_core::{
-    DifferentialOracle, DivergenceReport, Generator, MinimisationRecord, NamedOutput,
-    NormalizedRunner, Oracle, Runner, SeededRng, TolerancePolicy, Verdict, minimize,
+    DifferentialOracle, DivergenceReport, MinimisationRecord, NamedOutput, NormalizedRunner,
+    Oracle, Runner, TolerancePolicy, Verdict, minimize,
 };
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 use tensor_adapter::{
-    CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy,
-    environment, libtorch, ndarray,
+    CanonicalTensor, TensorNormalizer, TensorOp, TensorTolerancePolicy, environment, libtorch,
+    ndarray,
 };
 
 /// Everything that is expensive to build, constructed once and reused.
@@ -41,7 +41,6 @@ use tensor_adapter::{
 /// itself the bottleneck, and **throughput is bugs found**: a harness that halves the
 /// execution rate halves the ground covered in a campaign.
 struct Harness {
-    generator: TensorOpGenerator,
     cpu: NormalizedRunner<tensor_adapter::NdArrayBackend, TensorNormalizer>,
     torch: NormalizedRunner<tensor_adapter::LibTorchBackend, TensorNormalizer>,
     oracle: DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy>,
@@ -51,28 +50,21 @@ static HARNESS: OnceLock<Harness> = OnceLock::new();
 
 fn harness() -> &'static Harness {
     HARNESS.get_or_init(|| Harness {
-        generator: TensorOpGenerator::default(),
         cpu: NormalizedRunner::new(ndarray(), TensorNormalizer),
         torch: NormalizedRunner::new(libtorch(), TensorNormalizer),
         oracle: DifferentialOracle::new(TensorTolerancePolicy),
     })
 }
 
-fuzz_target!(|data: &[u8]| {
+// The case arrives already decoded. `TensorOp` implements `Arbitrary` by mapping the
+// fuzzer's bytes onto a fixed layout — operation, rank, dimensions, then one byte per
+// value — so a mutation late in the input perturbs a value while leaving the shape
+// intact. That locality is what lets libFuzzer's coverage feedback mean anything: it can
+// explore *around* an interesting input instead of being thrown to an unrelated one.
+fuzz_target!(|case: TensorOp| {
     let harness = harness();
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] =
         [&harness.cpu, &harness.torch];
-
-    // Bytes to a case.
-    //
-    // **This is the weak part of the target, and it is deliberate for now.** Turning the
-    // bytes into a seed and generating from that means a one-bit mutation produces a
-    // completely unrelated case, so libFuzzer's coverage feedback has nothing to act on
-    // — it cannot learn that "this input was close, try something like it". Decoding the
-    // bytes *into the case structure*, so that small mutations make small changes, is
-    // the next step, and is what makes the coverage guidance worth having.
-    let Some(seed) = seed_from(data) else { return };
-    let case = harness.generator.generate(&mut SeededRng::from_seed(seed));
 
     let outputs = run_all(&case, &runners);
     let Verdict::Diverged(divergence) = harness.oracle.check(&case, &outputs) else {
@@ -90,9 +82,13 @@ fuzz_target!(|data: &[u8]| {
     let minimized = minimize(case.clone(), diverges);
 
     let report = DivergenceReport {
-        seed,
+        // No seed: this case came from the fuzzer's bytes, not from a seeded generator.
+        // Zero records that honestly rather than inventing a number that would reproduce
+        // something else entirely — the `input` field is what reproduces this finding,
+        // and libFuzzer keeps the bytes in `fuzz/artifacts/` besides.
+        seed: 0,
         label: case.name().to_string(),
-        generator: format!("{:?}", harness.generator.bounds),
+        generator: "decoded from fuzzer bytes".to_string(),
         input: minimized.input.clone(),
         minimisation: MinimisationRecord::from(&minimized),
         outputs: divergence.outputs.clone(),
@@ -103,13 +99,25 @@ fuzz_target!(|data: &[u8]| {
 
     // Written before panicking. The panic is what makes libFuzzer keep the input; the
     // report is what makes the finding readable by a person.
-    let path = format!("findings/{}", report.filename());
+    // Named by the operation and a hash of the case, since there is no seed to key on.
+    let path = format!("findings/fuzz-{}-{:x}.json", case.name(), case_digest(&case));
     if let Err(error) = report.save(&path) {
         eprintln!("could not save report to {path}: {error}");
     }
 
-    panic!("divergence in {} (seed {}): {}", case.name(), seed, report.summary);
+    panic!("divergence in {}: {}", case.name(), report.summary);
 });
+
+/// A short stable digest of a case, for naming its report file.
+///
+/// Derived from the case itself so that re-finding the same divergence overwrites one
+/// file rather than accumulating copies.
+fn case_digest(case: &TensorOp) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{case:?}").hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Run a case on every implementation, keeping whatever succeeded.
 ///
@@ -131,14 +139,4 @@ fn run_all(
                 })
         })
         .collect()
-}
-
-/// The first eight bytes as a seed.
-///
-/// Returns `None` for anything shorter, which tells libFuzzer nothing interesting
-/// happened. Padding short inputs instead would map many distinct byte strings onto the
-/// same case, wasting the fuzzer's budget on duplicates.
-fn seed_from(data: &[u8]) -> Option<u64> {
-    let bytes: [u8; 8] = data.get(..8)?.try_into().ok()?;
-    Some(u64::from_le_bytes(bytes))
 }

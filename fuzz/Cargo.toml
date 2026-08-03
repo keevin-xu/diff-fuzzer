@@ -25,7 +25,7 @@ libfuzzer-sys = "0.4.13"
 arbitrary = { version = "1.4.2", features = ["derive"] }
 
 diff-fuzzer-core = { path = "../crates/diff-fuzzer-core" }
-tensor-adapter = { path = "../crates/tensor-adapter" }
+tensor-adapter = { path = "../crates/tensor-adapter", features = ["fuzzing"] }
 
 # Optimised even in debug: fuzzing throughput is bugs found, and an unoptimised backend
 # would dominate the runtime.

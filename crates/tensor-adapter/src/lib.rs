@@ -18,6 +18,9 @@
 //! here — building cases that satisfy each operation's own rules.
 
 pub mod backends;
+/// Decoding fuzzer bytes into cases. Requires the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub mod decode;
 pub mod environment;
 pub mod generator;
 pub mod input;
