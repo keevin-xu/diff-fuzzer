@@ -210,6 +210,7 @@ mod tests {
             max_rank: 2,
             max_dim: 3,
             magnitude: 1.0,
+            ..Bounds::default()
         });
         for seed in 0..500 {
             let case = generator.generate(&mut SeededRng::from_seed(seed));

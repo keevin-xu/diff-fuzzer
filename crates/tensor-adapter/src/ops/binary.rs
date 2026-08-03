@@ -20,10 +20,13 @@ pub const ALL: [BinaryOp; 4] = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, Bin
 
 /// The values the *right-hand* operand is defined on. Only division restricts it, and
 /// only on that side — a zero numerator is perfectly well behaved.
-fn right_domain(kind: BinaryOp) -> Domain {
+///
+/// When restrictions are lifted, a divisor may be zero and the result becomes infinite
+/// (or `NaN`, for `0/0`) — the case the special-value policy exists to judge.
+fn right_domain(kind: BinaryOp, bounds: &Bounds) -> Domain {
     match kind {
-        BinaryOp::Div => Domain::NonZero,
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => Domain::Any,
+        BinaryOp::Div if bounds.restrict_domains => Domain::NonZero,
+        BinaryOp::Div | BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => Domain::Any,
     }
 }
 
@@ -37,7 +40,10 @@ pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
     let count = element_count(&shape);
 
     let lhs = TensorValue::new(shape.clone(), values(rng, count, Domain::Any, bounds));
-    let rhs = TensorValue::new(shape, values(rng, count, right_domain(kind), bounds));
+    let rhs = TensorValue::new(
+        shape,
+        values(rng, count, right_domain(kind, bounds), bounds),
+    );
 
     TensorOp::binary(kind, lhs, rhs)
 }

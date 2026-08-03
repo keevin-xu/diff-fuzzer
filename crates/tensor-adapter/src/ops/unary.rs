@@ -13,9 +13,14 @@ use rand::RngExt;
 pub const ALL: [UnaryOp; 4] = [UnaryOp::Neg, UnaryOp::Abs, UnaryOp::Exp, UnaryOp::Sqrt];
 
 /// The values an operation is defined on.
-fn domain(kind: UnaryOp) -> Domain {
+///
+/// When domain restrictions are lifted, `sqrt` is offered negatives and produces `NaN` —
+/// which is the interesting case, now that the comparison has an explicit policy for
+/// undefined results.
+fn domain(kind: UnaryOp, bounds: &Bounds) -> Domain {
     match kind {
-        UnaryOp::Sqrt => Domain::NonNegative,
+        UnaryOp::Sqrt if bounds.restrict_domains => Domain::NonNegative,
+        UnaryOp::Sqrt => Domain::Any,
         // `exp` is defined everywhere; it overflows to infinity for large arguments,
         // but the magnitude bound keeps generated inputs well short of that. Removing
         // the bound is one of the interesting things to try later.
@@ -27,7 +32,7 @@ fn domain(kind: UnaryOp) -> Domain {
 pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
     let kind = ALL[rng.random_range(0..ALL.len())];
     let shape = shape(rng, bounds);
-    let data = values(rng, element_count(&shape), domain(kind), bounds);
+    let data = values(rng, element_count(&shape), domain(kind, bounds), bounds);
 
     TensorOp::unary(kind, TensorValue::new(shape, data))
 }

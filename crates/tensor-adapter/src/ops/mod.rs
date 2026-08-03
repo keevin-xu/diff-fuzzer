@@ -44,6 +44,24 @@ pub struct Bounds {
     pub max_dim: usize,
     /// Values are drawn from roughly `-magnitude..magnitude`.
     pub magnitude: f32,
+
+    /// How often a value is drawn from [`SPECIAL_VALUES`] instead of uniformly.
+    ///
+    /// Uniform sampling over a continuous range **never produces the interesting
+    /// numbers**. The probability of drawing exactly `0.0`, or `1.0`, or a subnormal,
+    /// is nil — so a million-case campaign can run without once testing what an
+    /// operation does with zero. Bugs cluster at exactly those values, which is why
+    /// they have to be injected deliberately rather than waited for.
+    pub special_value_rate: f64,
+
+    /// Whether arguments are confined to each operation's defined domain.
+    ///
+    /// When `true` (the default), `sqrt` receives only non-negatives and `div` only
+    /// non-zero divisors, so no operation produces `NaN` or infinity. When `false`,
+    /// those restrictions lift and undefined results occur — which is the point: those
+    /// are the numerically interesting cases, and the comparison now has an explicit
+    /// policy for them.
+    pub restrict_domains: bool,
 }
 
 impl Default for Bounds {
@@ -52,9 +70,40 @@ impl Default for Bounds {
             max_rank: crate::backends::MAX_RANK,
             max_dim: 8,
             magnitude: 10.0,
+            // Roughly one value in eight. High enough that most cases contain at least
+            // one interesting value, low enough that ordinary arithmetic still dominates
+            // and the operations are exercised on realistic data too.
+            special_value_rate: 0.125,
+            restrict_domains: true,
         }
     }
 }
+
+/// How far from zero a divisor is kept while domain restrictions are in force.
+///
+/// Not merely non-zero: a divisor of `1e-45` is non-zero and still overflows the
+/// quotient, which says more about floating-point range than about either backend.
+pub const DIVISOR_FLOOR: f32 = 0.5;
+
+/// Values worth testing on purpose, because random sampling will not find them.
+///
+/// Each is here for a reason: the zeros because sign is observable and division by them
+/// is undefined; `±1` because they are the identities and a wrong one is easy to miss;
+/// the smallest normal and the smallest subnormal because precision degrades below them
+/// and some implementations flush them away; the extremes because they are where
+/// overflow and underflow begin.
+pub const SPECIAL_VALUES: [f32; 10] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    f32::MIN_POSITIVE,
+    -f32::MIN_POSITIVE,
+    1e-45, // smallest positive subnormal
+    -1e-45,
+    1e30,
+    -1e30,
+];
 
 /// Which values an operation is willing to accept.
 ///
@@ -69,7 +118,8 @@ pub enum Domain {
     Any,
     /// Zero or above — `sqrt` is undefined below it.
     NonNegative,
-    /// Bounded away from zero — divisors, which would otherwise produce infinities.
+    /// Bounded away from zero by [`DIVISOR_FLOOR`] — divisors, which would otherwise
+    /// produce overflowing quotients.
     NonZero,
 }
 
@@ -98,24 +148,66 @@ pub fn shape_of_rank(rng: &mut SeededRng, rank: usize, bounds: &Bounds) -> Vec<u
 /// Everything is `f32` for now. A second element type would double every case the
 /// oracle has to reason about, and is worth adding only once one type is trustworthy.
 pub fn values(rng: &mut SeededRng, count: usize, domain: Domain, bounds: &Bounds) -> Vec<f32> {
-    let m = bounds.magnitude;
     (0..count)
-        .map(|_| match domain {
-            Domain::Any => rng.random_range(-m..m),
-            Domain::NonNegative => rng.random_range(0.0..m),
-            // A divisor near zero produces a huge quotient that says more about
-            // floating-point range than about either backend, so the magnitude is kept
-            // away from zero on both sides.
-            Domain::NonZero => {
-                let magnitude = rng.random_range(0.5..m);
-                if rng.random_bool(0.5) {
-                    magnitude
-                } else {
-                    -magnitude
-                }
+        .map(|_| {
+            if rng.random_bool(bounds.special_value_rate) {
+                special_value(rng, domain, bounds)
+            } else {
+                uniform_value(rng, domain, bounds)
             }
         })
         .collect()
+}
+
+/// An ordinary value drawn uniformly from the operation's domain.
+fn uniform_value(rng: &mut SeededRng, domain: Domain, bounds: &Bounds) -> f32 {
+    let m = bounds.magnitude;
+    match domain {
+        Domain::Any => rng.random_range(-m..m),
+        Domain::NonNegative => rng.random_range(0.0..m),
+        // A divisor near zero produces a huge quotient that says more about
+        // floating-point range than about either backend, so the magnitude is kept away
+        // from zero on both sides.
+        Domain::NonZero => {
+            let magnitude = rng.random_range(DIVISOR_FLOOR..m);
+            if rng.random_bool(0.5) {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+    }
+}
+
+/// One of the deliberately interesting values, respecting the operation's domain.
+///
+/// The domain filter matters: offering `-1.0` to `sqrt` while domains are restricted
+/// would break the very guarantee the restriction exists to provide. When restrictions
+/// are lifted the domain is `Any`, and every special value becomes reachable.
+fn special_value(rng: &mut SeededRng, domain: Domain, bounds: &Bounds) -> f32 {
+    let allowed: Vec<f32> = SPECIAL_VALUES
+        .iter()
+        .copied()
+        .filter(|v| match domain {
+            Domain::Any => true,
+            Domain::NonNegative => *v >= 0.0,
+            // `NonZero` means *bounded away from* zero, not merely unequal to it. A
+            // divisor of `1e-45` is non-zero and still produces an overflowing quotient,
+            // which would say more about floating-point range than about either backend
+            // — the exact noise this restriction exists to keep out while it is in
+            // force. Matches the threshold the uniform path uses.
+            Domain::NonZero => v.abs() >= DIVISOR_FLOOR,
+        })
+        .collect();
+
+    // Every domain leaves some special values available, so this cannot be empty; the
+    // fallback keeps the function total rather than relying on that reasoning holding
+    // if the table changes.
+    if allowed.is_empty() {
+        return uniform_value(rng, domain, bounds);
+    }
+
+    allowed[rng.random_range(0..allowed.len())]
 }
 
 /// Total number of elements in a shape.
@@ -160,12 +252,16 @@ mod tests {
             assert!(
                 values(rng, 16, Domain::NonZero, &bounds)
                     .iter()
-                    .all(|&v| v.abs() >= 0.5)
+                    .all(|&v| v.abs() >= DIVISOR_FLOOR)
             );
+            // Finite while domains are restricted — but *not* necessarily within
+            // `magnitude`, because special values deliberately reach past it. That is
+            // their purpose: the extremes are where overflow and underflow begin.
             assert!(
                 values(rng, 16, Domain::Any, &bounds)
                     .iter()
-                    .all(|&v| v.is_finite() && v.abs() <= bounds.magnitude)
+                    .all(|&v| v.is_finite()
+                        && (v.abs() <= bounds.magnitude || SPECIAL_VALUES.contains(&v)))
             );
         });
     }
@@ -179,6 +275,72 @@ mod tests {
         let vs = values(&mut rng, 200, Domain::NonZero, &bounds);
         assert!(vs.iter().any(|&v| v > 0.0));
         assert!(vs.iter().any(|&v| v < 0.0));
+    }
+
+    /// The interesting values must actually turn up. Uniform sampling never produces
+    /// them, so if injection were broken, zero and one would simply never be tested and
+    /// nothing else in the suite would notice.
+    #[test]
+    fn special_values_actually_appear() {
+        let bounds = Bounds::default();
+        let mut rng = SeededRng::from_seed(0);
+        let drawn = values(&mut rng, 5_000, Domain::Any, &bounds);
+
+        for special in SPECIAL_VALUES {
+            assert!(
+                drawn.iter().any(|v| v.to_bits() == special.to_bits()),
+                "{special} was never generated"
+            );
+        }
+    }
+
+    /// Turning the rate off must turn them off entirely — a knob that does nothing is
+    /// worse than no knob, because it invites false confidence.
+    #[test]
+    fn a_zero_rate_produces_no_special_values() {
+        let bounds = Bounds {
+            special_value_rate: 0.0,
+            ..Bounds::default()
+        };
+        let mut rng = SeededRng::from_seed(0);
+
+        for value in values(&mut rng, 2_000, Domain::Any, &bounds) {
+            assert!(value.abs() <= bounds.magnitude, "{value} exceeds the bound");
+        }
+    }
+
+    /// Ordinary arithmetic must still dominate. If nearly every value were special, the
+    /// operations would only ever be exercised on edge cases and never on realistic
+    /// data.
+    #[test]
+    fn ordinary_values_still_dominate() {
+        let bounds = Bounds::default();
+        let mut rng = SeededRng::from_seed(0);
+        let drawn = values(&mut rng, 5_000, Domain::Any, &bounds);
+
+        let special = drawn
+            .iter()
+            .filter(|v| SPECIAL_VALUES.iter().any(|s| s.to_bits() == v.to_bits()))
+            .count();
+        assert!(
+            special < drawn.len() / 2,
+            "{special} of {} values were special",
+            drawn.len()
+        );
+    }
+
+    /// Domain restrictions must hold even for injected values — otherwise the
+    /// restriction would be quietly defeated by the very mechanism meant to stress it.
+    #[test]
+    fn special_values_respect_domain_restrictions() {
+        let bounds = Bounds::default();
+        for_many_seeds(|rng| {
+            assert!(
+                values(rng, 16, Domain::NonNegative, &bounds)
+                    .iter()
+                    .all(|&v| v >= 0.0)
+            );
+        });
     }
 
     #[test]

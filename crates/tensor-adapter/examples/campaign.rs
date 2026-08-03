@@ -50,9 +50,12 @@ struct Tally {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let cases: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(100_000);
-    let wide = args.next().is_some_and(|a| a == "wide");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cases: u64 = args.first().and_then(|a| a.parse().ok()).unwrap_or(100_000);
+    let wide = args.iter().any(|a| a == "wide");
+    // `open` lifts the generator's domain restrictions, so `sqrt` receives negatives and
+    // divisors may be zero — undefined and infinite results start occurring.
+    let open = args.iter().any(|a| a == "open");
 
     // The wider setting exists to stress the accumulating operations. Since the
     // tolerance for those is derived per case from the actual shapes and values, a
@@ -67,9 +70,14 @@ fn main() {
             max_rank: 3,
             max_dim: 64,
             magnitude: 1000.0,
+            ..Bounds::default()
         }
     } else {
         Bounds::default()
+    };
+    let bounds = Bounds {
+        restrict_domains: !open,
+        ..bounds
     };
 
     let generator = TensorOpGenerator::new(bounds);
@@ -80,8 +88,9 @@ fn main() {
         DifferentialOracle::new(TensorTolerancePolicy);
 
     println!(
-        "campaign: {cases} cases, {} bounds (rank <= {}, dim <= {}, |value| <= {})",
+        "campaign: {cases} cases, {} bounds{} (rank <= {}, dim <= {}, |value| <= {})",
         if wide { "wide" } else { "default" },
+        if open { ", domains unrestricted" } else { "" },
         bounds.max_rank,
         bounds.max_dim,
         bounds.magnitude
@@ -118,7 +127,9 @@ fn main() {
             Verdict::Skipped(reason) => {
                 totals.skipped += 1;
                 entry.skipped += 1;
-                println!("  SKIPPED seed {seed} ({}): {reason}", case.name());
+                if totals.skipped <= 5 {
+                    println!("  SKIPPED seed {seed} ({}): {reason}", case.name());
+                }
             }
             Verdict::Diverged(divergence) => {
                 totals.diverged += 1;

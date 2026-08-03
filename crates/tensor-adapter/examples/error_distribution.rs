@@ -60,6 +60,7 @@ fn main() {
             max_rank: 3,
             max_dim: 64,
             magnitude: 1000.0,
+            ..Bounds::default()
         }
     } else {
         Bounds::default()

@@ -170,6 +170,7 @@ fn degenerate_shapes_still_execute() {
         max_rank: 4,
         max_dim: 1,
         magnitude: 1.0,
+        ..Bounds::default()
     });
     let (cpu, torch) = (ndarray(), libtorch());
 
