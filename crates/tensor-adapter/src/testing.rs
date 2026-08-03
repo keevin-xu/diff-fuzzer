@@ -64,6 +64,18 @@ impl<B: Backend> Implementation for FaultyBackend<B> {
     }
 }
 
+/// A CPU backend wrong by a known amount.
+///
+/// Mirrors `ndarray()` and `libtorch()`, so a caller can construct one without naming
+/// `burn`'s types — the same reason those constructors exist. Callers outside this crate
+/// should not have to depend on `burn` just to build a backend.
+pub type FaultyNdArray = FaultyBackend<burn::backend::NdArray<f32>>;
+
+/// Construct the CPU backend with a deliberate fault of `bias` in its first output value.
+pub fn faulty(bias: f32) -> FaultyNdArray {
+    FaultyBackend::new(crate::backends::ndarray(), bias)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

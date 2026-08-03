@@ -27,7 +27,11 @@ pub mod input;
 pub mod normalize;
 pub mod ops;
 pub mod repro;
+/// A starting corpus for the fuzzer. Requires the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub mod seeds;
 pub mod shrink;
+pub mod signature;
 pub mod testing;
 pub mod tolerance;
 
@@ -37,5 +41,6 @@ pub use generator::{FixedAddGenerator, TensorOpGenerator};
 pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use ops::Bounds;
-pub use testing::FaultyBackend;
+pub use signature::signature;
+pub use testing::{FaultyBackend, FaultyNdArray, faulty};
 pub use tolerance::{OpClass, TensorTolerancePolicy};

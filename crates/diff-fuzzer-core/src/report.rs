@@ -100,16 +100,85 @@ pub struct Finding {
     /// name. The engine never interprets it, only records it, since only the domain
     /// knows what makes two findings "the same kind".
     pub label: String,
+    /// How the generator was configured.
+    ///
+    /// Without this the seed is unusable: it identifies a case only in combination with
+    /// the configuration that produced it, so a reader with the log alone would have to
+    /// be told the bounds out of band — which, in practice, means guessing.
+    pub generator: String,
+    /// What makes two findings "the same kind", for de-duplication.
+    ///
+    /// Computed by the caller, because only the domain knows what distinguishes one
+    /// underlying problem from another. The engine records and groups by it without
+    /// interpreting it.
+    pub signature: String,
     pub divergence: Divergence,
 }
 
 impl Finding {
-    pub fn new(seed: u64, label: impl Into<String>, divergence: Divergence) -> Self {
+    pub fn new(
+        seed: u64,
+        label: impl Into<String>,
+        generator: impl Into<String>,
+        signature: impl Into<String>,
+        divergence: Divergence,
+    ) -> Self {
         Self {
             seed,
             label: label.into(),
+            generator: generator.into(),
+            signature: signature.into(),
             divergence,
         }
+    }
+}
+
+/// Tracks which findings have already been seen, so one underlying problem is reported
+/// once rather than once per input that triggers it.
+///
+/// **Why this is necessary rather than tidy.** A single defect is usually reachable from
+/// an enormous number of inputs — a fuzzer that finds one will find it again within
+/// seconds, and keep finding it. Without collapsing them, a campaign's output is a
+/// thousand copies of the same thing, the log grows without bound, and any genuinely
+/// *second* problem is invisible in the noise. Reporting volume stops carrying
+/// information about how much is wrong.
+///
+/// The signature is supplied by the caller, since only the domain knows what makes two
+/// findings the same. Grouping by it is all the engine does.
+#[derive(Debug, Default)]
+pub struct Seen {
+    counts: std::collections::BTreeMap<String, usize>,
+}
+
+impl Seen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a signature, and say whether it is the first of its kind.
+    ///
+    /// Counting *every* occurrence while reporting only the first is deliberate: the
+    /// count is evidence of how reachable a problem is, which is worth knowing and would
+    /// be lost by discarding duplicates outright.
+    pub fn is_new(&mut self, signature: &str) -> bool {
+        let count = self.counts.entry(signature.to_string()).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// How many times each signature has been seen, in a stable order.
+    pub fn counts(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.counts.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+
+    /// How many distinct problems have been seen.
+    pub fn distinct(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// How many findings have been seen in total, duplicates included.
+    pub fn total(&self) -> usize {
+        self.counts.values().sum()
     }
 }
 
@@ -349,6 +418,8 @@ mod tests {
         Finding::new(
             seed,
             label,
+            "Bounds { max_dim: 8 }",
+            format!("{label}/rank1/numeric/1e-6"),
             Divergence {
                 input: format!("Case {{ seed: {seed} }}"),
                 outputs: vec![
@@ -586,6 +657,62 @@ mod tests {
     fn report_filenames_are_stable() {
         assert_eq!(report().filename(), "matmul-4242.json");
         assert_eq!(report().filename(), report().filename());
+    }
+
+    /// **The property de-duplication exists for.** One problem reported once, however
+    /// many inputs reach it.
+    #[test]
+    fn a_repeated_signature_is_reported_only_once() {
+        let mut seen = Seen::new();
+
+        assert!(seen.is_new("matmul/rank2/numeric/1e-6"));
+        assert!(!seen.is_new("matmul/rank2/numeric/1e-6"));
+        assert!(!seen.is_new("matmul/rank2/numeric/1e-6"));
+
+        assert_eq!(seen.distinct(), 1);
+        // Every occurrence is still counted: how *reachable* a problem is is worth
+        // knowing, and discarding duplicates outright would lose it.
+        assert_eq!(seen.total(), 3);
+    }
+
+    #[test]
+    fn distinct_signatures_are_each_reported() {
+        let mut seen = Seen::new();
+
+        assert!(seen.is_new("exp/rank1/numeric/1e-7"));
+        assert!(seen.is_new("matmul/rank2/undefined"));
+        assert_eq!(seen.distinct(), 2);
+    }
+
+    /// Counts come out in a stable order, so a campaign's summary does not reshuffle
+    /// between runs and become hard to compare.
+    #[test]
+    fn counts_are_reported_in_a_stable_order() {
+        let mut seen = Seen::new();
+        for signature in ["zeta", "alpha", "mu", "alpha"] {
+            seen.is_new(signature);
+        }
+
+        let order: Vec<&str> = seen.counts().map(|(s, _)| s).collect();
+        assert_eq!(order, vec!["alpha", "mu", "zeta"]);
+    }
+
+    /// A finding must record the configuration its seed depends on. Without it the seed
+    /// identifies nothing, and a reader would have to be told the bounds out of band.
+    #[test]
+    fn a_finding_records_the_generator_configuration() {
+        let recorded = finding(1, "matmul");
+        assert!(!recorded.generator.is_empty());
+
+        let path = temp_path("generator");
+        let mut log = FindingsLog::open(&path).unwrap();
+        log.append(&recorded).unwrap();
+
+        let loaded = &read_findings(&path).unwrap()[0];
+        assert_eq!(loaded.generator, recorded.generator);
+        assert_eq!(loaded.signature, recorded.signature);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub use driver::{RunOutcome, run_once};
 pub use minimize::{Budget, Minimized, Shrink, StopReason, minimize, minimize_within};
 pub use oracle::DifferentialOracle;
 pub use report::{
-    Divergence, DivergenceReport, Environment, Finding, FindingsLog, MinimisationRecord,
+    Divergence, DivergenceReport, Environment, Finding, FindingsLog, MinimisationRecord, Seen,
     load_report, read_findings,
 };
 pub use rng::SeededRng;

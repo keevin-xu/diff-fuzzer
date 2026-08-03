@@ -24,14 +24,14 @@
 #![no_main]
 
 use diff_fuzzer_core::{
-    DifferentialOracle, DivergenceReport, MinimisationRecord, NamedOutput, NormalizedRunner,
-    Oracle, Runner, TolerancePolicy, Verdict, minimize,
+    Budget, DifferentialOracle, Divergence, DivergenceReport, MinimisationRecord, NamedOutput,
+    NormalizedRunner, Oracle, Runner, TolerancePolicy, Verdict, minimize_within,
 };
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 use tensor_adapter::{
-    CanonicalTensor, TensorNormalizer, TensorOp, TensorTolerancePolicy, environment, libtorch,
-    ndarray,
+    CanonicalTensor, FaultyNdArray, TensorNormalizer, TensorOp, TensorTolerancePolicy,
+    environment, faulty as faulty_backend, libtorch, ndarray,
 };
 
 /// Everything that is expensive to build, constructed once and reused.
@@ -43,7 +43,11 @@ use tensor_adapter::{
 struct Harness {
     cpu: NormalizedRunner<tensor_adapter::NdArrayBackend, TensorNormalizer>,
     torch: NormalizedRunner<tensor_adapter::LibTorchBackend, TensorNormalizer>,
+    /// A backend wrong by a known amount, used only when the fault switch is set.
+    faulty: NormalizedRunner<FaultyNdArray, TensorNormalizer>,
     oracle: DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy>,
+    /// Whether to compare against the faulty backend instead of libtorch.
+    inject_fault: bool,
 }
 
 static HARNESS: OnceLock<Harness> = OnceLock::new();
@@ -52,9 +56,32 @@ fn harness() -> &'static Harness {
     HARNESS.get_or_init(|| Harness {
         cpu: NormalizedRunner::new(ndarray(), TensorNormalizer),
         torch: NormalizedRunner::new(libtorch(), TensorNormalizer),
+        faulty: NormalizedRunner::new(faulty_backend(0.5), TensorNormalizer),
         oracle: DifferentialOracle::new(TensorTolerancePolicy),
+        // **The switch that makes a clean campaign mean something.**
+        //
+        // A fuzzing run that finds nothing is indistinguishable from one whose detection
+        // has quietly broken — and unlike the library code, this target's divergence path
+        // is not covered by `cargo test`, because a fuzz target cannot be unit-tested.
+        // Setting `DIFF_FUZZER_INJECT_FAULT=1` compares against a backend wrong by a known
+        // amount, so the whole path — detect, shrink, report, panic, preserve the input —
+        // can be demonstrated on demand rather than trusted.
+        inject_fault: std::env::var("DIFF_FUZZER_INJECT_FAULT").is_ok(),
     })
 }
+
+/// How hard to shrink inside a fuzz iteration.
+///
+/// Tighter than the default. Every candidate is a full run on both backends, and libFuzzer
+/// measures how long an input takes — a minimisation that ran for minutes would look like a
+/// hang and could get the input reported as a timeout rather than a divergence. A slightly
+/// larger reproduction that arrives promptly is the better trade here; the campaign runner
+/// has no such constraint and uses the full budget.
+const FUZZ_MINIMISATION: Budget = Budget {
+    max_steps: 50,
+    max_candidates: 500,
+    max_duration: None,
+};
 
 // The case arrives already decoded. `TensorOp` implements `Arbitrary` by mapping the
 // fuzzer's bytes onto a fixed layout — operation, rank, dimensions, then one byte per
@@ -63,13 +90,17 @@ fn harness() -> &'static Harness {
 // explore *around* an interesting input instead of being thrown to an unrelated one.
 fuzz_target!(|case: TensorOp| {
     let harness = harness();
-    let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] =
-        [&harness.cpu, &harness.torch];
+    let second: &dyn Runner<In = TensorOp, Canon = CanonicalTensor> = if harness.inject_fault {
+        &harness.faulty
+    } else {
+        &harness.torch
+    };
+    let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&harness.cpu, second];
 
     let outputs = run_all(&case, &runners);
-    let Verdict::Diverged(divergence) = harness.oracle.check(&case, &outputs) else {
+    if !matches!(harness.oracle.check(&case, &outputs), Verdict::Diverged(_)) {
         return;
-    };
+    }
 
     // A divergence: shrink it, record it, then panic so libFuzzer preserves the input.
     let diverges = |candidate: &TensorOp| {
@@ -79,7 +110,17 @@ fuzz_target!(|case: TensorOp| {
             Verdict::Diverged(_)
         )
     };
-    let minimized = minimize(case.clone(), diverges);
+    let minimized = minimize_within(case.clone(), FUZZ_MINIMISATION, diverges);
+
+    // Describe the *minimised* case, not the original. Pairing a one-element input with
+    // a summary of a hundred values leaves a reader unable to tell which they are
+    // looking at — the same incoherence the campaign runner had, and worth fixing in
+    // both places rather than only where it was noticed.
+    let described = describe(&minimized.input, &runners, &harness.oracle);
+    let Some(divergence) = described else {
+        // Unreachable: the predicate only accepted candidates that diverge.
+        return;
+    };
 
     let report = DivergenceReport {
         // No seed: this case came from the fuzzer's bytes, not from a seeded generator.
@@ -91,22 +132,44 @@ fuzz_target!(|case: TensorOp| {
         generator: "decoded from fuzzer bytes".to_string(),
         input: minimized.input.clone(),
         minimisation: MinimisationRecord::from(&minimized),
-        outputs: divergence.outputs.clone(),
+        outputs: divergence.outputs,
         tolerance: TensorTolerancePolicy.tolerance_for(&minimized.input),
         environment: environment(),
-        summary: divergence.summary.clone(),
+        summary: divergence.summary,
     };
 
     // Written before panicking. The panic is what makes libFuzzer keep the input; the
     // report is what makes the finding readable by a person.
+    // Resolved against this crate's location rather than the working directory, which
+    // for a fuzz target depends on how it was invoked. Reports otherwise land in
+    // `fuzz/findings/` while the campaign runner writes to `findings/`, and findings
+    // split across two directories is how one set of them gets forgotten.
+    //
     // Named by the operation and a hash of the case, since there is no seed to key on.
-    let path = format!("findings/fuzz-{}-{:x}.json", case.name(), case_digest(&case));
+    let path = format!(
+        "{}/../findings/fuzz-{}-{:x}.json",
+        env!("CARGO_MANIFEST_DIR"),
+        case.name(),
+        case_digest(&case)
+    );
     if let Err(error) = report.save(&path) {
         eprintln!("could not save report to {path}: {error}");
     }
 
     panic!("divergence in {}: {}", case.name(), report.summary);
 });
+
+/// Run a case and return the divergence it produces, if any.
+fn describe(
+    case: &TensorOp,
+    runners: &[&dyn Runner<In = TensorOp, Canon = CanonicalTensor>],
+    oracle: &DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy>,
+) -> Option<Divergence> {
+    match oracle.check(case, &run_all(case, runners)) {
+        Verdict::Diverged(divergence) => Some(divergence),
+        _ => None,
+    }
+}
 
 /// A short stable digest of a case, for naming its report file.
 ///

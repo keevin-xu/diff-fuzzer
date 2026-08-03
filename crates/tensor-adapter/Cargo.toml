@@ -31,3 +31,10 @@ fuzzing = ["dep:arbitrary"]
 # calling program decide what to do with them. A dev-dependency is not compiled into
 # anything this crate publishes.
 tracing-subscriber.workspace = true
+
+# Declared explicitly so cargo skips it unless the feature is on. Without this, a
+# default-feature build of all targets fails on an example that references a
+# feature-gated module.
+[[example]]
+name = "write_seed_corpus"
+required-features = ["fuzzing"]

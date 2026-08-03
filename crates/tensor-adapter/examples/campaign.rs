@@ -25,13 +25,13 @@
 
 use diff_fuzzer_core::{
     DifferentialOracle, DivergenceReport, Finding, FindingsLog, Generator, MinimisationRecord,
-    NamedOutput, NormalizedRunner, Oracle, Runner, SeededRng, TolerancePolicy, Verdict,
+    NamedOutput, NormalizedRunner, Oracle, Runner, SeededRng, Seen, TolerancePolicy, Verdict,
     driver::run_once, minimize,
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
     Bounds, CanonicalTensor, FaultyBackend, TensorNormalizer, TensorOp, TensorOpGenerator,
-    TensorTolerancePolicy, environment, libtorch, ndarray,
+    TensorTolerancePolicy, environment, libtorch, ndarray, signature,
 };
 
 /// Divergences printed in full before switching to a count. A campaign that flags
@@ -147,6 +147,11 @@ fn main() {
     );
     let mut log = FindingsLog::open(&log_path).expect("findings log is writable");
 
+    // Tracks which problems have already been reported. A single defect is reachable
+    // from a huge number of inputs, so without this a campaign's output is one finding
+    // repeated — and a genuinely *second* problem would be invisible in the noise.
+    let mut seen = Seen::new();
+
     let mut totals = Tally::default();
     let mut per_operation: BTreeMap<&str, Tally> = BTreeMap::new();
     let mut printed = 0usize;
@@ -181,6 +186,22 @@ fn main() {
                 // generator produced — often hundreds of values, nearly all irrelevant —
                 // and nobody can act on that. Doing it here, at the moment of discovery,
                 // means every saved report is already the smallest form we could find.
+                // Group before doing any work. Shrinking and writing a report for the
+                // thousandth instance of a problem already recorded costs real time and
+                // adds nothing.
+                let outputs = normalized(&case, &runners);
+                let tolerance = TensorTolerancePolicy.tolerance_for(&case);
+                let fingerprint = match outputs.as_slice() {
+                    [(_, left), (_, right), ..] => signature(&case, left, right, tolerance),
+                    _ => format!("{}/unpaired", case.name()),
+                };
+
+                if !seen.is_new(&fingerprint) {
+                    // Counted, not recorded. How often a problem is reachable is worth
+                    // knowing; a thousand copies of its report is not.
+                    continue;
+                }
+
                 let minimized = minimize(case.clone(), diverges);
 
                 // Re-judge the *minimised* case to describe it. The original's outputs
@@ -231,6 +252,10 @@ fn main() {
                 log.append(&Finding::new(
                     seed,
                     case.name(),
+                    // Without the configuration, the seed above identifies nothing — it
+                    // names a case only in combination with the bounds that produced it.
+                    format!("{bounds:?}"),
+                    &fingerprint,
                     divergence.truncated(FINDING_FIELD_CHARS),
                 ))
                 .expect("findings log is writable");
@@ -273,6 +298,18 @@ fn main() {
         );
     }
 
+    if seen.distinct() > 0 {
+        println!();
+        println!(
+            "  distinct problems: {} (from {} diverging cases)",
+            seen.distinct(),
+            seen.total()
+        );
+        for (fingerprint, count) in seen.counts() {
+            println!("    {count:>6}x  {fingerprint}");
+        }
+    }
+
     println!();
     if log.written() > 0 {
         println!("  {} findings written to {log_path}\n", log.written());
@@ -288,6 +325,22 @@ fn main() {
             totals.diverged
         );
     }
+}
+
+/// Run a case on every implementation and return the canonical results.
+fn normalized(
+    case: &TensorOp,
+    runners: &[&dyn Runner<In = TensorOp, Canon = CanonicalTensor>],
+) -> Vec<(String, CanonicalTensor)> {
+    runners
+        .iter()
+        .filter_map(|runner| {
+            runner
+                .run_and_normalize(case)
+                .ok()
+                .map(|output| (runner.name().to_string(), output))
+        })
+        .collect()
 }
 
 /// Run a case and return the divergence it produces, if any.
