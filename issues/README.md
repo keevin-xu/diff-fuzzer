@@ -50,4 +50,4 @@ assert** — a wrong assertion costs credibility, a well-posed question costs no
 
 | # | Subject | Status |
 |---|---|---|
-| 001 | `burn` matmul: backends disagree when intermediate products overflow | DRAFT — final text prepared, awaiting review |
+| 001 | `burn` matmul: backends disagree when intermediate products overflow | **FILED** 2026-08-03 — [burn#5284](https://github.com/tracel-ai/burn/issues/5284) |
