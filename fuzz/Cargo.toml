@@ -1,0 +1,40 @@
+# The cargo-fuzz crate.
+#
+# Deliberately **not** a member of the root workspace. Fuzz targets are built with a
+# nightly toolchain and sanitizer instrumentation, and pulling that into the everyday
+# `cargo build` would slow down and complicate work that has no need of it. The empty
+# `[workspace]` table below is what makes this its own workspace despite sitting inside
+# another one's directory.
+
+[package]
+name = "diff-fuzzer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+# The `fuzz_target!` macro and the glue that hands libFuzzer's bytes to it.
+libfuzzer-sys = "0.4.13"
+# Turns those bytes into structured, valid inputs. The whole difficulty of a fuzz target
+# for structured data is in this conversion — see `fuzz_targets/tensor_diff.rs`.
+arbitrary = { version = "1.4.2", features = ["derive"] }
+
+diff-fuzzer-core = { path = "../crates/diff-fuzzer-core" }
+tensor-adapter = { path = "../crates/tensor-adapter" }
+
+# Optimised even in debug: fuzzing throughput is bugs found, and an unoptimised backend
+# would dominate the runtime.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "tensor_diff"
+path = "fuzz_targets/tensor_diff.rs"
+test = false
+doc = false
+bench = false
