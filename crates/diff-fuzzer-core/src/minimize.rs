@@ -37,6 +37,77 @@ pub trait Shrink: Sized {
     fn candidates(&self) -> Vec<Self>;
 }
 
+/// Limits on how hard the search may work.
+///
+/// The `Shrink` contract already implies termination — every candidate is strictly
+/// simpler, so the search cannot revisit a case. **Relying on a contract for termination
+/// is not the same as enforcing it.** A shrinker with a subtle bug that returns a
+/// candidate equal to its parent would loop forever, and an infinite loop inside a
+/// reporting path is a far worse failure than an imperfectly shrunk case.
+///
+/// The step and candidate limits are **deterministic**: the same case shrinks the same
+/// way on any machine. The optional time limit is not, and that is discussed on the
+/// field itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// Most reductions to accept. Generous: a case shrinking a hundred times is
+    /// converging, not stuck.
+    pub max_steps: usize,
+
+    /// Most candidates to evaluate. This is the limit that actually bites, since each
+    /// evaluation is a full run on every system under test.
+    pub max_candidates: usize,
+
+    /// Optional wall-clock limit.
+    ///
+    /// **Off by default, because it costs determinism.** A time limit makes the result
+    /// depend on how fast the machine happens to be, so the same case could minimise
+    /// differently on two computers — and a minimised reproduction that varies by
+    /// machine is not much of a reproduction. The deterministic limits above are the
+    /// intended protection; this exists for the case where a single evaluation is
+    /// pathologically slow, and when it fires the outcome records that it did.
+    pub max_duration: Option<std::time::Duration>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            max_steps: 200,
+            max_candidates: 10_000,
+            max_duration: None,
+        }
+    }
+}
+
+/// Why the search stopped.
+///
+/// Recorded because **a case that ran out of budget is not minimal**, and claiming
+/// otherwise would overstate the result. A report saying "minimised to two elements"
+/// means something different from "stopped at two elements with reductions still
+/// untried", and the difference is exactly the kind that quietly inflates a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Nothing simpler still fails. The result is minimal for the available moves.
+    LocalMinimum,
+    /// Hit [`Budget::max_steps`].
+    StepBudget,
+    /// Hit [`Budget::max_candidates`].
+    CandidateBudget,
+    /// Hit [`Budget::max_duration`]. **The only non-deterministic outcome.**
+    TimeBudget,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopReason::LocalMinimum => write!(f, "no simpler case still fails"),
+            StopReason::StepBudget => write!(f, "step budget exhausted; not minimal"),
+            StopReason::CandidateBudget => write!(f, "candidate budget exhausted; not minimal"),
+            StopReason::TimeBudget => write!(f, "time budget exhausted; not minimal"),
+        }
+    }
+}
+
 /// The outcome of shrinking, with enough detail to say what it achieved.
 ///
 /// The counts are not decoration. "Shrunk to a rank-1 tensor of two elements" invites
@@ -52,6 +123,18 @@ pub struct Minimized<T> {
     pub steps: usize,
     /// How many candidates were evaluated, accepted or not.
     pub candidates_tried: usize,
+    /// Why the search stopped. Only [`StopReason::LocalMinimum`] means the result is
+    /// actually minimal.
+    pub stopped: StopReason,
+}
+
+impl<T> Minimized<T> {
+    /// Did the search finish, rather than run out of budget?
+    ///
+    /// Worth checking before describing a result as minimal in a report.
+    pub fn is_minimal(&self) -> bool {
+        self.stopped == StopReason::LocalMinimum
+    }
 }
 
 /// Shrink a failing case to a locally minimal one.
@@ -77,11 +160,27 @@ pub struct Minimized<T> {
 /// taken. That is a caller error rather than something to assert on: minimisation is
 /// often invoked from a reporting path, and crashing there would lose the finding it was
 /// called to describe.
-pub fn minimize<T, P>(input: T, mut still_fails: P) -> Minimized<T>
+pub fn minimize<T, P>(input: T, still_fails: P) -> Minimized<T>
 where
     T: Shrink,
     P: FnMut(&T) -> bool,
 {
+    minimize_within(input, Budget::default(), still_fails)
+}
+
+/// [`minimize`], with explicit limits on how hard to work.
+pub fn minimize_within<T, P>(input: T, budget: Budget, mut still_fails: P) -> Minimized<T>
+where
+    T: Shrink,
+    P: FnMut(&T) -> bool,
+{
+    let started = std::time::Instant::now();
+    let out_of_time = || {
+        budget
+            .max_duration
+            .is_some_and(|limit| started.elapsed() >= limit)
+    };
+
     let mut current = input;
     let mut steps = 0;
     let mut candidates_tried = 0;
@@ -91,11 +190,23 @@ where
             input: current,
             steps: 0,
             candidates_tried: 1,
+            stopped: StopReason::LocalMinimum,
         };
     }
 
-    'shrinking: loop {
+    let stopped = 'shrinking: loop {
+        if steps >= budget.max_steps {
+            break StopReason::StepBudget;
+        }
+
         for candidate in current.candidates() {
+            if candidates_tried >= budget.max_candidates {
+                break 'shrinking StopReason::CandidateBudget;
+            }
+            if out_of_time() {
+                break 'shrinking StopReason::TimeBudget;
+            }
+
             candidates_tried += 1;
 
             if still_fails(&candidate) {
@@ -109,13 +220,14 @@ where
         }
 
         // Nothing simpler still fails, so this is a local minimum.
-        break;
-    }
+        break StopReason::LocalMinimum;
+    };
 
     Minimized {
         input: current,
         steps,
         candidates_tried,
+        stopped,
     }
 }
 
@@ -244,6 +356,81 @@ mod tests {
 
         assert!(result.candidates_tried >= result.steps);
         assert!(result.candidates_tried > 0);
+    }
+
+    /// **The guarantee the budget exists for.** A shrinker that violates its contract by
+    /// returning a candidate no simpler than its parent would otherwise loop forever —
+    /// and an infinite loop inside a reporting path is a far worse failure than an
+    /// imperfectly shrunk case.
+    ///
+    /// This shrinker is deliberately broken in exactly that way. The test passing at all
+    /// is the point: it terminates.
+    #[test]
+    fn a_shrinker_that_never_makes_progress_still_terminates() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct NeverShrinks(u32);
+
+        impl Shrink for NeverShrinks {
+            fn candidates(&self) -> Vec<Self> {
+                // Contract violation: identical to its parent, forever.
+                vec![NeverShrinks(self.0)]
+            }
+        }
+
+        let budget = Budget {
+            max_steps: 50,
+            max_candidates: 500,
+            max_duration: None,
+        };
+        let result = minimize_within(NeverShrinks(1), budget, |_| true);
+
+        assert_eq!(result.stopped, StopReason::StepBudget);
+        assert!(!result.is_minimal());
+        assert_eq!(result.steps, 50);
+    }
+
+    /// Running out of budget must be reported, not hidden. A case that stopped early is
+    /// **not** minimal, and a report claiming otherwise would overstate the result.
+    #[test]
+    fn exhausting_the_candidate_budget_is_reported() {
+        let budget = Budget {
+            max_steps: usize::MAX,
+            max_candidates: 3,
+            max_duration: None,
+        };
+        let result = minimize_within(Sample(vec![1; 40]), budget, |_| true);
+
+        assert_eq!(result.stopped, StopReason::CandidateBudget);
+        assert!(!result.is_minimal());
+        assert!(result.candidates_tried <= 3);
+    }
+
+    /// A finished search says so, which is what lets a report distinguish "minimised" from
+    /// "gave up here".
+    #[test]
+    fn a_completed_search_reports_a_local_minimum() {
+        let result = minimize(Sample(vec![5, 200, 6]), |s| s.0.iter().any(|v| *v >= 100));
+
+        assert_eq!(result.stopped, StopReason::LocalMinimum);
+        assert!(result.is_minimal());
+    }
+
+    /// The default budget must be generous enough that ordinary cases finish rather than
+    /// being truncated — a limit that fires routinely would silently degrade every
+    /// report.
+    #[test]
+    fn the_default_budget_does_not_truncate_an_ordinary_case() {
+        let result = minimize(Sample(vec![900; 30]), |s| s.0.iter().any(|v| *v >= 100));
+        assert!(result.is_minimal(), "stopped early: {}", result.stopped);
+    }
+
+    /// **Determinism by default.** No time limit is set unless a caller asks for one,
+    /// because a wall-clock bound makes the result depend on machine speed — and a
+    /// minimised reproduction that differs between computers is not much of a
+    /// reproduction.
+    #[test]
+    fn the_default_budget_sets_no_time_limit() {
+        assert_eq!(Budget::default().max_duration, None);
     }
 
     /// The predicate must never be asked about a case the search would not accept, and

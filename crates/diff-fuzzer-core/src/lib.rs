@@ -31,7 +31,7 @@ pub mod traits;
 // `diff_fuzzer_core::traits::Oracle`. Module structure is our business; the names are
 // what callers care about.
 pub use driver::{RunOutcome, run_once};
-pub use minimize::{Minimized, Shrink, minimize};
+pub use minimize::{Budget, Minimized, Shrink, StopReason, minimize, minimize_within};
 pub use oracle::DifferentialOracle;
 pub use report::{Divergence, Finding, FindingsLog, read_findings};
 pub use rng::SeededRng;
