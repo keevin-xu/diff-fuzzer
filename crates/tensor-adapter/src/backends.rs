@@ -15,7 +15,7 @@
 //! everything else treat rank as an ordinary value.
 
 use crate::input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
-use burn::backend::{LibTorch, NdArray};
+use burn::backend::{LibTorch, NdArray, Wgpu};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use diff_fuzzer_core::{Implementation, RunError};
@@ -153,6 +153,26 @@ pub fn libtorch() -> LibTorchBackend {
     BurnBackend::new("burn-tch")
 }
 
+/// The wgpu backend — the same arithmetic again, this time on the GPU.
+///
+/// **Note the second type parameter.** `NdArray<f32>` and `LibTorch<f32>` name only their
+/// float type; `Wgpu` names its integer type as well, because a GPU kernel must know both
+/// at compile time. That difference is absorbed here and reaches nothing else: the generic
+/// `BurnBackend<B>` only requires `B: Backend`, so every operation, every rank, and the
+/// whole dispatch `match` come across unchanged.
+pub type WgpuBackend = BurnBackend<Wgpu<f32, i32>>;
+
+/// Construct the GPU backend under test.
+///
+/// **This is the first backend on genuinely different hardware.** The two CPU backends
+/// share an instruction set, which is what made exact agreement a defensible default.
+/// A GPU shares none of it, and its reductions are not even deterministic between runs of
+/// the same input (see `examples/wgpu_check.rs`) — so what counts as a legal difference
+/// has to be re-derived rather than inherited. That work is step 7.4, not here.
+pub fn wgpu() -> WgpuBackend {
+    BurnBackend::new("burn-wgpu")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +194,66 @@ mod tests {
         assert_eq!(cpu.shape.to_vec(), expected_shape.to_vec());
         assert_eq!(torch.shape.to_vec(), expected_shape.to_vec());
         (values(cpu), values(torch))
+    }
+
+    /// **The framework claim, as a test.** The GPU backend is reached through the same
+    /// generic `run` as the CPU ones — no separate code path, no special-casing — so if
+    /// this passes, adding an implementation really was a type alias and a constructor.
+    ///
+    /// Values are chosen to be exactly representable in `f32`, and every operation here
+    /// is elementwise, so equality is the right test: no accumulation means no
+    /// order-dependence, and none of the GPU's non-determinism can enter. Reductions are
+    /// deliberately excluded — `sum` on this device returns one of two results (see
+    /// `examples/wgpu_check.rs`), which is a tolerance question for step 7.4 rather than
+    /// something a backend test should assert.
+    #[test]
+    fn the_gpu_backend_runs_through_the_same_dispatch_as_the_others() {
+        let cases = [
+            (
+                TensorOp::binary(
+                    BinaryOp::Add,
+                    value(&[2, 2], &[1.0, 2.0, 3.0, 4.0]),
+                    value(&[2, 2], &[10.0, 20.0, 30.0, 40.0]),
+                ),
+                vec![11.0, 22.0, 33.0, 44.0],
+            ),
+            (
+                TensorOp::unary(UnaryOp::Neg, value(&[3], &[-1.0, 0.0, 2.5])),
+                vec![1.0, -0.0, -2.5],
+            ),
+            (
+                TensorOp::unary(UnaryOp::Abs, value(&[2, 1, 2], &[-1.0, 2.0, -3.0, 4.0])),
+                vec![1.0, 2.0, 3.0, 4.0],
+            ),
+        ];
+
+        for (op, expected) in cases {
+            let out = wgpu().run(&op).expect("the gpu backend supports this");
+            assert_eq!(
+                values(out),
+                expected,
+                "gpu disagreed on an exactly-representable case: {op:?}"
+            );
+        }
+    }
+
+    /// Rank is a *type* in burn, so each rank is a separate instantiation. A backend that
+    /// works at rank 1 tells you nothing about rank 4 — worth asserting once per backend.
+    #[test]
+    fn the_gpu_backend_handles_every_rank() {
+        for rank in 1..=MAX_RANK {
+            let shape = vec![2; rank];
+            let count = 1 << rank;
+            let op = TensorOp::unary(UnaryOp::Neg, value(&shape, &vec![1.0; count]));
+
+            let out = wgpu().run(&op).expect("the gpu backend supports this rank");
+            assert_eq!(out.shape.to_vec(), shape, "wrong shape at rank {rank}");
+            assert_eq!(
+                values(out),
+                vec![-1.0; count],
+                "wrong values at rank {rank}"
+            );
+        }
     }
 
     #[test]

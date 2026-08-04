@@ -37,7 +37,9 @@ pub mod signature;
 pub mod testing;
 pub mod tolerance;
 
-pub use backends::{BurnBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, libtorch, ndarray};
+pub use backends::{
+    BurnBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, WgpuBackend, libtorch, ndarray, wgpu,
+};
 pub use environment::{BURN_VERSION, LIBTORCH_VERSION, TCH_VERSION, environment};
 pub use generator::{FixedAddGenerator, TensorOpGenerator};
 pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
