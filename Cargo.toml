@@ -29,12 +29,19 @@ repository = "https://github.com/kevinxu/diff-fuzzer"
 # Backends are opt-in features, and both sides of the differential are enabled here:
 #   "ndarray" — pure-Rust CPU kernels
 #   "tch"     — libtorch (PyTorch's C++ library) via the `tch` bindings
+#   "wgpu"    — GPU, via Metal on this machine
 # burn-tch enables tch's `download-libtorch` feature, so the libtorch binaries are
 # fetched by the build script; no manual install and no LIBTORCH/DYLD_LIBRARY_PATH.
+#
+# `wgpu` is the first backend on genuinely different hardware. The two CPU backends run
+# the same instruction set, which is why exact agreement has been a defensible default;
+# a GPU shares none of that, so what counts as a legal difference has to be re-derived
+# rather than assumed (PHASE-7 step 7.4).
 burn = { version = "0.21.0", default-features = false, features = [
     "std",
     "ndarray",
     "tch",
+    "wgpu",
 ] }
 
 # Engine dependencies.
