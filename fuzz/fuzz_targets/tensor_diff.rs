@@ -119,14 +119,35 @@ fuzz_target!(|case: TensorOp| {
     }
 
     // A divergence: shrink it, record it, then panic so libFuzzer preserves the input.
+    //
+    // **The shrinker's rejects are the best negatives available, and they are free.** Every
+    // candidate it tries and discards is one edit away from a case that diverges — a
+    // near-miss by construction, far closer to the decision boundary than anything sampled
+    // from the general stream. They were previously thrown away.
+    //
+    // The predicate is `FnMut`, so capturing them needs no change to `minimize.rs`: the
+    // closure already sees every candidate and its verdict.
+    let mut near_misses: Vec<TensorOp> = Vec::new();
     let diverges = |candidate: &TensorOp| {
         let outputs = run_all(candidate, &runners);
-        matches!(
+        let diverged = matches!(
             harness.oracle.check(candidate, &outputs),
             Verdict::Diverged(_)
-        )
+        );
+        if !diverged {
+            near_misses.push(candidate.clone());
+        }
+        diverged
     };
     let minimized = minimize_within(case.clone(), FUZZ_MINIMISATION, diverges);
+
+    // Only the last few, and only distinct ones. Rejects from late in the search sit next
+    // to the *minimised* case and are the tightest counter-examples; early ones may be far
+    // away, since a move that zeroes a whole tensor is one edit but an enormous jump.
+    // Keeping every reject would also write hundreds of files per finding.
+    for candidate in near_misses.iter().rev().take(NEAR_MISSES_PER_FINDING) {
+        save_negative(candidate, negatives::Source::NearMiss);
+    }
 
     // Describe the *minimised* case, not the original. Pairing a one-element input with
     // a summary of a hundred values leaves a reader unable to tell which they are
@@ -188,50 +209,84 @@ fuzz_target!(|case: TensorOp| {
     panic!("divergence in {}: {}", case.name(), report.summary);
 });
 
-/// How often an agreeing case is kept, as a reciprocal: one in this many.
+/// How many of a finding's rejected shrink candidates to keep.
 ///
-/// Deliberately sparse. A campaign agrees on essentially everything — 49,910 of 50,000 in
-/// one measured run — so keeping them all would write tens of millions of files to prove a
-/// point a few hundred already make. At this rate a four-hour campaign leaves a few
-/// hundred; the writes are far too rare to affect throughput.
+/// Bounded because minimisation can try hundreds. The last few are the valuable ones —
+/// they sit beside the minimised case rather than beside the original — and content-derived
+/// filenames mean a candidate met twice costs nothing.
+const NEAR_MISSES_PER_FINDING: usize = 8;
+
+/// How often an *ordinary* agreeing case is kept — one in this many.
 ///
-/// Override with `DIFF_FUZZER_NEGATIVE_RATE`. Setting it to `0` disables sampling.
-const NEGATIVE_RATE: usize = 100_000;
+/// Very sparse, because these are the weakest evidence available. A case with unremarkable
+/// values rejects every plausible trigger rule for free, so it can never be the negative
+/// that demotes a wrong one. A handful is worth keeping to check a rule against the
+/// ordinary case; five hundred is not.
+const ORDINARY_RATE: usize = 1_000_000;
+
+/// How often an *interesting* agreeing case is kept — one in this many.
+///
+/// **The stratification.** Cases carrying an overflowing product, a special value or an
+/// extreme magnitude ratio are the ones a trigger rule might plausibly match, and are
+/// therefore the only sampled ones that can falsify anything. They are rare in the stream,
+/// so they are kept a thousand times more eagerly. Same total volume, landing where it
+/// discriminates.
+const INTERESTING_RATE: usize = 1_000;
+
+/// Cases skipped at the start of each process before sampling begins.
+///
+/// **Under `-fork=1` every child restarts this counter**, so without a warm-up the sample
+/// would be dominated by whatever each child sees first — and immediately after a fork
+/// libFuzzer is replaying corpus entries rather than mutating. That would fill the
+/// negatives with curated corpus inputs instead of the mutated cases that actually make up
+/// the run, undermining the distribution-matching that sampling live exists to provide.
+const WARM_UP: usize = 2_000;
 
 /// Counts cases seen by *this process*, for sampling.
-///
-/// Per-process, not per-campaign: under `-fork=1` every child starts fresh, so the counter
-/// resets whenever libFuzzer rotates. That is fine — the aim is a spread of ordinary
-/// agreeing cases, not an exact one-in-N across the run — but it does mean the sample is
-/// biased slightly toward cases seen early in each child.
 static SEEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Keep roughly one agreeing case in [`NEGATIVE_RATE`].
+/// Keep an agreeing case, at a rate depending on how much it could discriminate.
 ///
 /// Failures are silent by design: a campaign must not die because a directory is not
 /// writable. Negatives are supporting evidence, and losing some costs precision in a later
 /// analysis — unlike losing a *finding*, which costs the thing the campaign exists for.
 fn sample_negative(case: &TensorOp) {
-    let rate = std::env::var("DIFF_FUZZER_NEGATIVE_RATE")
+    let scale = std::env::var("DIFF_FUZZER_NEGATIVE_RATE")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(NEGATIVE_RATE);
-    if rate == 0 {
+        .and_then(|value| value.parse::<usize>().ok());
+    if scale == Some(0) {
         return;
     }
 
     let seen = SEEN.fetch_add(1, Ordering::Relaxed);
-    if !seen.is_multiple_of(rate) {
+    if seen < WARM_UP {
         return;
     }
 
+    let interesting = negatives::is_interesting(case);
+    let (rate, source) = match (interesting, scale) {
+        // An explicit rate overrides both tiers, for short verification runs.
+        (true, Some(rate)) => (rate, negatives::Source::Interesting),
+        (false, Some(rate)) => (rate, negatives::Source::Ordinary),
+        (true, None) => (INTERESTING_RATE, negatives::Source::Interesting),
+        (false, None) => (ORDINARY_RATE, negatives::Source::Ordinary),
+    };
+
+    if !(seen - WARM_UP).is_multiple_of(rate.max(1)) {
+        return;
+    }
+
+    save_negative(case, source);
+}
+
+/// Record a case that did *not* diverge, under its source.
+fn save_negative(case: &TensorOp, source: negatives::Source) {
     let directory = format!(
-        "{}/../findings/negatives/{}/{}",
+        "{}/../findings/negatives/{}",
         env!("CARGO_MANIFEST_DIR"),
-        run_label(),
-        case.name()
+        run_label()
     );
-    let _ = negatives::save_case(&directory, case);
+    let _ = negatives::save_case(&directory, case, source);
 }
 
 /// Which run's directory this process should file its findings under.

@@ -28,43 +28,157 @@
 //! both returned `NaN` so no arithmetic was compared — is not evidence that the case fails
 //! to diverge. It is evidence that nothing was learned, and recording it as a negative
 //! would quietly poison the set with cases that were never actually tested.
+//!
+//! # Not all negatives are worth the same, which is why each records its source
+//!
+//! **A negative only tests a rule that could plausibly have matched it.** A case with
+//! ordinary magnitudes and no special values fails `overflow_product AND mixed_sign`
+//! trivially — it was never going to challenge that rule, so keeping it proves nothing.
+//! Sample the stream uniformly and almost every negative is of that kind.
+//!
+//! The consequence is concrete: the search ranks candidates by *fewest negatives matched*
+//! first. If no candidate matches any negative, they all tie, the ranking falls through to
+//! "covers the most findings", and that is overfitting by another name. `overflow_product`
+//! alone matches all 41 findings and every boring negative rejects it for free — **yet it
+//! is wrong**, and only the hand-built near-misses demote it.
+//!
+//! So [`Source`] is recorded per case. "Survived 12 near-misses" and "survived 500
+//! ordinary cases" are wildly different claims, and without provenance they look identical
+//! in a report.
 
 use crate::input::TensorOp;
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 
-/// Write one non-diverging case into `directory`.
+/// Where a negative came from, which is a proxy for how hard it is to satisfy.
 ///
-/// Named by a hash of the case, so a case sampled twice overwrites rather than
-/// accumulating — the same content-derived naming the findings use, and for the same
-/// reason: a directory that grows without bound stops being readable.
-pub fn save_case(directory: impl AsRef<Path>, case: &TensorOp) -> io::Result<()> {
-    let directory = directory.as_ref();
-    std::fs::create_dir_all(directory)?;
-
-    let path = directory.join(format!("neg-{}-{:x}.json", case.name(), digest(case)));
-    std::fs::write(path, serde_json::to_string(case)?)
+/// Ordered by discriminating power, strongest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    /// Rejected by the shrinker while minimising a real finding — **one edit away from a
+    /// case that diverges**, and therefore the closest counter-example obtainable. Free:
+    /// the shrinker already generates and discards these.
+    NearMiss,
+    /// Built by hand to probe a specific hypothesis, like the batched-matmul cases that
+    /// falsified `overflow AND mixed_sign`.
+    Constructed,
+    /// Sampled from a campaign, and carrying something a rule might plausibly key on —
+    /// an overflowing product, a special value, an extreme magnitude ratio.
+    Interesting,
+    /// Sampled from a campaign with nothing notable in it. Cheap to collect and weak
+    /// evidence; kept in small numbers so a rule can be checked against the ordinary case
+    /// as well as the hard one.
+    Ordinary,
 }
 
-/// Write a batch of cases as a single file.
+impl Source {
+    /// A short, stable name — used as a directory, so it must not contain separators.
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::NearMiss => "near-miss",
+            Source::Constructed => "constructed",
+            Source::Interesting => "interesting",
+            Source::Ordinary => "ordinary",
+        }
+    }
+}
+
+/// A non-diverging case together with where it came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Negative {
+    pub case: TensorOp,
+    pub source: Source,
+}
+
+/// Whether a case carries anything a trigger rule might plausibly key on.
 ///
-/// Used where the cases come from a deliberate experiment rather than from sampling, and
-/// belong together — the probe cases in `findings/negatives/batched_probe.json` are one
-/// experiment's output and are only meaningful read as a set.
-pub fn save_batch(path: impl AsRef<Path>, cases: &[TensorOp]) -> io::Result<()> {
+/// **This is the stratification test**, and it is deliberately coarse: it asks only "could
+/// a rule about extreme floating-point behaviour possibly match this?", not "does any
+/// particular rule match". A finer test would amount to choosing negatives with the very
+/// vocabulary the search uses, which risks selecting cases that confirm what is already
+/// believed.
+///
+/// Erring toward *interesting* is the safe direction — a false positive here costs one
+/// extra file, while a false negative discards exactly the evidence that discriminates.
+pub fn is_interesting(case: &TensorOp) -> bool {
+    /// Every value a case carries, across however many operands it has.
+    fn operand_values(case: &TensorOp) -> Vec<&f32> {
+        let operands: Vec<&crate::input::TensorValue> = match case {
+            TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => vec![arg],
+            TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => vec![lhs, rhs],
+        };
+        operands.into_iter().flat_map(|o| o.data().iter()).collect()
+    }
+
+    const OVERFLOW_RISK: f32 = 1e18; // squares to beyond f32's range
+    const EXTREME_RATIO: f32 = 1e12;
+
+    let mut smallest_nonzero = f32::INFINITY;
+    let mut largest = 0.0f32;
+
+    for &value in operand_values(case) {
+        if !value.is_finite() {
+            return true; // an infinity or NaN already in the input
+        }
+        let magnitude = value.abs();
+        if magnitude >= OVERFLOW_RISK {
+            return true;
+        }
+        if magnitude > 0.0 {
+            smallest_nonzero = smallest_nonzero.min(magnitude);
+            largest = largest.max(magnitude);
+        }
+        if magnitude > 0.0 && magnitude < f32::MIN_POSITIVE {
+            return true; // subnormal
+        }
+    }
+
+    largest > 0.0 && smallest_nonzero.is_finite() && largest / smallest_nonzero > EXTREME_RATIO
+}
+
+/// Write one non-diverging case, filed under its source.
+///
+/// Named by a hash of the case, so a case seen twice overwrites rather than accumulating —
+/// the same content-derived naming the findings use, and for the same reason: a directory
+/// that grows without bound stops being readable.
+pub fn save_case(directory: impl AsRef<Path>, case: &TensorOp, source: Source) -> io::Result<()> {
+    let directory = directory.as_ref().join(source.label());
+    std::fs::create_dir_all(&directory)?;
+
+    let record = Negative {
+        case: case.clone(),
+        source,
+    };
+    let path = directory.join(format!("neg-{}-{:x}.json", case.name(), digest(case)));
+    std::fs::write(path, serde_json::to_string(&record)?)
+}
+
+/// Write a batch of cases sharing one source, as a single file.
+///
+/// For cases produced by a deliberate experiment, which are only meaningful read as a set.
+pub fn save_batch(path: impl AsRef<Path>, cases: &[TensorOp], source: Source) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(cases)?)
+    let records: Vec<Negative> = cases
+        .iter()
+        .map(|case| Negative {
+            case: case.clone(),
+            source,
+        })
+        .collect();
+    std::fs::write(path, serde_json::to_string_pretty(&records)?)
 }
 
 /// Load every negative at or below `directory`.
 ///
-/// Accepts both shapes written above — a file holding one case, and a file holding an
-/// array of them — because the two arrive from different sources and a caller should not
-/// have to care which.
-pub fn load(directory: impl AsRef<Path>) -> Vec<TensorOp> {
+/// Four on-disk shapes are accepted, because they arrive from different places and a
+/// caller should not have to care which: one record, an array of records, and — for files
+/// written before provenance existed — a bare case or an array of bare cases, which are
+/// read as [`Source::Constructed`].
+pub fn load(directory: impl AsRef<Path>) -> Vec<Negative> {
     let mut cases = Vec::new();
     let mut pending = vec![directory.as_ref().to_path_buf()];
 
@@ -88,20 +202,49 @@ pub fn load(directory: impl AsRef<Path>) -> Vec<TensorOp> {
                 continue;
             };
 
-            if let Ok(batch) = serde_json::from_str::<Vec<TensorOp>>(&text) {
+            if let Ok(batch) = serde_json::from_str::<Vec<Negative>>(&text) {
                 cases.extend(batch);
-            } else if let Ok(one) = serde_json::from_str::<TensorOp>(&text) {
+            } else if let Ok(one) = serde_json::from_str::<Negative>(&text) {
                 cases.push(one);
+            } else if let Ok(batch) = serde_json::from_str::<Vec<TensorOp>>(&text) {
+                cases.extend(batch.into_iter().map(|case| Negative {
+                    case,
+                    source: Source::Constructed,
+                }));
+            } else if let Ok(case) = serde_json::from_str::<TensorOp>(&text) {
+                cases.push(Negative {
+                    case,
+                    source: Source::Constructed,
+                });
             } else {
-                eprintln!(
-                    "could not parse {} as a case or a case list",
-                    path.display()
-                );
+                eprintln!("could not parse {} as a negative", path.display());
             }
         }
     }
 
     cases
+}
+
+/// How many negatives of each source a set contains.
+///
+/// **The number a report should lead with.** "Survived 12 near-misses" and "survived 500
+/// ordinary cases" are different claims, and a bare total conflates them.
+pub fn by_source(negatives: &[Negative]) -> Vec<(Source, usize)> {
+    [
+        Source::NearMiss,
+        Source::Constructed,
+        Source::Interesting,
+        Source::Ordinary,
+    ]
+    .into_iter()
+    .map(|source| {
+        (
+            source,
+            negatives.iter().filter(|n| n.source == source).count(),
+        )
+    })
+    .filter(|(_, count)| *count > 0)
+    .collect()
 }
 
 /// A stable identifier for a case, used only for naming files.
@@ -128,50 +271,92 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_case_loads_back_identically() {
+    fn a_saved_case_loads_back_with_its_source() {
         let dir = temp_dir("roundtrip");
-        let original = case(1.5);
-        save_case(&dir, &original).expect("writable");
+        save_case(&dir, &case(1.5), Source::NearMiss).expect("writable");
 
         let loaded = load(&dir);
         assert_eq!(loaded.len(), 1);
-        assert_eq!(format!("{:?}", loaded[0]), format!("{original:?}"));
+        assert_eq!(loaded[0].source, Source::NearMiss);
+        assert_eq!(format!("{:?}", loaded[0].case), format!("{:?}", case(1.5)));
     }
 
-    /// Content-derived naming, so a campaign that meets the same case twice does not grow
-    /// the directory. Without this a long run accumulates duplicates of whatever it sees
-    /// most often — which is exactly the least interesting case.
+    /// Content-derived naming, so a campaign meeting the same case twice does not grow the
+    /// directory. Without it a long run accumulates duplicates of whatever it sees most —
+    /// which is exactly the least interesting case.
     #[test]
     fn saving_the_same_case_twice_leaves_one_file() {
         let dir = temp_dir("dedup");
-        save_case(&dir, &case(2.0)).expect("writable");
-        save_case(&dir, &case(2.0)).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary).expect("writable");
 
         assert_eq!(load(&dir).len(), 1);
     }
 
     #[test]
-    fn different_cases_are_kept_apart() {
-        let dir = temp_dir("distinct");
-        save_case(&dir, &case(1.0)).expect("writable");
-        save_case(&dir, &case(2.0)).expect("writable");
+    fn sources_are_kept_apart_on_disk_and_counted_separately() {
+        let dir = temp_dir("sources");
+        save_case(&dir, &case(1.0), Source::NearMiss).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary).expect("writable");
+        save_case(&dir, &case(3.0), Source::Ordinary).expect("writable");
 
-        assert_eq!(load(&dir).len(), 2);
+        let counts = by_source(&load(&dir));
+        assert_eq!(counts, vec![(Source::NearMiss, 1), (Source::Ordinary, 2)]);
     }
 
-    /// Both file shapes are read by one call, since they arrive from different sources —
-    /// sampled one at a time by a campaign, or written as a set by an experiment.
+    /// Files written before provenance existed must still load, rather than being dropped
+    /// silently — a lost negative weakens every predicate scored against the set.
     #[test]
-    fn a_batch_file_and_single_files_load_together() {
-        let dir = temp_dir("mixed");
-        save_case(&dir, &case(1.0)).expect("writable");
-        save_batch(dir.join("probe.json"), &[case(2.0), case(3.0)]).expect("writable");
+    fn a_file_without_provenance_still_loads() {
+        let dir = temp_dir("legacy");
+        std::fs::create_dir_all(&dir).expect("writable");
+        let bare = serde_json::to_string(&[case(1.0), case(2.0)]).expect("serialisable");
+        std::fs::write(dir.join("old.json"), bare).expect("writable");
 
-        assert_eq!(load(&dir).len(), 3);
+        let loaded = load(&dir);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|n| n.source == Source::Constructed));
     }
 
     #[test]
     fn loading_a_missing_directory_yields_nothing_rather_than_failing() {
         assert!(load(temp_dir("absent")).is_empty());
+    }
+
+    // --- the stratification test ---------------------------------------------------
+
+    #[test]
+    fn ordinary_values_are_not_interesting() {
+        assert!(!is_interesting(&case(1.0)));
+        assert!(!is_interesting(&case(-42.5)));
+        assert!(!is_interesting(&case(0.0)));
+    }
+
+    /// The cases that actually discriminate: anything a rule about extreme floating-point
+    /// behaviour could plausibly key on.
+    #[test]
+    fn extreme_values_are_interesting() {
+        assert!(is_interesting(&case(1e30)), "overflows when squared");
+        assert!(is_interesting(&case(-1e30)));
+        assert!(is_interesting(&case(f32::INFINITY)));
+        assert!(is_interesting(&case(f32::NAN)));
+        assert!(is_interesting(&case(1e-45)), "subnormal");
+    }
+
+    /// A wide spread between the largest and smallest magnitude is where cancellation and
+    /// accumulation-order effects live, even when no single value is extreme.
+    #[test]
+    fn an_extreme_magnitude_ratio_is_interesting() {
+        let spread = TensorOp::unary(UnaryOp::Neg, TensorValue::new(vec![2], vec![1e15, 1e-3]));
+        assert!(is_interesting(&spread));
+    }
+
+    /// Erring toward *interesting* is the safe direction — a false positive costs one file,
+    /// a false negative discards the evidence that discriminates. This pins the intent so a
+    /// future tightening of the thresholds has to be deliberate.
+    #[test]
+    fn the_test_errs_toward_keeping() {
+        let borderline = TensorOp::unary(UnaryOp::Neg, TensorValue::new(vec![2], vec![1e18, 1.0]));
+        assert!(is_interesting(&borderline));
     }
 }

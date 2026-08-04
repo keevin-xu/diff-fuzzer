@@ -75,6 +75,7 @@
 use burn::backend::{LibTorch, NdArray};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
+use tensor_adapter::negatives::{self, Source};
 use tensor_adapter::{TensorOp, TensorValue};
 
 /// Left operand values: sign alternates along the contraction axis, so every dot product
@@ -322,13 +323,12 @@ fn write_negatives(cases: &[(String, TensorOp)]) {
         return;
     }
 
-    let only_cases: Vec<&TensorOp> = cases.iter().map(|(_, case)| case).collect();
+    let only_cases: Vec<TensorOp> = cases.iter().map(|(_, case)| case.clone()).collect();
     let path = format!("{dir}/batched_probe.json");
-    match serde_json::to_string_pretty(&only_cases) {
-        Ok(json) => match std::fs::write(&path, json) {
-            Ok(()) => println!("\n{} non-diverging case(s) written to {path}", cases.len()),
-            Err(error) => eprintln!("\ncould not write {path}: {error}"),
-        },
-        Err(error) => eprintln!("\ncould not serialise negatives: {error}"),
+    // Recorded as `Constructed`: built by hand to probe a specific hypothesis, which makes
+    // them stronger evidence than anything sampled and worth distinguishing in a report.
+    match negatives::save_batch(&path, &only_cases, Source::Constructed) {
+        Ok(()) => println!("\n{} non-diverging case(s) written to {path}", cases.len()),
+        Err(error) => eprintln!("\ncould not write {path}: {error}"),
     }
 }
