@@ -31,6 +31,10 @@ fuzzing = ["dep:arbitrary"]
 # calling program decide what to do with them. A dev-dependency is not compiled into
 # anything this crate publishes.
 tracing-subscriber.workspace = true
+# `batched_probe` records its non-diverging cases as data for a later predicate search.
+# Already a workspace dependency (the engine writes findings with it), so this pins nothing
+# new — and as a dev-dependency it stays out of anything this crate publishes.
+serde_json.workspace = true
 
 # Declared explicitly so cargo skips it unless the feature is on. Without this, a
 # default-feature build of all targets fails on an example that references a
