@@ -181,17 +181,66 @@ fn disagreement_kind(
                 return "undefined".to_string();
             }
 
-            // Otherwise, the order of magnitude of the relative error. `1e-6` and `1e-1`
-            // are almost certainly different problems; `3.1e-6` and `7.4e-6` are almost
-            // certainly not.
-            let error = comparison.max_relative_error;
-            if error > 0.0 && error.is_finite() {
-                format!("numeric/1e{}", error.log10().floor() as i32)
-            } else {
-                "numeric/unmeasurable".to_string()
-            }
+            numeric_kind(comparison.max_relative_error)
         }
     }
+}
+
+/// A numeric disagreement's severity, on a scale whose boundaries mean something.
+///
+/// # Why not the order of magnitude
+///
+/// This used to return `numeric/1e{floor(log10(error))}` — one class per decade. That was
+/// recorded as suspect from the start (`PENDING` 2.8) and a third backend proved it: GPU
+/// rounding differences landed at `1e-7` **and** `1e-8`, splitting **one phenomenon across
+/// two classes**. A campaign produced 44 classes where perhaps 15 were real, and triage
+/// pays for every spurious one with a wasted investigation.
+///
+/// The problem is that a decade boundary is arbitrary — nothing distinguishes `9.9e-8` from
+/// `1.01e-7` except which side of a power of ten they fall on.
+///
+/// # The two boundaries, and why each has a reason
+///
+/// **`ROUNDING_SCALE` (16 ε).** Machine epsilon is the natural unit of legitimate
+/// floating-point disagreement: two implementations that are both correct but round
+/// differently land within a handful of ULP. Sixteen is generous enough to cover several
+/// roundings in sequence and far below anything a real defect produces. **Errors here are
+/// the arithmetic being itself.**
+///
+/// **`TOTAL` (relative error ≥ 1.0).** At this point the results are no longer a perturbed
+/// version of each other — one is at least as far from the other as the other is from zero.
+/// A subnormal flushed to zero gives *exactly* 1.0; a sign flip gives 2.0. **Errors here
+/// are a different answer, not an inaccurate one.**
+///
+/// Neither boundary was chosen by looking at a histogram of observed errors. That
+/// distinction matters: picking cut-points to make the class count look tidy is the same
+/// fitting-to-data error the tolerance policy exists to prevent.
+///
+/// # What is deliberately given up
+///
+/// Three buckets cannot distinguish `1e-2` from `1e-1`; both are `significant`. This is a
+/// **coarsening**, and coarsening is the direction that hides things — so it is only
+/// defensible because the finer number is not lost: every report's summary carries the
+/// exact `max relative error`. The *signature* is a grouping key, not the evidence.
+fn numeric_kind(error: f64) -> String {
+    /// Sixteen machine epsilons — a handful of roundings.
+    const ROUNDING_SCALE: f64 = 16.0 * f32::EPSILON as f64;
+    /// At a relative error of 1, the results are not near each other in any sense.
+    const TOTAL: f64 = 1.0;
+
+    // `is_finite` first, so `NaN` is caught explicitly rather than by a negated comparison
+    // — with floats the two are not the same thing, and the reader should not have to work
+    // that out.
+    if !error.is_finite() || error <= 0.0 {
+        return "numeric/unmeasurable".to_string();
+    }
+    if error <= ROUNDING_SCALE {
+        return "numeric/rounding".to_string();
+    }
+    if error >= TOTAL {
+        return "numeric/total".to_string();
+    }
+    "numeric/significant".to_string()
 }
 
 /// Whether either result contains a value that is not finite.
@@ -435,6 +484,71 @@ mod tests {
         let outputs = [named("a", &[1], &[1.0]), named("b", &[1], &[1.0])];
         let (_, pair) = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
         assert!(pair.is_none());
+    }
+
+    /// **The fix for `PENDING` 2.8, as a test.** Two GPU rounding differences an order of
+    /// magnitude apart are the *same* phenomenon — the arithmetic being itself — and used to
+    /// land in `numeric/1e-7` and `numeric/1e-8`, splitting one problem across two classes.
+    #[test]
+    fn rounding_differences_an_order_of_magnitude_apart_share_a_signature() {
+        let base = canon(&[1], &[1.0]);
+        let one_ulp = signature(
+            &case(&[1]),
+            &base,
+            &canon(&[1], &[1.0 + f32::EPSILON]),
+            Tolerance::EXACT,
+        );
+        // Eight ULP, not a fraction of one: `1.0 + EPSILON/8.0` rounds back to exactly
+        // `1.0` in f32, so the two results would be identical and the test would compare
+        // nothing. An order of magnitude apart in error, both still ordinary rounding.
+        let eight_ulp = signature(
+            &case(&[1]),
+            &base,
+            &canon(&[1], &[1.0 + 8.0 * f32::EPSILON]),
+            Tolerance::EXACT,
+        );
+
+        assert_eq!(one_ulp, eight_ulp, "both are ordinary rounding");
+        assert!(one_ulp.contains("rounding"), "{one_ulp}");
+    }
+
+    /// **The distinction the coarsening must not destroy.** A subnormal flushed to zero is a
+    /// *relative error of exactly 1.0* — a different answer, not an inaccurate one — and
+    /// must never be grouped with rounding noise.
+    #[test]
+    fn a_flushed_subnormal_is_not_grouped_with_rounding() {
+        let flushed = signature(
+            &case(&[1]),
+            &canon(&[1], &[1e-45]),
+            &canon(&[1], &[0.0]),
+            Tolerance::EXACT,
+        );
+        let rounding = signature(
+            &case(&[1]),
+            &canon(&[1], &[1.0]),
+            &canon(&[1], &[1.0 + f32::EPSILON]),
+            Tolerance::EXACT,
+        );
+
+        assert_ne!(flushed, rounding);
+        assert!(flushed.contains("total"), "{flushed}");
+    }
+
+    /// The boundaries are anchored to machine epsilon and to a relative error of 1, not to
+    /// powers of ten. Pinned so a future adjustment has to be deliberate — and so that
+    /// nobody quietly retunes them to make a class count look tidy.
+    #[test]
+    fn the_severity_boundaries_are_where_they_are_claimed_to_be() {
+        let epsilon = f32::EPSILON as f64;
+
+        assert_eq!(numeric_kind(epsilon), "numeric/rounding");
+        assert_eq!(numeric_kind(15.0 * epsilon), "numeric/rounding");
+        assert_eq!(numeric_kind(100.0 * epsilon), "numeric/significant");
+        assert_eq!(numeric_kind(0.5), "numeric/significant");
+        assert_eq!(numeric_kind(1.0), "numeric/total", "a flushed subnormal");
+        assert_eq!(numeric_kind(2.0), "numeric/total", "a sign flip");
+        assert_eq!(numeric_kind(0.0), "numeric/unmeasurable");
+        assert_eq!(numeric_kind(f64::INFINITY), "numeric/unmeasurable");
     }
 
     /// Signatures must be stable across runs, or de-duplication would fail to duplicate.
