@@ -218,7 +218,12 @@ fn main() {
                 // thousandth instance of a problem already recorded costs real time and
                 // adds nothing.
                 let outputs = normalized(&case, runners);
-                let tolerance = TensorTolerancePolicy.tolerance_for(&case);
+                // The pair that will name this finding, so the tolerance cited matches the
+                // comparison described. With per-pair bounds there is no single number for
+                // a case.
+                let pair = worst_pair(&case, &outputs);
+                let tolerance =
+                    TensorTolerancePolicy.tolerance_for(&case, (pair.0.as_str(), pair.1.as_str()));
                 // Across *all* implementations, not the first two. With three backends the
                 // old form computed the label from two CPUs that agreed, so a GPU
                 // divergence came out labelled `.../agree`.
@@ -252,7 +257,8 @@ fn main() {
                     input: minimized.input.clone(),
                     minimisation: MinimisationRecord::from(&minimized),
                     outputs: shrunk_divergence.outputs,
-                    tolerance: TensorTolerancePolicy.tolerance_for(&minimized.input),
+                    tolerance: TensorTolerancePolicy
+                        .tolerance_for(&minimized.input, (pair.0.as_str(), pair.1.as_str())),
                     environment: environment(),
                     summary: shrunk_divergence.summary,
                 };
@@ -418,5 +424,21 @@ fn shapes_of(case: &TensorOp) -> String {
             format!("{:?} x {:?}", lhs.shape(), rhs.shape())
         }
         TensorOp::Reduce { arg, axis, .. } => format!("{:?} axis {axis}", arg.shape()),
+    }
+}
+
+/// Which two implementations a finding should be attributed to.
+///
+/// The worst disagreeing pair when one exists, so the tolerance recorded in a report is the
+/// one that governed the comparison the report describes. Falls back to the first two, which
+/// only happens on a case that did not diverge.
+fn worst_pair(case: &TensorOp, outputs: &[(String, CanonicalTensor)]) -> (String, String) {
+    let probe = TensorTolerancePolicy.tolerance_for(case, ("", ""));
+    match signature_across(case, outputs, probe).1 {
+        Some(pair) => (pair.left, pair.right),
+        None => match outputs {
+            [(a, _), (b, _), ..] => (a.clone(), b.clone()),
+            _ => (String::new(), String::new()),
+        },
     }
 }

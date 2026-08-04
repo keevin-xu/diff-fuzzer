@@ -52,7 +52,7 @@
 //! relative while its absolute error stays at `7.6e-6`: the error did not grow, the
 //! denominator shrank.
 
-use crate::input::TensorOp;
+use crate::input::{BinaryOp, TensorOp, UnaryOp};
 use diff_fuzzer_core::{Tolerance, TolerancePolicy};
 
 /// One rounding step for `f32`, as a `f64` so the arithmetic below does not itself
@@ -102,15 +102,108 @@ impl TensorOp {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TensorTolerancePolicy;
 
+/// Units in the last place that Metal permits for `f32` division with fast math enabled.
+///
+/// **Quoted, not chosen.** *Metal Shading Language Specification* (2026-06-04) Table 8.2:
+/// `x / y` → "`<= 2.5 ulp` for y in the domain of 2⁻¹²⁶ to 2¹²⁶". Fast math is the default
+/// unless `-fno-fast-math` is passed. See `SPECS.md` §4.1.
+///
+/// Measured difference between CPU and GPU: **1 ULP**, so the derived bound clears the
+/// observation by 2.5x. Had it not, that would be a finding about the GPU.
+const METAL_DIV_ULPS: f64 = 2.5;
+
+/// Units in the last place derived for `f32` `sqrt` on Metal with fast math enabled.
+///
+/// **Composed, not quoted.** Table 8.2 gives `sqrt` no figure of its own; it states
+/// `sqrt(x)` is "Implemented as `x * rsqrt(x)` with special cases handled correctly", and
+/// gives `rsqrt <= 2 ulp`. The multiply is correctly rounded and contributes at most a
+/// further half ULP, so the composition permits **3**. Measured: 2 ULP, a 1.5x margin.
+const METAL_SQRT_ULPS: f64 = 3.0;
+
+/// The largest magnitude Metal is permitted to flush to zero.
+///
+/// **Derived, and exactly bounded.** *Metal Shading Language Specification* (2026-06-04)
+/// §8.1: "Denormalized single-precision … numbers passed as input to or produced as the
+/// output of … arithmetic operations **may be flushed to zero**."
+///
+/// A denormal is precisely a value with magnitude below `f32::MIN_POSITIVE`, so an absolute
+/// tolerance of exactly that covers every permitted flush **and nothing else**: anything at
+/// or above it is a normal number, which the specification gives no licence to discard.
+///
+/// This has to be an *absolute* tolerance. A subnormal becoming zero is a **relative error
+/// of 1.0** — the largest a relative measure can express short of a sign change — so no
+/// `rtol` short of absurd would absorb it, and an absurd one would hide everything else.
+const METAL_SUBNORMAL_FLOOR: f64 = f32::MIN_POSITIVE as f64;
+
+/// Whether a comparison involves a GPU backend.
+///
+/// Matched on the name because that is what the policy is handed. Crude, and deliberately
+/// so: the alternative is threading a backend *capability* description through the engine,
+/// which would be real machinery in service of one boolean.
+fn involves_gpu(implementations: (&str, &str)) -> bool {
+    let (left, right) = implementations;
+    left.contains("wgpu") || right.contains("wgpu")
+}
+
 impl TolerancePolicy<TensorOp> for TensorTolerancePolicy {
-    fn tolerance_for(&self, input: &TensorOp) -> Tolerance {
+    fn tolerance_for(&self, input: &TensorOp, implementations: (&str, &str)) -> Tolerance {
+        let base = self.without_hardware_allowances(input, implementations);
+
+        if !involves_gpu(implementations) {
+            return base;
+        }
+
+        // Metal may flush denormals (§8.1). Raise the absolute floor to cover exactly that
+        // — `max`, not `+`, so a class that already derives a larger absolute term keeps
+        // its own bound rather than silently gaining a little more.
+        Tolerance {
+            atol: base.atol.max(METAL_SUBNORMAL_FLOOR),
+            ..base
+        }
+    }
+}
+
+impl TensorTolerancePolicy {
+    /// The bound before any hardware-specific allowance.
+    fn without_hardware_allowances(
+        &self,
+        input: &TensorOp,
+        implementations: (&str, &str),
+    ) -> Tolerance {
         match input.class() {
-            OpClass::CorrectlyRounded => Tolerance::EXACT,
+            // **Exact stays exact even against the GPU** for most of this class. Metal's
+            // Table 8.2 lists `x + y`, `x - y`, `x * y` as *correctly rounded* and `fabs`
+            // at `0 ulp`, and measurement found them bit-identical on 200/200 cases. Two
+            // operations are the exception, and only when a GPU is involved.
+            OpClass::CorrectlyRounded => match input {
+                TensorOp::Binary {
+                    kind: BinaryOp::Div,
+                    ..
+                } if involves_gpu(implementations) => ulps(METAL_DIV_ULPS),
+
+                TensorOp::Unary {
+                    kind: UnaryOp::Sqrt,
+                    ..
+                } if involves_gpu(implementations) => ulps(METAL_SQRT_ULPS),
+
+                _ => Tolerance::EXACT,
+            },
 
             OpClass::Approximated => approximated_tolerance(input),
 
             OpClass::Accumulating => accumulating_tolerance(input),
         }
+    }
+}
+
+/// A relative tolerance of `n` units in the last place.
+///
+/// `f32::EPSILON` is the gap between 1.0 and the next representable value, which is the
+/// width of one ULP in relative terms — so `n` ULPs is `n * EPSILON` of relative error.
+fn ulps(n: f64) -> Tolerance {
+    Tolerance {
+        rtol: n * EPSILON,
+        atol: 0.0,
     }
 }
 
@@ -211,7 +304,137 @@ mod tests {
     }
 
     fn tolerance_for(op: &TensorOp) -> Tolerance {
-        TensorTolerancePolicy.tolerance_for(op)
+        // The CPU pair: these tests state what the *specification* requires of conforming
+        // implementations, which is the bound before any hardware-specific relaxation.
+        TensorTolerancePolicy.tolerance_for(op, ("burn-ndarray", "burn-tch"))
+    }
+
+    fn gpu_tolerance(op: &TensorOp) -> Tolerance {
+        TensorTolerancePolicy.tolerance_for(op, ("burn-ndarray", "burn-wgpu"))
+    }
+
+    /// **The bound must come from the specification, not the measurement.** Pinned so that
+    /// a future adjustment has to be deliberate, and so nobody quietly widens it to make a
+    /// campaign quieter.
+    ///
+    /// Metal Shading Language Specification (2026-06-04) Table 8.2, fast math enabled:
+    /// `x / y` → `<= 2.5 ulp`. See `SPECS.md` §4.1.
+    #[test]
+    fn division_against_the_gpu_gets_exactly_the_bound_metal_permits() {
+        let op = TensorOp::binary(BinaryOp::Div, value(&[4], 1.0), value(&[4], 2.0));
+        let tolerance = gpu_tolerance(&op);
+
+        assert_eq!(
+            tolerance.rtol,
+            2.5 * EPSILON,
+            "Metal Table 8.2: x / y <= 2.5 ulp"
+        );
+        // The absolute term is the separate subnormal allowance from §8.1, not part of the
+        // ULP bound — two permissions from two clauses, deliberately kept distinct.
+        assert_eq!(tolerance.atol, METAL_SUBNORMAL_FLOOR);
+    }
+
+    /// `sqrt` is the one composed bound: Table 8.2 gives it no figure, stating it is
+    /// "Implemented as `x * rsqrt(x)`" with `rsqrt <= 2 ulp`, and the correctly-rounded
+    /// multiply adds at most half a ULP.
+    #[test]
+    fn sqrt_against_the_gpu_gets_the_composed_bound() {
+        let op = TensorOp::unary(UnaryOp::Sqrt, value(&[4], 4.0));
+        assert_eq!(gpu_tolerance(&op).rtol, 3.0 * EPSILON);
+    }
+
+    /// **The relaxation applies only where the specification permits it.** Metal lists
+    /// `x + y`, `x - y`, `x * y` as *correctly rounded* and `fabs` at `0 ulp`, and
+    /// measurement found them bit-identical on 200/200 cases — so exactness holds even
+    /// against the GPU. Widening the whole class would have been the easy, wrong move.
+    #[test]
+    fn the_gpu_relaxation_does_not_leak_to_operations_metal_rounds_correctly() {
+        for op in [
+            TensorOp::binary(BinaryOp::Add, value(&[4], 1.0), value(&[4], 2.0)),
+            TensorOp::binary(BinaryOp::Sub, value(&[4], 1.0), value(&[4], 2.0)),
+            TensorOp::binary(BinaryOp::Mul, value(&[4], 1.0), value(&[4], 2.0)),
+            TensorOp::unary(UnaryOp::Neg, value(&[4], 1.0)),
+            TensorOp::unary(UnaryOp::Abs, value(&[4], 1.0)),
+        ] {
+            assert_eq!(
+                gpu_tolerance(&op).rtol,
+                0.0,
+                "Metal rounds this correctly; a GPU pair earns no *relative* slack: {op:?}"
+            );
+        }
+    }
+
+    /// **And it applies only to pairs involving the GPU.** A CPU-versus-CPU division is
+    /// still held to IEEE-754's correctly-rounded requirement; loosening it would give away
+    /// sensitivity on hardware that has no excuse for the difference.
+    #[test]
+    fn two_cpu_backends_get_no_gpu_slack() {
+        let op = TensorOp::binary(BinaryOp::Div, value(&[4], 1.0), value(&[4], 2.0));
+
+        assert_eq!(
+            TensorTolerancePolicy.tolerance_for(&op, ("burn-ndarray", "burn-tch")),
+            Tolerance::EXACT
+        );
+    }
+
+    /// **The subnormal floor is bounded exactly by what the specification permits.** Metal
+    /// §8.1 licenses flushing *denormals*, so the absolute allowance is exactly
+    /// `f32::MIN_POSITIVE` — every permitted flush, and nothing above it.
+    #[test]
+    fn the_gpu_gets_an_absolute_floor_at_exactly_the_smallest_normal() {
+        let op = TensorOp::binary(BinaryOp::Add, value(&[4], 1.0), value(&[4], 2.0));
+        let tolerance = gpu_tolerance(&op);
+
+        assert_eq!(tolerance.atol, f32::MIN_POSITIVE as f64);
+        assert_eq!(tolerance.rtol, 0.0, "add is still correctly rounded");
+    }
+
+    /// A flushed subnormal must be absorbed; a difference one step above must not. This is
+    /// the boundary the derivation claims, asserted from both sides.
+    #[test]
+    fn the_floor_absorbs_a_flushed_subnormal_and_nothing_larger() {
+        let op = TensorOp::binary(BinaryOp::Add, value(&[4], 1.0), value(&[4], 2.0));
+        let atol = gpu_tolerance(&op).atol;
+
+        let largest_subnormal = f32::from_bits(0x007f_ffff) as f64;
+        assert!(atol > largest_subnormal, "a flushed denormal is permitted");
+
+        let smallest_normal = f32::MIN_POSITIVE as f64;
+        assert!(
+            atol <= smallest_normal,
+            "a normal value vanishing is not permitted and must still be reported"
+        );
+    }
+
+    /// CPU pairs get no such floor — nothing in IEEE-754 licenses a CPU to discard a
+    /// subnormal, and granting it anyway would give away sensitivity for free.
+    #[test]
+    fn cpu_pairs_get_no_subnormal_floor() {
+        let op = TensorOp::binary(BinaryOp::Add, value(&[4], 1.0), value(&[4], 2.0));
+
+        assert_eq!(
+            TensorTolerancePolicy.tolerance_for(&op, ("burn-ndarray", "burn-tch")),
+            Tolerance::EXACT
+        );
+    }
+
+    /// The derived bounds must cover what was actually measured, with margin. If a future
+    /// device exceeded them, this is where it would show — and that would be a finding
+    /// about the device, not a reason to widen the number.
+    #[test]
+    fn the_derived_bounds_cover_the_measured_error_with_margin() {
+        let measured_div = EPSILON; // 1 ULP, `examples/gpu_numerics.rs`
+        let measured_sqrt = 2.0 * EPSILON; // 2 ULP
+
+        let div = gpu_tolerance(&TensorOp::binary(
+            BinaryOp::Div,
+            value(&[4], 1.0),
+            value(&[4], 2.0),
+        ));
+        let sqrt = gpu_tolerance(&TensorOp::unary(UnaryOp::Sqrt, value(&[4], 4.0)));
+
+        assert!(div.rtol >= 2.0 * measured_div, "div margin too thin");
+        assert!(sqrt.rtol >= 1.4 * measured_sqrt, "sqrt margin too thin");
     }
 
     #[test]

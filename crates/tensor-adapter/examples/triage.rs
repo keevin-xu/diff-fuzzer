@@ -84,7 +84,7 @@ fn main() {
         let right = TensorNormalizer.normalize(torch.run(&case).expect("valid case"));
 
         // Rung 1: does it still diverge, from the seed alone?
-        let tolerance = policy.tolerance_for(&case);
+        let tolerance = policy.tolerance_for(&case, ("burn-ndarray", "burn-tch"));
         let reproduced = !compare(&left.values, &right.values, tolerance).agrees();
 
         // Rung 2: how does the error compare with what the arithmetic predicts?

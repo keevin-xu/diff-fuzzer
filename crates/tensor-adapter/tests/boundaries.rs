@@ -37,7 +37,7 @@ fn on_both(case: &TensorOp) -> (Vec<f32>, Vec<f32>) {
 fn agree(case: &TensorOp) -> bool {
     let cpu = TensorNormalizer.normalize(ndarray().run(case).expect("valid case"));
     let torch = TensorNormalizer.normalize(libtorch().run(case).expect("valid case"));
-    let tolerance = TensorTolerancePolicy.tolerance_for(case);
+    let tolerance = TensorTolerancePolicy.tolerance_for(case, ("burn-ndarray", "burn-tch"));
 
     matches!(cpu.approx_compare(&torch, tolerance), Agreement::Agree(_))
 }

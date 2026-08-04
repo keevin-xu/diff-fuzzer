@@ -177,7 +177,23 @@ pub enum Agreement {
 /// the question; only the domain knows enough to answer it, since only the domain knows
 /// what kind of operation a case represents.
 pub trait TolerancePolicy<In> {
-    fn tolerance_for(&self, input: &In) -> Tolerance;
+    /// How much disagreement is permitted between **these two implementations** on this
+    /// case.
+    ///
+    /// # Why the implementations are a parameter
+    ///
+    /// This took only the input until PHASE-7, which was sufficient while every
+    /// implementation ran on the same hardware. It stopped being sufficient the moment a
+    /// GPU arrived: division is *correctly rounded* on a CPU and permitted `2.5` units in
+    /// the last place on Metal, so the same case deserves a different bound depending on
+    /// **who ran it**.
+    ///
+    /// **A tolerance was always a property of a comparison, not of a case.** With two
+    /// implementations there is exactly one comparison, so the input alone identified it
+    /// and the omission was invisible — the same structural blindness that let the oracle
+    /// compare everything against `outputs[0]` and let signatures be built from the first
+    /// two results. A third implementation exposed all three.
+    fn tolerance_for(&self, input: &In, implementations: (&str, &str)) -> Tolerance;
 }
 
 /// The same tolerance regardless of the case.
@@ -187,7 +203,7 @@ pub trait TolerancePolicy<In> {
 pub struct FixedTolerance(pub Tolerance);
 
 impl<In> TolerancePolicy<In> for FixedTolerance {
-    fn tolerance_for(&self, _input: &In) -> Tolerance {
+    fn tolerance_for(&self, _input: &In, _implementations: (&str, &str)) -> Tolerance {
         self.0
     }
 }

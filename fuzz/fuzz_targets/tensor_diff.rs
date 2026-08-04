@@ -170,7 +170,10 @@ fuzz_target!(|case: TensorOp| {
         input: minimized.input.clone(),
         minimisation: MinimisationRecord::from(&minimized),
         outputs: divergence.outputs,
-        tolerance: TensorTolerancePolicy.tolerance_for(&minimized.input),
+        // Named explicitly: with per-pair bounds a report must say which comparison its
+        // tolerance governed. The fuzz target always compares exactly two.
+        tolerance: TensorTolerancePolicy
+            .tolerance_for(&minimized.input, (harness.cpu.name(), second.name())),
         environment: environment(),
         summary: divergence.summary,
     };

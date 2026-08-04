@@ -13,7 +13,7 @@
 //! which is why every report carries the one that was in force.
 
 use crate::report::Divergence;
-use crate::tolerance::{Agreement, ApproxEq, Comparison, TolerancePolicy};
+use crate::tolerance::{Agreement, ApproxEq, Comparison, Tolerance, TolerancePolicy};
 use crate::traits::{Input, NamedOutput, Oracle, SkipReason, Verdict};
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -56,8 +56,6 @@ where
             });
         }
 
-        let tolerance = self.policy.tolerance_for(input);
-
         // **Compare every pair, not everything against the first.**
         //
         // This used to compare each result against `outputs[0]`, on the grounds that
@@ -75,6 +73,9 @@ where
         // implementation; comparing walks arrays already in memory. At five
         // implementations that is five runs against ten array walks.
         let mut complaints: Vec<String> = Vec::new();
+        // The tolerance a report cites. With per-pair bounds there is no single number for
+        // the case, so the report names the one in force for the pair it describes.
+        let mut worst_tolerance: Option<Tolerance> = None;
 
         // Whether any comparison actually examined arithmetic. A result entirely
         // undefined on both sides agrees without checking anything, and reporting that as
@@ -90,6 +91,13 @@ where
             agrees[left][left] = true;
             for right in (left + 1)..outputs.len() {
                 let (a, b) = (&outputs[left], &outputs[right]);
+                // Asked per pair, not once for the case: a bound can differ by *who* is
+                // being compared, and a single tolerance would apply a CPU-versus-CPU
+                // assumption to a CPU-versus-GPU comparison.
+                let tolerance = self
+                    .policy
+                    .tolerance_for(input, (&a.implementation, &b.implementation));
+                worst_tolerance = Some(tolerance);
                 match a.output.approx_compare(&b.output, tolerance) {
                     Agreement::Agree(comparison) => {
                         agrees[left][right] = true;
@@ -134,13 +142,16 @@ where
                 .iter()
                 .map(|o| (o.implementation.clone(), format!("{:?}", o.output)))
                 .collect(),
-            summary: format!(
-                "{}{} (rtol {:e}, atol {:e})",
-                verdict_line(outputs, &agrees),
-                complaints.join("; "),
-                tolerance.rtol,
-                tolerance.atol
-            ),
+            summary: {
+                let tolerance = worst_tolerance.unwrap_or(Tolerance::EXACT);
+                format!(
+                    "{}{} (rtol {:e}, atol {:e})",
+                    verdict_line(outputs, &agrees),
+                    complaints.join("; "),
+                    tolerance.rtol,
+                    tolerance.atol
+                )
+            },
         })
     }
 }
