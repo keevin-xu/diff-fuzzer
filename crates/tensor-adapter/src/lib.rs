@@ -46,6 +46,6 @@ pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use known::{KNOWN, Known, Status, known_issue};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use ops::Bounds;
-pub use signature::signature;
+pub use signature::{DisagreeingPair, signature, signature_across};
 pub use testing::{FaultyBackend, FaultyNdArray, faulty};
 pub use tolerance::{OpClass, TensorTolerancePolicy};

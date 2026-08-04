@@ -31,7 +31,7 @@ use diff_fuzzer_core::{
 use std::collections::BTreeMap;
 use tensor_adapter::{
     Bounds, CanonicalTensor, FaultyBackend, TensorNormalizer, TensorOp, TensorOpGenerator,
-    TensorTolerancePolicy, environment, libtorch, ndarray, signature, wgpu,
+    TensorTolerancePolicy, environment, libtorch, ndarray, signature_across, wgpu,
 };
 
 /// Divergences printed in full before switching to a count. A campaign that flags
@@ -219,10 +219,11 @@ fn main() {
                 // adds nothing.
                 let outputs = normalized(&case, runners);
                 let tolerance = TensorTolerancePolicy.tolerance_for(&case);
-                let fingerprint = match outputs.as_slice() {
-                    [(_, left), (_, right), ..] => signature(&case, left, right, tolerance),
-                    _ => format!("{}/unpaired", case.name()),
-                };
+                // Across *all* implementations, not the first two. With three backends the
+                // old form computed the label from two CPUs that agreed, so a GPU
+                // divergence came out labelled `.../agree`.
+                let (fingerprint, disagreeing) = signature_across(&case, &outputs, tolerance);
+                let _ = &disagreeing;
 
                 if !seen.is_new(&fingerprint) {
                     // Counted, not recorded. How often a problem is reachable is worth

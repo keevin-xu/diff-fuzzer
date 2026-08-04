@@ -22,11 +22,18 @@ use diff_fuzzer_core::{
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    Known, TensorNormalizer, TensorOp, known_issue, libtorch, ndarray, signature,
+    CanonicalTensor, DisagreeingPair, Known, TensorNormalizer, TensorOp, known_issue, libtorch,
+    ndarray, signature_across, wgpu,
 };
 
 /// One representative of a problem, plus how often it was hit.
 struct Group {
+    /// Which two implementations the signature was computed from.
+    ///
+    /// Kept **beside** the signature rather than inside it: a key containing backend names
+    /// would change when a backend is added, orphaning `known.rs`. See
+    /// `signature_across`'s documentation.
+    disagreeing: Option<DisagreeingPair>,
     occurrences: usize,
     /// The smallest case seen for this problem — the one worth reading.
     smallest: DivergenceReport<TensorOp>,
@@ -61,7 +68,7 @@ fn main() {
         // file. A report written by an older build may carry a signature computed by an
         // older rule, and grouping by two different rules at once would split a problem
         // in half without saying so.
-        let fingerprint = fingerprint_of(&report);
+        let (fingerprint, disagreeing) = fingerprint_of(&report);
         seen.is_new(&fingerprint);
 
         // Rung 1 of the ladder, on every report: does it still diverge? A finding that
@@ -83,6 +90,7 @@ fn main() {
                 }
             })
             .or_insert_with(|| Group {
+                disagreeing,
                 occurrences: 1,
                 smallest_size: size,
                 smallest: report,
@@ -207,6 +215,12 @@ fn section(out: &mut String, signature: &str, group: &Group, known: Option<&'sta
         }
     }
 
+    if let Some(pair) = &group.disagreeing {
+        out.push_str(&format!(
+            "- disagreeing pair: **{}** vs **{}**\n",
+            pair.left, pair.right
+        ));
+    }
     out.push_str(&format!(
         "- **{}** case(s) matched this signature — *matching is not evidence of a shared cause*\n\
          - reproduces: **{} of {}** checked{}\n\
@@ -265,19 +279,35 @@ fn load_all(directory: &str) -> Vec<(std::path::PathBuf, DivergenceReport<Tensor
     reports
 }
 
-/// Recompute a report's signature from its case.
-fn fingerprint_of(report: &DivergenceReport<TensorOp>) -> String {
-    let (cpu, torch) = (ndarray(), libtorch());
-    let (Ok(left), Ok(right)) = (cpu.run(&report.input), torch.run(&report.input)) else {
-        return format!("{}/could-not-run", report.label);
-    };
+/// Recompute a report's signature from its case, across every implementation.
+///
+/// Re-derived rather than read from the file: a report written by an older build carries a
+/// label computed by an older rule, and grouping under two rules at once splits a problem
+/// in half without saying so.
+///
+/// **Every backend is run, not just the two CPUs.** Hardcoding a pair here had the same
+/// defect the campaign runner did — a finding whose only dissenter was the GPU would be
+/// re-labelled from two backends that agree.
+fn fingerprint_of(report: &DivergenceReport<TensorOp>) -> (String, Option<DisagreeingPair>) {
+    let mut outputs: Vec<(String, CanonicalTensor)> = Vec::new();
+    for runner in backends() {
+        if let Ok(raw) = runner.run(&report.input) {
+            outputs.push((runner.name().to_string(), TensorNormalizer.normalize(raw)));
+        }
+    }
+    if outputs.len() < 2 {
+        return (format!("{}/could-not-run", report.label), None);
+    }
 
-    signature(
-        &report.input,
-        &TensorNormalizer.normalize(left),
-        &TensorNormalizer.normalize(right),
-        report.tolerance,
-    )
+    signature_across(&report.input, &outputs, report.tolerance)
+}
+
+/// Every backend a finding is re-checked against.
+///
+/// The GPU is included so a divergence that only it exhibits is labelled from the pair that
+/// actually disagreed. Cheap: triage runs once over a directory, not per fuzzing execution.
+fn backends() -> Vec<Box<dyn Implementation<In = TensorOp, Out = burn::tensor::TensorData>>> {
+    vec![Box::new(ndarray()), Box::new(libtorch()), Box::new(wgpu())]
 }
 
 /// Does this report's case still diverge, under the tolerance it was judged against?
@@ -321,6 +351,9 @@ fn report(groups: &BTreeMap<String, Group>, seen: &Seen) {
         // matches; it did not establish that N cases share a mechanism. A count that reads
         // as N confirmations of one bug overstates what was computed.
         println!("   {} case(s) matched this signature", group.occurrences);
+        if let Some(pair) = &group.disagreeing {
+            println!("   disagreeing pair: {} vs {}", pair.left, pair.right);
+        }
         println!(
             "   reproduces: {} of {} checked{}",
             group.reproduced,

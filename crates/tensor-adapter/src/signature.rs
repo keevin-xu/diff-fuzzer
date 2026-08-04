@@ -51,6 +51,116 @@ pub fn signature(
     format!("{}/rank{}/{}", case.name(), case.rank(), kind)
 }
 
+/// Which two implementations a signature was computed from.
+///
+/// Recorded **beside** the signature rather than inside it — see [`signature_across`] for
+/// why the names must stay out of the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisagreeingPair {
+    pub left: String,
+    pub right: String,
+}
+
+/// A signature for a case run on **any number** of implementations.
+///
+/// # The problem this solves
+///
+/// [`signature`] takes exactly two results, which was unambiguous while there were two
+/// backends. With three, callers were passing the *first two* — so when the GPU was the
+/// one that disagreed, the label was computed from two CPU backends that agreed, and a
+/// diverging case came out labelled `.../agree`. **Something wrong was recorded, which is
+/// worse than nothing, because it looks like a normal result.**
+///
+/// This picks the pair that actually disagreed — the **worst** one, by kind first and
+/// magnitude second — and returns its name alongside the signature.
+///
+/// # Why the implementation names stay out of the signature string
+///
+/// It is tempting to write `div/rank2/ndarray-vs-wgpu/numeric/1e-7`. Resist it:
+///
+/// - **The signature is a de-duplication key, and names make it depend on the experiment.**
+///   The same `matmul` overflow would be `matmul/rank2/undefined` in a two-backend campaign
+///   and `matmul/rank2/ndarray-vs-tch/undefined` in a three-backend one. `known.rs` matches
+///   exact strings, so a long-settled problem would return labelled *new* the moment a
+///   backend is added.
+/// - **It inflates the class count.** One GPU rounding difference disagrees on
+///   `ndarray↔wgpu` *and* `tch↔wgpu`; with names in the key that is two classes for one
+///   phenomenon, triaged twice.
+/// - **Nothing is lost**, because the pair is returned separately and can be grouped or
+///   displayed on demand.
+///
+/// > **A signature should describe the *problem*, not the *observation setup*.** Which
+/// > backends were running is a fact about the experiment, not about the bug.
+///
+/// Returns `None` for the pair when everything agreed.
+pub fn signature_across(
+    case: &TensorOp,
+    outputs: &[(String, CanonicalTensor)],
+    tolerance: Tolerance,
+) -> (String, Option<DisagreeingPair>) {
+    let mut worst: Option<(Severity, usize, usize)> = None;
+
+    for left in 0..outputs.len() {
+        for right in (left + 1)..outputs.len() {
+            let severity = severity_of(&outputs[left].1, &outputs[right].1, tolerance);
+            if severity == Severity::AGREE {
+                continue;
+            }
+            // Strictly greater, so the first pair wins a tie and the choice is
+            // deterministic — a signature that varied with iteration order would be
+            // useless as a key.
+            if worst.as_ref().is_none_or(|(w, _, _)| severity > *w) {
+                worst = Some((severity, left, right));
+            }
+        }
+    }
+
+    match worst {
+        Some((_, left, right)) => (
+            signature(case, &outputs[left].1, &outputs[right].1, tolerance),
+            Some(DisagreeingPair {
+                left: outputs[left].0.clone(),
+                right: outputs[right].0.clone(),
+            }),
+        ),
+        // Everything agreed. Fall back to the first pair so the function is total; callers
+        // reach this only when asking for a signature on a case that did not diverge.
+        None => match outputs {
+            [(_, a), (_, b), ..] => (signature(case, a, b, tolerance), None),
+            _ => (format!("{}/unpaired", case.name()), None),
+        },
+    }
+}
+
+/// How bad a disagreement is, for choosing which pair names a finding.
+///
+/// Ordered so that a difference *in kind* always outranks one of degree: two backends
+/// returning different shapes is a more fundamental disagreement than two returning
+/// slightly different numbers, however large the numeric gap.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+struct Severity(u8, f64);
+
+impl Severity {
+    const AGREE: Severity = Severity(0, 0.0);
+}
+
+fn severity_of(left: &CanonicalTensor, right: &CanonicalTensor, tolerance: Tolerance) -> Severity {
+    match left.approx_compare(right, tolerance) {
+        Agreement::Agree(_) => Severity::AGREE,
+        Agreement::Structural { .. } => Severity(3, 0.0),
+        Agreement::Disagree(comparison) => {
+            if involves_undefined(left, right) {
+                Severity(2, 0.0)
+            } else {
+                // Magnitude breaks ties within the numeric class, so the pair that differs
+                // most is the one that names the finding.
+                let error = comparison.max_relative_error;
+                Severity(1, if error.is_finite() { error } else { f64::MAX })
+            }
+        }
+    }
+}
+
 /// How two results disagree, in the coarsest terms that still separate causes.
 fn disagreement_kind(
     left: &CanonicalTensor,
@@ -220,6 +330,111 @@ mod tests {
         );
 
         assert!(structural.contains("structural"), "{structural}");
+    }
+
+    fn named(name: &str, shape: &[usize], values: &[f32]) -> (String, CanonicalTensor) {
+        (name.to_string(), canon(shape, values))
+    }
+
+    /// **The bug this function exists to fix.** Callers used to pass the first two outputs,
+    /// so when the third implementation was the one that disagreed, the label was computed
+    /// from two that agreed — and a diverging case came out labelled `.../agree`.
+    #[test]
+    fn a_third_implementation_disagreeing_is_not_labelled_agree() {
+        let outputs = [
+            named("cpu-a", &[1], &[1.0]),
+            named("cpu-b", &[1], &[1.0]),
+            named("gpu", &[1], &[1.5]),
+        ];
+
+        let (signature, pair) = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
+
+        assert!(
+            !signature.contains("agree"),
+            "a diverging case must not be labelled agree: {signature}"
+        );
+        let pair = pair.expect("a disagreeing pair exists");
+        assert_eq!(pair.right, "gpu", "the pair must include the dissenter");
+    }
+
+    /// **The property that keeps `known.rs` from orphaning when a backend is added.** The
+    /// same problem must produce the same key whether two or three implementations ran.
+    #[test]
+    fn adding_an_agreeing_implementation_does_not_change_the_signature() {
+        let two = [named("cpu-a", &[1], &[1.0]), named("gpu", &[1], &[1.5])];
+        let three = [
+            named("cpu-a", &[1], &[1.0]),
+            named("cpu-b", &[1], &[1.0]),
+            named("gpu", &[1], &[1.5]),
+        ];
+
+        let (from_two, _) = signature_across(&case(&[1]), &two, Tolerance::EXACT);
+        let (from_three, _) = signature_across(&case(&[1]), &three, Tolerance::EXACT);
+
+        assert_eq!(
+            from_two, from_three,
+            "the signature must describe the problem, not which backends were running"
+        );
+    }
+
+    /// Implementation names must stay out of the key — see `signature_across`'s docs for
+    /// the two failures that causes.
+    #[test]
+    fn the_signature_never_contains_an_implementation_name() {
+        let outputs = [
+            named("burn-ndarray", &[1], &[1.0]),
+            named("burn-wgpu", &[1], &[1.5]),
+        ];
+        let (signature, _) = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
+
+        assert!(
+            !signature.contains("ndarray") && !signature.contains("wgpu"),
+            "{signature}"
+        );
+    }
+
+    /// A difference in *kind* outranks one of degree, however large the numeric gap: two
+    /// backends returning different shapes disagree more fundamentally than two returning
+    /// different numbers.
+    #[test]
+    fn a_structural_disagreement_outranks_a_large_numeric_one() {
+        let outputs = [
+            named("a", &[1], &[1.0]),
+            named("b", &[1], &[1e30]),
+            named("c", &[2], &[1.0, 2.0]),
+        ];
+
+        let (signature, pair) = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
+
+        assert!(signature.contains("structural"), "{signature}");
+        assert_eq!(pair.expect("a pair").right, "c");
+    }
+
+    /// Deterministic on ties, or the key would vary with iteration order.
+    #[test]
+    fn the_chosen_pair_is_deterministic() {
+        let outputs = [
+            named("a", &[1], &[1.0]),
+            named("b", &[1], &[2.0]),
+            named("c", &[1], &[2.0]),
+        ];
+
+        let first = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
+        let again = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
+        assert_eq!(first.1, again.1);
+        assert_eq!(
+            first.1.expect("a pair").right,
+            "b",
+            "the earlier pair wins a tie"
+        );
+    }
+
+    /// Agreement yields no pair — callers should not be told a disagreement happened.
+    #[test]
+    fn full_agreement_reports_no_disagreeing_pair() {
+        let outputs = [named("a", &[1], &[1.0]), named("b", &[1], &[1.0])];
+        let (_, pair) = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
+        assert!(pair.is_none());
     }
 
     /// Signatures must be stable across runs, or de-duplication would fail to duplicate.
