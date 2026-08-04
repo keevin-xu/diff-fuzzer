@@ -135,6 +135,26 @@ const METAL_SQRT_ULPS: f64 = 3.0;
 /// `rtol` short of absurd would absorb it, and an absurd one would hide everything else.
 const METAL_SUBNORMAL_FLOOR: f64 = f32::MIN_POSITIVE as f64;
 
+/// Whether any operand carries a subnormal value.
+///
+/// Checked on the **input**, not the result. Metal §8.1 licenses flushing denormals
+/// "passed as input to *or* produced as the output of" an arithmetic operation, and the
+/// input case is the one no tolerance can handle: a subnormal input flushed to zero can
+/// produce a perfectly normal-sized difference in the output.
+fn has_subnormal_input(case: &TensorOp) -> bool {
+    let operands: [&crate::input::TensorValue; 2] = match case {
+        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => [arg, arg],
+        TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => [lhs, rhs],
+    };
+
+    operands.iter().any(|operand| {
+        operand
+            .data()
+            .iter()
+            .any(|value| *value != 0.0 && value.abs() < f32::MIN_POSITIVE)
+    })
+}
+
 /// Whether a comparison involves a GPU backend.
 ///
 /// Matched on the name because that is what the policy is handed. Crude, and deliberately
@@ -160,6 +180,51 @@ impl TolerancePolicy<TensorOp> for TensorTolerancePolicy {
             atol: base.atol.max(METAL_SUBNORMAL_FLOOR),
             ..base
         }
+    }
+
+    fn known_legal(
+        &self,
+        input: &TensorOp,
+        implementations: (&str, &str),
+    ) -> Option<(String, String)> {
+        self.licensed_difference(input, implementations)
+    }
+}
+
+impl TensorTolerancePolicy {
+    /// **The one licensed difference, and it is licensed by a quoted clause.**
+    ///
+    /// Metal Shading Language Specification (2026-06-04) §8.1: "Denormalized
+    /// single-precision … numbers passed as **input to** or produced as the output of …
+    /// arithmetic operations may be flushed to zero."
+    ///
+    /// The *output* half is handled by an absolute tolerance ([`METAL_SUBNORMAL_FLOOR`]).
+    /// The **input** half cannot be: flushing a subnormal input can move the output by an
+    /// unbounded amount. `sqrt(1.4e-45)` is `3.7e-23` on a CPU and `0` on the GPU —
+    /// fifteen orders of magnitude apart, from a difference the specification permits.
+    ///
+    /// So such a case is **not compared** against a GPU. That discards evidence, which is
+    /// why it is confined to exactly this condition rather than applied to the operation
+    /// or the class: a policy that declares its awkward cases legal finds nothing and
+    /// looks flawless.
+    ///
+    /// **CPU pairs are unaffected** — nothing licenses a CPU to discard a subnormal, and
+    /// a divergence there would be a real finding.
+    fn licensed_difference(
+        &self,
+        input: &TensorOp,
+        implementations: (&str, &str),
+    ) -> Option<(String, String)> {
+        if involves_gpu(implementations) && has_subnormal_input(input) {
+            return Some((
+                "subnormal input on a GPU".to_string(),
+                "Metal Shading Language Specification §8.1 permits denormals passed as \
+                 input to be flushed to zero; the resulting output difference is unbounded \
+                 and no tolerance can distinguish it from a defect"
+                    .to_string(),
+            ));
+        }
+        None
     }
 }
 
@@ -415,6 +480,61 @@ mod tests {
         assert_eq!(
             TensorTolerancePolicy.tolerance_for(&op, ("burn-ndarray", "burn-tch")),
             Tolerance::EXACT
+        );
+    }
+
+    /// **The licensed difference fires only where the specification licenses it.**
+    #[test]
+    fn a_subnormal_input_against_the_gpu_is_licensed() {
+        let op = TensorOp::unary(UnaryOp::Sqrt, value(&[2], 1e-45));
+
+        let licensed = TensorTolerancePolicy.known_legal(&op, ("burn-ndarray", "burn-wgpu"));
+        let (class, detail) = licensed.expect("Metal §8.1 permits flushing a denormal input");
+
+        assert!(class.contains("subnormal"));
+        assert!(
+            detail.contains("§8.1"),
+            "the licence must cite its clause, since it discards evidence: {detail}"
+        );
+    }
+
+    /// **Nothing licenses a CPU to discard a subnormal**, so the same case is still judged.
+    /// Getting this wrong would silently stop testing two conforming implementations
+    /// against each other.
+    #[test]
+    fn the_same_case_between_two_cpus_is_not_licensed() {
+        let op = TensorOp::unary(UnaryOp::Sqrt, value(&[2], 1e-45));
+
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&op, ("burn-ndarray", "burn-tch"))
+                .is_none()
+        );
+    }
+
+    /// The licence is confined to the condition that earns it — not the operation, and not
+    /// the class. A GPU comparison on ordinary values is judged normally.
+    #[test]
+    fn ordinary_values_against_the_gpu_are_still_judged() {
+        let op = TensorOp::unary(UnaryOp::Sqrt, value(&[2], 4.0));
+
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&op, ("burn-ndarray", "burn-wgpu"))
+                .is_none()
+        );
+    }
+
+    /// A zero is not a subnormal, and treating it as one would license a large share of
+    /// every campaign for no reason.
+    #[test]
+    fn zero_is_not_a_subnormal() {
+        let op = TensorOp::unary(UnaryOp::Sqrt, value(&[2], 0.0));
+
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&op, ("burn-ndarray", "burn-wgpu"))
+                .is_none()
         );
     }
 

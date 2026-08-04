@@ -76,6 +76,9 @@ where
         // The tolerance a report cites. With per-pair bounds there is no single number for
         // the case, so the report names the one in force for the pair it describes.
         let mut worst_tolerance: Option<Tolerance> = None;
+        // Pairs the policy declared licensed, kept so a fully licensed case can say *why*
+        // it was not judged rather than vanishing into a generic skip.
+        let mut licensed: Vec<(String, String)> = Vec::new();
 
         // Whether any comparison actually examined arithmetic. A result entirely
         // undefined on both sides agrees without checking anything, and reporting that as
@@ -91,6 +94,18 @@ where
             agrees[left][left] = true;
             for right in (left + 1)..outputs.len() {
                 let (a, b) = (&outputs[left], &outputs[right]);
+
+                // A licensed difference is not compared at all. Treating the pair as
+                // agreeing would be worse than skipping it: it would count as evidence the
+                // implementations match, when the truth is that nothing was learned.
+                if let Some((class, detail)) = self
+                    .policy
+                    .known_legal(input, (&a.implementation, &b.implementation))
+                {
+                    licensed.push((class, detail));
+                    continue;
+                }
+
                 // Asked per pair, not once for the case: a bound can differ by *who* is
                 // being compared, and a single tolerance would apply a CPU-versus-CPU
                 // assumption to a CPU-versus-GPU comparison.
@@ -125,6 +140,17 @@ where
         if complaints.is_empty() {
             // Agreement reached without comparing a single number is not a pass. It is a
             // case that went unjudged, and saying so keeps the distinction visible.
+            // **A licensed pair means the case was not fully judged, even if the pairs
+            // that *were* compared agreed.** Reporting `Agree` here would count an
+            // implementation that was never examined as having passed — the same
+            // "exclusion wearing the costume of agreement" that makes an all-`NaN` result
+            // a skip rather than a pass. The distinction matters most exactly when a
+            // campaign looks clean.
+            if !licensed.is_empty() {
+                let (class, detail) = licensed.remove(0);
+                return Verdict::Skipped(SkipReason::KnownLegal { class, detail });
+            }
+
             return if examined_arithmetic {
                 Verdict::Agree
             } else {
@@ -356,6 +382,72 @@ mod tests {
             ),
             other => panic!("expected a divergence, got {other:?}"),
         }
+    }
+
+    /// A policy that licenses one pair, to test that the licence is honoured.
+    #[derive(Debug, Clone, Copy)]
+    struct LicensesTheSecondPair;
+
+    impl TolerancePolicy<TestInput> for LicensesTheSecondPair {
+        fn tolerance_for(&self, _input: &TestInput, _implementations: (&str, &str)) -> Tolerance {
+            Tolerance::EXACT
+        }
+        fn known_legal(
+            &self,
+            _input: &TestInput,
+            implementations: (&str, &str),
+        ) -> Option<(String, String)> {
+            (implementations.0 == "gpu" || implementations.1 == "gpu")
+                .then(|| ("gpu".to_string(), "cited clause".to_string()))
+        }
+    }
+
+    /// **A licensed pair must not be counted as agreement**, even when the pairs that
+    /// *were* compared agreed. Reporting `Agree` would record an implementation that was
+    /// never examined as having passed — an exclusion wearing the costume of a pass, and
+    /// most misleading exactly when a campaign looks clean.
+    #[test]
+    fn a_licensed_pair_makes_the_case_unjudged_rather_than_passing() {
+        let oracle: DifferentialOracle<TestInput, Vec<f32>, LicensesTheSecondPair> =
+            DifferentialOracle::new(LicensesTheSecondPair);
+
+        let verdict = oracle.check(
+            &TestInput,
+            &[
+                output("cpu-a", vec![1.0]),
+                output("cpu-b", vec![1.0]),
+                output("gpu", vec![999.0]),
+            ],
+        );
+
+        match verdict {
+            Verdict::Skipped(SkipReason::KnownLegal { class, detail }) => {
+                assert_eq!(class, "gpu");
+                assert_eq!(detail, "cited clause");
+            }
+            other => panic!("the gpu pair was licensed, so nothing was fully judged: {other:?}"),
+        }
+    }
+
+    /// A licence for one pair must not suppress a divergence between two others.
+    #[test]
+    fn a_licence_does_not_hide_a_disagreement_elsewhere() {
+        let oracle: DifferentialOracle<TestInput, Vec<f32>, LicensesTheSecondPair> =
+            DifferentialOracle::new(LicensesTheSecondPair);
+
+        let verdict = oracle.check(
+            &TestInput,
+            &[
+                output("cpu-a", vec![1.0]),
+                output("cpu-b", vec![2.0]),
+                output("gpu", vec![999.0]),
+            ],
+        );
+
+        assert!(
+            matches!(verdict, Verdict::Diverged(_)),
+            "cpu-a and cpu-b disagree and neither is licensed: {verdict:?}"
+        );
     }
 
     #[test]

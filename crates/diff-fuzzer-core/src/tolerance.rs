@@ -194,6 +194,35 @@ pub trait TolerancePolicy<In> {
     /// compare everything against `outputs[0]` and let signatures be built from the first
     /// two results. A third implementation exposed all three.
     fn tolerance_for(&self, input: &In, implementations: (&str, &str)) -> Tolerance;
+
+    /// Whether a difference between **these two implementations** on this case is licensed
+    /// outright, making the comparison uninformative rather than wrong.
+    ///
+    /// # Why this is not a tolerance
+    ///
+    /// A tolerance says *how much* difference is acceptable. Some permitted differences
+    /// have **no bound at all**, and no threshold can express them without also absorbing
+    /// real defects.
+    ///
+    /// The case that forced this: Metal is permitted to flush a subnormal *input* to zero.
+    /// For `sqrt` that is catastrophic in magnitude — `sqrt(1.4e-45)` is `3.7e-23` on a CPU
+    /// and `0` on the GPU, a difference fifteen orders of magnitude above any subnormal
+    /// floor, because `sqrt` maps a subnormal input to a **normal** output. The
+    /// specification licenses it; no `atol` can absorb it without hiding genuine bugs.
+    ///
+    /// # This must be rare, and cited
+    ///
+    /// Returning `Some` here **discards evidence**: the pair is not compared at all. That
+    /// is the strongest thing a policy can say and the easiest to abuse — a policy that
+    /// declares its awkward cases legal reports no divergences and looks perfect. Every
+    /// use should point at a specification clause, and the `detail` string is where that
+    /// citation goes so it reaches the report.
+    ///
+    /// Returns `(class, detail)` for [`SkipReason::KnownLegal`]. Defaults to `None`: a
+    /// policy says nothing is licensed unless it says so explicitly.
+    fn known_legal(&self, _input: &In, _implementations: (&str, &str)) -> Option<(String, String)> {
+        None
+    }
 }
 
 /// The same tolerance regardless of the case.
