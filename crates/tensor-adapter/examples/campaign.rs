@@ -31,7 +31,7 @@ use diff_fuzzer_core::{
 use std::collections::BTreeMap;
 use tensor_adapter::{
     Bounds, CanonicalTensor, FaultyBackend, TensorNormalizer, TensorOp, TensorOpGenerator,
-    TensorTolerancePolicy, environment, libtorch, ndarray, signature,
+    TensorTolerancePolicy, environment, libtorch, ndarray, signature, wgpu,
 };
 
 /// Divergences printed in full before switching to a count. A campaign that flags
@@ -62,6 +62,11 @@ fn main() {
     // reporting path — shrink, describe, save — can be exercised on demand rather than
     // only when a genuine divergence happens to turn up.
     let fault = args.iter().any(|a| a == "fault");
+    // `gpu` adds `burn-wgpu` as a third implementation. Opt-in rather than default: GPU
+    // reductions are not deterministic on this device (see `examples/wgpu_check.rs`), so
+    // a run including it answers a different question from a CPU-only one and the two
+    // should not be silently mixed.
+    let gpu = args.iter().any(|a| a == "gpu");
 
     // The wider setting exists to stress the accumulating operations. Since the
     // tolerance for those is derived per case from the actual shapes and values, a
@@ -91,9 +96,18 @@ fn main() {
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
 
+    let gpu_runner = NormalizedRunner::new(wgpu(), TensorNormalizer);
+
     let second: &dyn Runner<In = TensorOp, Canon = CanonicalTensor> =
         if fault { &faulty } else { &torch };
-    let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, second];
+
+    // A `Vec` rather than an array: the driver has always taken a slice and never assumed
+    // two, so a third implementation needs no change beyond appending one.
+    let mut runners: Vec<&dyn Runner<In = TensorOp, Canon = CanonicalTensor>> = vec![&cpu, second];
+    if gpu {
+        runners.push(&gpu_runner);
+    }
+    let runners = runners.as_slice();
 
     let oracle: DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy> =
         DifferentialOracle::new(TensorTolerancePolicy);
@@ -134,9 +148,12 @@ fn main() {
     // Naming the actual pair rather than the usual one: a header that says `burn-tch`
     // while a fault is injected would misdescribe every finding below it.
     println!(
-        "  {} vs {}, tolerance derived per operation\n",
-        cpu.name(),
-        second.name()
+        "  {}, tolerance derived per operation\n",
+        runners
+            .iter()
+            .map(|r| r.name())
+            .collect::<Vec<_>>()
+            .join(" vs ")
     );
 
     // Which run directory this campaign's output belongs to.
@@ -173,7 +190,7 @@ fn main() {
         // Regenerated only to label the row; the driver builds the identical case from
         // the same seed, which is the determinism guarantee being relied on.
         let case = generator.generate(&mut SeededRng::from_seed(seed));
-        let outcome = run_once(seed, &generator, &runners, &oracle);
+        let outcome = run_once(seed, &generator, runners, &oracle);
 
         let entry = per_operation.entry(case.name()).or_default();
 
@@ -200,7 +217,7 @@ fn main() {
                 // Group before doing any work. Shrinking and writing a report for the
                 // thousandth instance of a problem already recorded costs real time and
                 // adds nothing.
-                let outputs = normalized(&case, &runners);
+                let outputs = normalized(&case, runners);
                 let tolerance = TensorTolerancePolicy.tolerance_for(&case);
                 let fingerprint = match outputs.as_slice() {
                     [(_, left), (_, right), ..] => signature(&case, left, right, tolerance),
@@ -219,7 +236,7 @@ fn main() {
                 // and summary belong to a case the report no longer contains — pairing a
                 // one-element input with a description of thirty-five values would leave
                 // a reader unable to tell which they were looking at.
-                let shrunk_divergence = match describe(&minimized.input, &runners, &oracle) {
+                let shrunk_divergence = match describe(&minimized.input, runners, &oracle) {
                     Some(divergence) => divergence,
                     // Cannot happen — the predicate only accepted candidates that
                     // diverge — but falling back to the original description is better

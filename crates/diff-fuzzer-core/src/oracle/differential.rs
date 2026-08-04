@@ -58,41 +58,59 @@ where
 
         let tolerance = self.policy.tolerance_for(input);
 
-        // Compare every result against the first. With two implementations this is just
-        // "do they match"; with more, agreeing with the first is enough to conclude all
-        // agree, since agreement within a fixed tolerance is transitive enough at this
-        // scale — and any disagreement is reported with the specific pair named.
-        let reference = &outputs[0];
+        // **Compare every pair, not everything against the first.**
+        //
+        // This used to compare each result against `outputs[0]`, on the grounds that
+        // agreement is transitive enough at this scale. It is not: approximate equality
+        // does not compose. If A agrees with B within the tolerance and A agrees with C
+        // within it, B and C may still differ by *twice* it — so a genuine B-versus-C
+        // divergence sitting just past the threshold would never be looked at.
+        //
+        // The assumption was also untestable while there were two implementations,
+        // because with two there is exactly one pair and the two strategies coincide. A
+        // third makes the choice real, and choosing wrongly fails silently: a missed
+        // disagreement is indistinguishable from agreement.
+        //
+        // The cost is on the cheap axis. Running a case costs one execution per
+        // implementation; comparing walks arrays already in memory. At five
+        // implementations that is five runs against ten array walks.
         let mut complaints: Vec<String> = Vec::new();
 
-        // Whether any comparison actually examined arithmetic. A result that is entirely
+        // Whether any comparison actually examined arithmetic. A result entirely
         // undefined on both sides agrees without checking anything, and reporting that as
         // a pass would inflate the evidence a campaign appears to provide.
         let mut examined_arithmetic = false;
         let mut vacuous_elements = 0usize;
 
-        for candidate in &outputs[1..] {
-            match reference
-                .output
-                .approx_compare(&candidate.output, tolerance)
-            {
-                Agreement::Agree(comparison) => {
-                    if comparison.examined_any_arithmetic() {
-                        examined_arithmetic = true;
-                    } else {
-                        vacuous_elements = vacuous_elements.max(comparison.total);
+        // Which implementations agreed with which, so disagreement can be reported as
+        // groups rather than as a list of pairs.
+        let mut agrees: Vec<Vec<bool>> = vec![vec![false; outputs.len()]; outputs.len()];
+
+        for left in 0..outputs.len() {
+            agrees[left][left] = true;
+            for right in (left + 1)..outputs.len() {
+                let (a, b) = (&outputs[left], &outputs[right]);
+                match a.output.approx_compare(&b.output, tolerance) {
+                    Agreement::Agree(comparison) => {
+                        agrees[left][right] = true;
+                        agrees[right][left] = true;
+                        if comparison.examined_any_arithmetic() {
+                            examined_arithmetic = true;
+                        } else {
+                            vacuous_elements = vacuous_elements.max(comparison.total);
+                        }
                     }
+                    Agreement::Structural { reason } => complaints.push(format!(
+                        "{} vs {}: {reason}",
+                        a.implementation, b.implementation
+                    )),
+                    Agreement::Disagree(comparison) => complaints.push(format!(
+                        "{} vs {}: {}",
+                        a.implementation,
+                        b.implementation,
+                        describe(&comparison)
+                    )),
                 }
-                Agreement::Structural { reason } => complaints.push(format!(
-                    "{} vs {}: {reason}",
-                    reference.implementation, candidate.implementation
-                )),
-                Agreement::Disagree(comparison) => complaints.push(format!(
-                    "{} vs {}: {}",
-                    reference.implementation,
-                    candidate.implementation,
-                    describe(&comparison)
-                )),
             }
         }
 
@@ -117,13 +135,72 @@ where
                 .map(|o| (o.implementation.clone(), format!("{:?}", o.output)))
                 .collect(),
             summary: format!(
-                "{} (rtol {:e}, atol {:e})",
+                "{}{} (rtol {:e}, atol {:e})",
+                verdict_line(outputs, &agrees),
                 complaints.join("; "),
                 tolerance.rtol,
                 tolerance.atol
             ),
         })
     }
+}
+
+/// Partition implementations into groups that agree, and name the outlier if there is one.
+///
+/// **This is the capability a third implementation buys.** With two, an oracle can only
+/// ever say "these disagree" — there is no basis for saying which is wrong, and burn#5284
+/// is exactly that limitation in public. With three or more, a lone dissenter against a
+/// consensus is visible, and saying so is a materially different claim.
+///
+/// Reported as a *hint*, never as a verdict. A majority is not proof: implementations can
+/// share a bug (two backends built on the same kernel library will agree while both being
+/// wrong), and the smaller group may be the correct one. The wording says "differs from",
+/// not "is wrong".
+///
+/// Returns an empty string when everything agrees or when the split is not a clean
+/// one-against-the-rest, since a partial claim would be worse than none.
+fn verdict_line<C>(outputs: &[NamedOutput<C>], agrees: &[Vec<bool>]) -> String {
+    if outputs.len() < 3 {
+        return String::new();
+    }
+
+    // A lone dissenter agrees with nobody but itself, and every other implementation
+    // agrees with every other. Anything more tangled is left to the pairwise complaints.
+    for candidate in 0..outputs.len() {
+        let alone =
+            (0..outputs.len()).all(|other| (other == candidate) == agrees[candidate][other]);
+        if !alone {
+            continue;
+        }
+
+        let rest: Vec<&str> = (0..outputs.len())
+            .filter(|&i| i != candidate)
+            .map(|i| outputs[i].implementation.as_str())
+            .collect();
+        let consensus = rest.iter().enumerate().all(|(a, _)| {
+            rest.iter().enumerate().all(|(b, _)| {
+                let (ia, ib) = (index_of(outputs, rest[a]), index_of(outputs, rest[b]));
+                agrees[ia][ib]
+            })
+        });
+
+        if consensus {
+            return format!(
+                "{} differs from {} which agree; ",
+                outputs[candidate].implementation,
+                rest.join(" and ")
+            );
+        }
+    }
+
+    String::new()
+}
+
+fn index_of<C>(outputs: &[NamedOutput<C>], name: &str) -> usize {
+    outputs
+        .iter()
+        .position(|o| o.implementation == name)
+        .expect("name came from this slice")
 }
 
 /// Turn a comparison into the sentence a report shows.
@@ -176,6 +253,98 @@ mod tests {
 
     fn check(outputs: &[NamedOutput<Vec<f32>>]) -> Verdict {
         check_with(Tolerance::EXACT, outputs)
+    }
+
+    /// **The bug the old strategy hid, as a test.**
+    ///
+    /// Comparing everything against `outputs[0]` meant B-versus-C was never checked. With
+    /// a tolerance of 0.15, A agrees with B (0.1 apart) and A agrees with C (0.1 apart),
+    /// but B and C are 0.2 apart and genuinely disagree. The old oracle returned `Agree`.
+    ///
+    /// This is why "transitive enough" was wrong: approximate equality does not compose,
+    /// and the error can accumulate to twice the tolerance across a chain.
+    #[test]
+    fn a_disagreement_that_avoids_the_first_implementation_is_still_caught() {
+        let verdict = check_with(
+            Tolerance {
+                rtol: 0.0,
+                atol: 0.15,
+            },
+            &[
+                output("a", vec![1.0]),
+                output("b", vec![0.9]),
+                output("c", vec![1.1]),
+            ],
+        );
+
+        match verdict {
+            Verdict::Diverged(divergence) => {
+                assert!(
+                    divergence.summary.contains("b vs c"),
+                    "the pair that disagrees must be named: {}",
+                    divergence.summary
+                );
+            }
+            other => panic!("b and c differ by more than the tolerance: {other:?}"),
+        }
+    }
+
+    /// **The capability a third implementation buys.** With two, an oracle can only say
+    /// "these disagree"; with three, a lone dissenter against a consensus is visible.
+    #[test]
+    fn a_lone_dissenter_is_named() {
+        let verdict = check(&[
+            output("cpu-a", vec![1.0]),
+            output("cpu-b", vec![1.0]),
+            output("gpu", vec![2.0]),
+        ]);
+
+        match verdict {
+            Verdict::Diverged(divergence) => assert!(
+                divergence.summary.contains("gpu differs from")
+                    && divergence.summary.contains("cpu-a")
+                    && divergence.summary.contains("cpu-b"),
+                "the outlier and the consensus must both be named: {}",
+                divergence.summary
+            ),
+            other => panic!("expected a divergence, got {other:?}"),
+        }
+    }
+
+    /// A three-way split has no outlier, and claiming one would be worse than saying
+    /// nothing. The pairwise complaints still carry the detail.
+    #[test]
+    fn a_three_way_disagreement_names_no_outlier() {
+        let verdict = check(&[
+            output("a", vec![1.0]),
+            output("b", vec![2.0]),
+            output("c", vec![3.0]),
+        ]);
+
+        match verdict {
+            Verdict::Diverged(divergence) => assert!(
+                !divergence.summary.contains("differs from"),
+                "no implementation is alone against a consensus here: {}",
+                divergence.summary
+            ),
+            other => panic!("expected a divergence, got {other:?}"),
+        }
+    }
+
+    /// With two implementations there is no consensus to be alone against, so the
+    /// grouping stays silent and the report reads exactly as it did before.
+    #[test]
+    fn two_implementations_get_no_outlier_claim() {
+        let verdict = check(&[output("a", vec![1.0]), output("b", vec![2.0])]);
+
+        match verdict {
+            Verdict::Diverged(divergence) => assert!(
+                !divergence.summary.contains("differs from"),
+                "two implementations cannot establish a majority: {}",
+                divergence.summary
+            ),
+            other => panic!("expected a divergence, got {other:?}"),
+        }
     }
 
     #[test]
