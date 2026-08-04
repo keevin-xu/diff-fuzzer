@@ -18,6 +18,10 @@ burn.workspace = true
 rand.workspace = true
 # A finding must serialise whole, so the case type carries serde derives.
 serde.workspace = true
+# Non-diverging cases are written and read as data (`negatives.rs`) so a later trigger
+# claim can be scored against them. Already a workspace dependency, so nothing new is
+# pinned.
+serde_json.workspace = true
 # Only needed to decode fuzzer bytes into cases. Optional, so an ordinary build of this
 # library does not pull in a fuzzing dependency it will never use.
 arbitrary = { version = "1.4.2", optional = true }
@@ -31,10 +35,6 @@ fuzzing = ["dep:arbitrary"]
 # calling program decide what to do with them. A dev-dependency is not compiled into
 # anything this crate publishes.
 tracing-subscriber.workspace = true
-# `batched_probe` records its non-diverging cases as data for a later predicate search.
-# Already a workspace dependency (the engine writes findings with it), so this pins nothing
-# new — and as a dev-dependency it stays out of anything this crate publishes.
-serde_json.workspace = true
 
 # Declared explicitly so cargo skips it unless the feature is on. Without this, a
 # default-feature build of all targets fails on an example that references a

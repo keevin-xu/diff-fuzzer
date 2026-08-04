@@ -4831,6 +4831,7 @@ dependencies = [
  "diff-fuzzer-core",
  "rand 0.10.2",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

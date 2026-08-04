@@ -29,9 +29,10 @@ use diff_fuzzer_core::{
 };
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tensor_adapter::{
     CanonicalTensor, FaultyNdArray, TensorNormalizer, TensorOp, TensorTolerancePolicy, environment,
-    faulty as faulty_backend, libtorch, ndarray,
+    faulty as faulty_backend, libtorch, ndarray, negatives,
 };
 
 /// Everything that is expensive to build, constructed once and reused.
@@ -98,8 +99,23 @@ fuzz_target!(|case: TensorOp| {
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&harness.cpu, second];
 
     let outputs = run_all(&case, &runners);
-    if !matches!(harness.oracle.check(&case, &outputs), Verdict::Diverged(_)) {
-        return;
+    match harness.oracle.check(&case, &outputs) {
+        Verdict::Diverged(_) => {}
+        // **Agreement is evidence too, and it is the half that cannot be recovered
+        // later.** A claim about what triggers a bug is only worth something if it
+        // separates diverging cases from agreeing ones; fitted to divergences alone, any
+        // rule can be found. Sampled here rather than reconstructed afterwards because a
+        // fuzzing case has no reproducible provenance — libFuzzer's stream depends on a
+        // corpus that evolves as it runs, in child processes that will not exist later.
+        Verdict::Agree => {
+            sample_negative(&case);
+            return;
+        }
+        // **Not a negative.** A backend refused the case, or both returned `NaN` so no
+        // arithmetic was compared. That is evidence nothing was learned, not evidence the
+        // case fails to diverge, and recording it would poison the set with cases that
+        // were never actually tested.
+        Verdict::Skipped(_) => return,
     }
 
     // A divergence: shrink it, record it, then panic so libFuzzer preserves the input.
@@ -171,6 +187,52 @@ fuzz_target!(|case: TensorOp| {
 
     panic!("divergence in {}: {}", case.name(), report.summary);
 });
+
+/// How often an agreeing case is kept, as a reciprocal: one in this many.
+///
+/// Deliberately sparse. A campaign agrees on essentially everything — 49,910 of 50,000 in
+/// one measured run — so keeping them all would write tens of millions of files to prove a
+/// point a few hundred already make. At this rate a four-hour campaign leaves a few
+/// hundred; the writes are far too rare to affect throughput.
+///
+/// Override with `DIFF_FUZZER_NEGATIVE_RATE`. Setting it to `0` disables sampling.
+const NEGATIVE_RATE: usize = 100_000;
+
+/// Counts cases seen by *this process*, for sampling.
+///
+/// Per-process, not per-campaign: under `-fork=1` every child starts fresh, so the counter
+/// resets whenever libFuzzer rotates. That is fine — the aim is a spread of ordinary
+/// agreeing cases, not an exact one-in-N across the run — but it does mean the sample is
+/// biased slightly toward cases seen early in each child.
+static SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Keep roughly one agreeing case in [`NEGATIVE_RATE`].
+///
+/// Failures are silent by design: a campaign must not die because a directory is not
+/// writable. Negatives are supporting evidence, and losing some costs precision in a later
+/// analysis — unlike losing a *finding*, which costs the thing the campaign exists for.
+fn sample_negative(case: &TensorOp) {
+    let rate = std::env::var("DIFF_FUZZER_NEGATIVE_RATE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(NEGATIVE_RATE);
+    if rate == 0 {
+        return;
+    }
+
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+    if !seen.is_multiple_of(rate) {
+        return;
+    }
+
+    let directory = format!(
+        "{}/../findings/negatives/{}/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        run_label(),
+        case.name()
+    );
+    let _ = negatives::save_case(&directory, case);
+}
 
 /// Which run's directory this process should file its findings under.
 ///
