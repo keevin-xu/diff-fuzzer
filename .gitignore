@@ -37,3 +37,8 @@ _to_delete/
 *.md
 skills/
 !README.md
+# A campaign's triage index belongs with the reports it describes: it records which
+# problems a run found, how many cases matched each, and whether they still reproduce.
+# The blanket *.md rule above would otherwise drop it.
+findings/runs/*
+!findings/runs/**/TRIAGE.md

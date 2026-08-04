@@ -139,12 +139,23 @@ fn main() {
         second.name()
     );
 
+    // Which run directory this campaign's output belongs to.
+    //
+    // The fuzz target files findings under `findings/runs/<run>/<operation>/`; this runner
+    // used to write to `findings/` directly, so the two paths scattered their output
+    // across two layouts. **Findings split across two places is how one set of them gets
+    // forgotten** — the same failure that was already fixed once for the fuzz target, and
+    // then reintroduced here by not applying it to both.
+    //
+    // `DIFF_FUZZER_RUN` names the run when set, matching the fuzz target. Unset, the label
+    // says what the campaign was rather than inventing a plausible one.
+    let run = std::env::var("DIFF_FUZZER_RUN")
+        .unwrap_or_else(|_| format!("seeded-{}", if wide { "wide" } else { "default" }));
+    let run_dir = format!("findings/runs/{run}");
+
     // Opened up front rather than on the first divergence, so a permissions or path
     // problem surfaces immediately instead of after an hour of work is already lost.
-    let log_path = format!(
-        "findings/campaign-{}.jsonl",
-        if wide { "wide" } else { "default" }
-    );
+    let log_path = format!("{run_dir}/campaign.jsonl");
     let mut log = FindingsLog::open(&log_path).expect("findings log is writable");
 
     // Tracks which problems have already been reported. A single defect is reachable
@@ -228,7 +239,9 @@ fn main() {
                     summary: shrunk_divergence.summary,
                 };
 
-                let report_path = format!("findings/{}", report.filename());
+                // Grouped by operation inside the run, so `triage_findings` sees the same
+                // shape of tree whichever runner produced it.
+                let report_path = format!("{run_dir}/{}/{}", case.name(), report.filename());
                 report.save(&report_path).expect("report is writable");
 
                 if printed < MAX_PRINTED {

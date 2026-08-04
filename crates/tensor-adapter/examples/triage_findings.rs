@@ -208,7 +208,9 @@ fn section(out: &mut String, signature: &str, group: &Group, known: Option<&'sta
     }
 
     out.push_str(&format!(
-        "- hit **{}** time(s)\n- reproduces: **{} of {}** checked{}\n- smallest case: {} values, `{}`\n\n",
+        "- **{}** case(s) matched this signature — *matching is not evidence of a shared cause*\n\
+         - reproduces: **{} of {}** checked{}\n\
+         - smallest case: {} values, `{}`\n\n",
         group.occurrences,
         group.reproduced,
         group.checked,
@@ -315,7 +317,10 @@ fn report(groups: &BTreeMap<String, Group>, seen: &Seen) {
 
     for (fingerprint, group) in &ordered {
         println!("── {fingerprint}");
-        println!("   hit {} time(s)", group.occurrences);
+        // "matched this signature" rather than "hit N times". The map counted signature
+        // matches; it did not establish that N cases share a mechanism. A count that reads
+        // as N confirmations of one bug overstates what was computed.
+        println!("   {} case(s) matched this signature", group.occurrences);
         println!(
             "   reproduces: {} of {} checked{}",
             group.reproduced,
