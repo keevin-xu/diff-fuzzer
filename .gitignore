@@ -32,13 +32,18 @@ _to_delete/
 
 # NOTE: Cargo.lock is intentionally NOT ignored — commit it.
 #   Reproducibility is a core project value (pinned deps -> reproducible divergences).
-# NOTE: findings/*.json are intentionally NOT ignored — reproducible bug reports
-#   are valuable artifacts worth version-controlling.
 *.md
 skills/
 !README.md
-# A campaign's triage index belongs with the reports it describes: it records which
-# problems a run found, how many cases matched each, and whether they still reproduce.
-# The blanket *.md rule above would otherwise drop it.
-findings/runs/*
-!findings/runs/**/TRIAGE.md
+
+# Campaign output — reports, triage indexes, sampled negatives, logs.
+#
+# Reproducible artifacts, but **regenerable ones**, and they grow without bound: one
+# four-hour run left 36 reports, 190 negatives and a 28 MB log. What is worth keeping is
+# already recorded where a reader would look — the numbers in `DECISIONS.md` and the phase
+# files, the analysed cases in `issues/`.
+#
+# Anything genuinely load-bearing must be lifted *out* of here and committed deliberately
+# (a reproduction in an issue draft, a case pinned in a test) rather than surviving by
+# accident because a directory happened to be tracked.
+findings/
