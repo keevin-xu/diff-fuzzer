@@ -39,7 +39,7 @@
 use burn::tensor::TensorData;
 use diff_fuzzer_core::{Implementation, SeededRng};
 use rand::RngExt;
-use tensor_adapter::{BinaryOp, TensorOp, TensorValue, UnaryOp, libtorch, ndarray, wgpu};
+use tensor_adapter::{BinaryOp, TensorOp, TensorValue, UnaryOp, flex, libtorch, ndarray, wgpu};
 
 /// Distance between two floats counted in representable values between them.
 ///
@@ -69,6 +69,7 @@ fn run(op: &TensorOp, backend: &str) -> Option<Vec<f32>> {
     let out: TensorData = match backend {
         "cpu" => ndarray().run(op).ok()?,
         "tch" => libtorch().run(op).ok()?,
+        "flex" => flex().run(op).ok()?,
         _ => wgpu().run(op).ok()?,
     };
     out.to_vec::<f32>().ok()
@@ -100,6 +101,17 @@ impl Spread {
 
 /// Measure one operation across many random inputs, CPU against GPU.
 fn measure(label: &str, build: impl Fn(&mut SeededRng) -> TensorOp, cases: usize) -> Spread {
+    measure_pair("cpu", "gpu", label, build, cases)
+}
+
+/// Measure one operation across many random inputs, between any two backends.
+fn measure_pair(
+    left_backend: &str,
+    right_backend: &str,
+    label: &str,
+    build: impl Fn(&mut SeededRng) -> TensorOp,
+    cases: usize,
+) -> Spread {
     let mut rng = SeededRng::from_seed(7);
     let mut spread = Spread {
         worst_ulps: 0,
@@ -110,7 +122,7 @@ fn measure(label: &str, build: impl Fn(&mut SeededRng) -> TensorOp, cases: usize
 
     for _ in 0..cases {
         let op = build(&mut rng);
-        let (Some(cpu), Some(gpu)) = (run(&op, "cpu"), run(&op, "gpu")) else {
+        let (Some(cpu), Some(gpu)) = (run(&op, left_backend), run(&op, right_backend)) else {
             continue;
         };
 
@@ -136,6 +148,63 @@ fn measure(label: &str, build: impl Fn(&mut SeededRng) -> TensorOp, cases: usize
     spread
 }
 
+/// The operations IEEE-754 requires to be correctly rounded, for the flex comparison.
+#[allow(clippy::type_complexity)]
+fn cpu_ops() -> Vec<(&'static str, Box<dyn Fn(&mut SeededRng) -> TensorOp>)> {
+    vec![
+        (
+            "add",
+            Box::new(|r: &mut SeededRng| {
+                TensorOp::binary(BinaryOp::Add, tensor(r, 64, 100.0), tensor(r, 64, 100.0))
+            }),
+        ),
+        (
+            "sub",
+            Box::new(|r: &mut SeededRng| {
+                TensorOp::binary(BinaryOp::Sub, tensor(r, 64, 100.0), tensor(r, 64, 100.0))
+            }),
+        ),
+        (
+            "mul",
+            Box::new(|r: &mut SeededRng| {
+                TensorOp::binary(BinaryOp::Mul, tensor(r, 64, 100.0), tensor(r, 64, 100.0))
+            }),
+        ),
+        (
+            "div",
+            Box::new(|r: &mut SeededRng| {
+                let rhs = TensorValue::new(
+                    vec![64],
+                    (0..64).map(|_| r.random_range(1.0..100.0)).collect(),
+                );
+                TensorOp::binary(BinaryOp::Div, tensor(r, 64, 100.0), rhs)
+            }),
+        ),
+        (
+            "sqrt",
+            Box::new(|r: &mut SeededRng| {
+                let arg = TensorValue::new(
+                    vec![64],
+                    (0..64).map(|_| r.random_range(0.0..100.0)).collect(),
+                );
+                TensorOp::unary(UnaryOp::Sqrt, arg)
+            }),
+        ),
+        (
+            "neg",
+            Box::new(|r: &mut SeededRng| TensorOp::unary(UnaryOp::Neg, tensor(r, 64, 100.0))),
+        ),
+        (
+            "abs",
+            Box::new(|r: &mut SeededRng| TensorOp::unary(UnaryOp::Abs, tensor(r, 64, 100.0))),
+        ),
+        (
+            "exp",
+            Box::new(|r: &mut SeededRng| TensorOp::unary(UnaryOp::Exp, tensor(r, 64, 5.0))),
+        ),
+    ]
+}
+
 fn tensor(rng: &mut SeededRng, count: usize, magnitude: f32) -> TensorValue {
     let data: Vec<f32> = (0..count)
         .map(|_| rng.random_range(-magnitude..magnitude))
@@ -145,6 +214,26 @@ fn tensor(rng: &mut SeededRng, count: usize, magnitude: f32) -> TensorValue {
 
 fn main() {
     println!("step 7.4 — measuring what the GPU does differently\n");
+
+    // ---- Step 7A.4: flex against the two established CPU backends -------------------
+    //
+    // `flex` is a CPU backend, so **IEEE-754 is the applicable specification** — the same
+    // one already cited for `ndarray` and `tch`, and no new document to retrieve. The only
+    // question is whether it conforms, which decides whether `Tolerance::EXACT` carries
+    // over unchanged or whether a pure-Rust CPU backend has a finding of its own.
+    println!("flex vs the established CPU backends (IEEE-754 requires 0 ULP):");
+    for (other, label) in [("cpu", "ndarray"), ("tch", "tch")] {
+        for (op_name, builder) in cpu_ops() {
+            measure_pair(
+                "flex",
+                other,
+                &format!("{op_name} vs {label}"),
+                builder,
+                200,
+            );
+        }
+    }
+    println!();
 
     // ---- 1. Subnormals ------------------------------------------------------------
     //
