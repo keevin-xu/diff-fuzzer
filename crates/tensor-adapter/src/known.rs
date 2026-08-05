@@ -69,10 +69,17 @@ pub struct Known {
 /// for that signature, so adding one is a decision, not bookkeeping.
 pub const KNOWN: &[Known] = &[Known {
     signature: "matmul/rank2/undefined",
-    status: Status::Reported,
+    // **Answered by a maintainer on 2026-08-04**, not merely reported: "I don't think
+    // inf / NaN should be interchangeable, it's a divergence that then propagates
+    // non-uniformly through downstream ops." So the open question this was filed as is
+    // closed, and the finding stands.
+    status: Status::ConfirmedBug,
     reference: "https://github.com/tracel-ai/burn/issues/5284",
     note: "matmul intermediate products overflow f32; ndarray fuses the multiply-add and \
-           yields ±inf where tch rounds first and yields NaN",
+           yields ±inf where tch rounds first and yields NaN. Root cause confirmed: \
+           libtorch's GEMM fuses inside a 4x8 micro-kernel and not in the trailing-corner \
+           cleanup, so disagreeing elements number (m mod 4) * (n mod 8). Maintainer \
+           notes burn has no explicit cross-backend numerical-agreement contract yet",
 }];
 
 /// Look up what is known about a signature, if anything.

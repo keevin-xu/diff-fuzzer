@@ -82,15 +82,27 @@ impl Tolerance {
 /// anything while continuing to report success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Special {
-    /// Both undefined. **Treated as agreement**: each system was asked something with no
-    /// answer and both said so, which is consistent behaviour.
+    /// Both undefined. **Treated as agreement — but for a narrower reason than it looks.**
+    ///
+    /// This was originally justified as "each system was asked something with no answer and
+    /// both said so". **That is wrong**, and wrong for the case this project cares most
+    /// about. `NaN` conflates two situations a comparison cannot tell apart:
+    ///
+    /// - genuinely no answer — `sqrt(-1)`, `0/0`
+    /// - **an answer exists and finite precision destroyed it** — `1e30 * 1e30` minus
+    ///   itself is exactly `0`, and only overflows to `inf + (-inf)` on the way
+    ///
+    /// The second is the mechanism behind burn#5284. So the honest claim is not that the
+    /// question had no answer; it is that **both implementations behaved the same way**,
+    /// which is all a differential comparison can establish without access to the true
+    /// result.
     ///
     /// Note this is deliberately *not* what `==` does — `NaN != NaN` — so relying on
-    /// equality would report two backends correctly producing `NaN` as a disagreement.
+    /// equality would report two backends behaving identically as a disagreement.
     ///
-    /// It is also the weakest form of agreement there is, and worth counting: a result
-    /// that is entirely `NaN` on both sides has told us nothing about either
-    /// implementation.
+    /// It is also the weakest form of agreement there is, and worth counting: a result that
+    /// is entirely `NaN` on both sides has told us nothing about either implementation,
+    /// which is why it is reported as `Skipped` rather than `Agree`.
     BothUndefined,
     /// One produced a number, the other did not. **A real disagreement** — they differ
     /// about whether an answer exists at all, which is more fundamental than differing

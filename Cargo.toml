@@ -42,6 +42,10 @@ burn = { version = "0.21.0", default-features = false, features = [
     "ndarray",
     "tch",
     "wgpu",
+    # Added 2026-08-05 to measure whether it reproduces the burn#5284 overflow before
+    # deciding whether it can replace ndarray, which burn no longer lists as a first-party
+    # CPU backend.
+    "flex",
 ] }
 
 # Engine dependencies.
