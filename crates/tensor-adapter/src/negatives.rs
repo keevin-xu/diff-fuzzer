@@ -54,7 +54,10 @@ use std::path::Path;
 /// Where a negative came from, which is a proxy for how hard it is to satisfy.
 ///
 /// Ordered by discriminating power, strongest first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Ord` follows the declaration order below, which is deliberately *descending order of
+// how much a negative discriminates*. Sorting a breakdown therefore puts the hardest
+// negatives first, where a reader looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Source {
     /// Rejected by the shrinker while minimising a real finding — **one edit away from a
     /// case that diverges**, and therefore the closest counter-example obtainable. Free:
@@ -433,6 +436,14 @@ impl Pool {
 
     pub fn is_empty(&self) -> bool {
         self.negatives.is_empty()
+    }
+
+    /// The negatives themselves, with their source and provenance.
+    ///
+    /// Used by the search, which pre-extracts features once rather than re-deriving them
+    /// on each of its thousands of predicate evaluations.
+    pub fn negatives(&self) -> &[Negative] {
+        &self.negatives
     }
 
     pub fn cases(&self) -> impl Iterator<Item = &TensorOp> {

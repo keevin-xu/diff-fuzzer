@@ -31,6 +31,7 @@ pub mod normalize;
 pub mod ops;
 pub mod predicate;
 pub mod repro;
+pub mod search;
 /// A starting corpus for the fuzzer. Requires the `fuzzing` feature.
 #[cfg(feature = "fuzzing")]
 pub mod seeds;
