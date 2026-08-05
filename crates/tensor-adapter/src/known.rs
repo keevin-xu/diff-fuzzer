@@ -95,11 +95,15 @@ mod tests {
     use crate::signature::signature;
     use diff_fuzzer_core::Tolerance;
 
-    /// **The test that keeps this file honest.** An entry is matched by exact string, so a
-    /// change to the signature *rule* silently orphans every entry — triage would report
-    /// long-settled problems as new, and the registry would look fine while doing nothing.
+    /// **Guards the signature *rule*, not the backends.** An entry is matched by exact
+    /// string, so a change to how signatures are built silently orphans every entry —
+    /// triage would report long-settled problems as new, and the registry would look fine
+    /// while doing nothing.
     ///
-    /// So the recorded signature is rebuilt from a case that actually produces it.
+    /// Note the outputs here are **written by hand**, not produced by running anything.
+    /// That is deliberate and it is also this test's limit: it cannot tell you whether any
+    /// backend still *produces* this class. See
+    /// `the_recorded_class_is_still_reachable_from_real_backends` for that half.
     #[test]
     fn the_recorded_matmul_signature_is_what_the_rule_still_produces() {
         let case = TensorOp::matmul(
@@ -124,6 +128,71 @@ mod tests {
             known_issue(&produced).is_some(),
             "the signature rule now produces {produced:?}, which no entry matches — \
              the registry has been orphaned and triage would report this as new"
+        );
+    }
+
+    /// **The half the rule test cannot cover: is this class still reachable at all?**
+    ///
+    /// A registry entry claims someone worked the triage ladder for a signature. If no
+    /// backend combination produces that signature any more — because a backend was
+    /// swapped, or a library fixed it — the entry points at nothing, and **the rule test
+    /// above would stay green**, since it supplies its own outputs.
+    ///
+    /// Added at PHASE-7A step 7A.1, before replacing `ndarray` with `flex`. The case is
+    /// chosen deliberately: `[14,4] × [4,27]` diverges under **any** pair including `tch`,
+    /// because libtorch alone leaves a non-fusing trailing corner. The originally filed
+    /// `[1,2] × [2,1]` does **not** — `flex` and `tch` both return `NaN` there and agree,
+    /// so a test built on it would start failing the moment `ndarray` left.
+    ///
+    /// The distinction that phase turns on: **the minimal reproduction died, the finding
+    /// did not.** A case is not a class.
+    #[test]
+    fn the_recorded_class_is_still_reachable_from_real_backends() {
+        use crate::backends::{libtorch, ndarray};
+        use crate::normalize::TensorNormalizer;
+        use crate::signature::signature_across;
+        use crate::tolerance::TensorTolerancePolicy;
+        use diff_fuzzer_core::{Implementation, Normalizer, TolerancePolicy};
+
+        // Sign alternates along the contraction axis, so every dot product contains both a
+        // positively- and a negatively-overflowing product. The exact answer is zero.
+        let (m, k, n) = (14usize, 4usize, 27usize);
+        let lhs: Vec<f32> = (0..m * k)
+            .map(|i| {
+                if (i % k).is_multiple_of(2) {
+                    1e30
+                } else {
+                    -1e30
+                }
+            })
+            .collect();
+        let case = TensorOp::matmul(
+            TensorValue::new(vec![m, k], lhs),
+            TensorValue::new(vec![k, n], vec![1e30; k * n]),
+        );
+
+        let outputs: Vec<(String, CanonicalTensor)> = [
+            ("burn-ndarray", ndarray().run(&case)),
+            ("burn-tch", libtorch().run(&case)),
+        ]
+        .into_iter()
+        .filter_map(|(name, raw)| Some((name.to_string(), TensorNormalizer.normalize(raw.ok()?))))
+        .collect();
+
+        assert_eq!(outputs.len(), 2, "both backends must run this case");
+
+        let tolerance = TensorTolerancePolicy
+            .tolerance_for(&case, (outputs[0].0.as_str(), outputs[1].0.as_str()));
+        let (produced, pair) = signature_across(&case, &outputs, tolerance);
+
+        assert!(
+            pair.is_some(),
+            "the recorded class is no longer reachable: {produced} — either a backend \
+             changed, or this case needs replacing with one that still exhibits it"
+        );
+        assert!(
+            known_issue(&produced).is_some(),
+            "real backends produce {produced:?}, which no registry entry matches"
         );
     }
 

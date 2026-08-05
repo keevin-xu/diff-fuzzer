@@ -15,7 +15,7 @@
 //! everything else treat rank as an ordinary value.
 
 use crate::input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
-use burn::backend::{LibTorch, NdArray, Wgpu};
+use burn::backend::{Flex, LibTorch, NdArray, Wgpu};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use diff_fuzzer_core::{Implementation, RunError};
@@ -161,6 +161,14 @@ pub fn libtorch() -> LibTorchBackend {
 /// `BurnBackend<B>` only requires `B: Backend`, so every operation, every rank, and the
 /// whole dispatch `match` come across unchanged.
 pub type WgpuBackend = BurnBackend<Wgpu<f32, i32>>;
+
+/// The flex backend — burn's current first-party pure-Rust CPU option.
+pub type FlexBackend = BurnBackend<Flex<f32>>;
+
+/// Construct the flex CPU backend under test.
+pub fn flex() -> FlexBackend {
+    BurnBackend::new("burn-flex")
+}
 
 /// Construct the GPU backend under test.
 ///

@@ -38,7 +38,10 @@ fn main() {
     println!("burn#5284 minimal case — [1,2] x [2,1], exact answer 0\n");
     println!("  ndarray  {:?}", overflow_case::<NdArray<f32>>());
     println!("  tch      {:?}", overflow_case::<LibTorch<f32>>());
-    println!("  flex     {:?}   <-- the question", overflow_case::<Flex<f32>>());
+    println!(
+        "  flex     {:?}   <-- the question",
+        overflow_case::<Flex<f32>>()
+    );
 
     println!("  wgpu     {:?}", overflow_case::<Wgpu<f32, i32>>());
 
