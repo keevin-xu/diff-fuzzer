@@ -39,6 +39,7 @@ pub mod shrink;
 pub mod signature;
 pub mod testing;
 pub mod tolerance;
+pub mod validation;
 
 pub use backends::{
     BurnBackend, FlexBackend, LibTorchBackend, MAX_RANK, WgpuBackend, flex, libtorch, wgpu,
