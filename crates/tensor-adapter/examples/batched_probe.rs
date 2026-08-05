@@ -40,7 +40,7 @@
 //! So libtorch's matmul uses a **4x8 micro-kernel** that fuses its multiply-add, plus a
 //! cleanup path for the trailing corner that does **not**. Divergence appears exactly where
 //! *both* dimensions leave a remainder — the bottom-right block that no full tile covers.
-//! `matrixmultiply` (via ndarray) fuses everywhere, so it returns `inf` throughout.
+//! `matrixmultiply` (via flex) fuses everywhere, so it returns `inf` throughout.
 //!
 //! **The sharpest consequence: libtorch disagrees with itself.** At `m=14, n=27` it returns
 //! `inf` for 372 elements and `NaN` for 6, from arithmetic that is structurally identical —
@@ -72,7 +72,7 @@
 //! cargo run --release -p tensor-adapter --example batched_probe
 //! ```
 
-use burn::backend::{LibTorch, NdArray};
+use burn::backend::{Flex, LibTorch};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use tensor_adapter::negatives::{self, Source};
@@ -101,7 +101,7 @@ fn rhs_values(k: usize, cols: usize) -> Vec<f32> {
 
 /// One measurement: both backends' results, and whether they disagree.
 struct Outcome {
-    ndarray: Vec<f32>,
+    flex: Vec<f32>,
     libtorch: Vec<f32>,
 }
 
@@ -110,7 +110,7 @@ impl Outcome {
     /// differ if they are not bit-equal. No tolerance: this experiment is about `inf`
     /// versus `NaN`, which no tolerance may absorb.
     fn differing(&self) -> usize {
-        self.ndarray
+        self.flex
             .iter()
             .zip(&self.libtorch)
             .filter(|(a, b)| a.is_nan() != b.is_nan() || (!a.is_nan() && a != b))
@@ -134,7 +134,7 @@ fn run_rank2(m: usize, k: usize, n: usize) -> Outcome {
         a.matmul(b).into_data().to_vec::<f32>().expect("f32 read")
     }
     Outcome {
-        ndarray: go::<NdArray<f32>>(m, k, n),
+        flex: go::<Flex<f32>>(m, k, n),
         libtorch: go::<LibTorch<f32>>(m, k, n),
     }
 }
@@ -150,7 +150,7 @@ fn run_rank3(batch: usize, m: usize, k: usize, n: usize) -> Outcome {
         a.matmul(b).into_data().to_vec::<f32>().expect("f32 read")
     }
     Outcome {
-        ndarray: go::<NdArray<f32>>(batch, m, k, n),
+        flex: go::<Flex<f32>>(batch, m, k, n),
         libtorch: go::<LibTorch<f32>>(batch, m, k, n),
     }
 }
@@ -166,7 +166,7 @@ fn run_rank4(b0: usize, b1: usize, m: usize, k: usize, n: usize) -> Outcome {
         a.matmul(b).into_data().to_vec::<f32>().expect("f32 read")
     }
     Outcome {
-        ndarray: go::<NdArray<f32>>(b0, b1, m, k, n),
+        flex: go::<Flex<f32>>(b0, b1, m, k, n),
         libtorch: go::<LibTorch<f32>>(b0, b1, m, k, n),
     }
 }
@@ -194,7 +194,7 @@ fn row(label: &str, outcome: &Outcome, cases: &mut Vec<(String, TensorOp)>, case
     let differing = outcome.differing();
     println!(
         "  {label:<28} nd: {:<26} tch: {:<26} {}",
-        Outcome::summary(&outcome.ndarray),
+        Outcome::summary(&outcome.flex),
         Outcome::summary(&outcome.libtorch),
         if differing > 0 {
             format!("◄ DIVERGES ({differing})")
@@ -299,7 +299,7 @@ fn main() {
     println!("\nWHICH elements disagree at m=14, k=4, n=27 (rank 2)?");
     let outcome = run_rank2(14, 4, 27);
     let differing: Vec<(usize, usize)> = outcome
-        .ndarray
+        .flex
         .iter()
         .zip(&outcome.libtorch)
         .enumerate()

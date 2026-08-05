@@ -31,7 +31,7 @@ use diff_fuzzer_core::{
 use std::collections::BTreeMap;
 use tensor_adapter::{
     Bounds, CanonicalTensor, FaultyBackend, TensorNormalizer, TensorOp, TensorOpGenerator,
-    TensorTolerancePolicy, environment, libtorch, ndarray, signature_across, wgpu,
+    TensorTolerancePolicy, environment, flex, libtorch, signature_across, wgpu,
 };
 
 /// Divergences printed in full before switching to a count. A campaign that flags
@@ -92,9 +92,9 @@ fn main() {
     };
 
     let generator = TensorOpGenerator::new(bounds);
-    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
-    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+    let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.5), TensorNormalizer);
 
     let gpu_runner = NormalizedRunner::new(wgpu(), TensorNormalizer);
 

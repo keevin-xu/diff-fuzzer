@@ -17,7 +17,7 @@ use diff_fuzzer_core::{
 };
 use std::time::Instant;
 use tensor_adapter::{
-    CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, libtorch, ndarray,
+    CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, flex, libtorch,
 };
 
 const CASES: u64 = 50_000;
@@ -43,7 +43,7 @@ fn main() {
 
     // Execution on each backend separately, so a slow backend is visible rather than
     // averaged away.
-    let cpu = ndarray();
+    let cpu = flex();
     let start = Instant::now();
     for case in &cases {
         let _ = cpu.run(case).expect("valid case");
@@ -69,7 +69,7 @@ fn main() {
         .map(|case| {
             let outputs = [
                 NamedOutput {
-                    implementation: "ndarray".to_string(),
+                    implementation: "flex".to_string(),
                     output: TensorNormalizer.normalize(cpu.run(case).unwrap()),
                 },
                 NamedOutput {
@@ -88,7 +88,7 @@ fn main() {
     let comparison = start.elapsed().as_secs_f64();
 
     // The whole pipeline, which is what a campaign actually runs.
-    let cpu_runner = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let cpu_runner = NormalizedRunner::new(flex(), TensorNormalizer);
     let torch_runner = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] =
         [&cpu_runner, &torch_runner];
@@ -103,7 +103,7 @@ fn main() {
     println!("  {:<22} {:>10}", "generation", rate(CASES, generation));
     println!(
         "  {:<22} {:>10}",
-        "execute on ndarray",
+        "execute on flex",
         rate(CASES, cpu_execution)
     );
     println!(

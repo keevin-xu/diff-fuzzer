@@ -13,7 +13,7 @@
 
 use diff_fuzzer_core::{Generator, Implementation, Normalizer, SeededRng, Tolerance, compare};
 use std::collections::BTreeMap;
-use tensor_adapter::{Bounds, TensorNormalizer, TensorOpGenerator, libtorch, ndarray};
+use tensor_adapter::{Bounds, TensorNormalizer, TensorOpGenerator, flex, libtorch};
 
 const CASES: u64 = 20_000;
 
@@ -68,7 +68,7 @@ fn main() {
     let cases = if wide { 4_000 } else { CASES };
 
     let generator = TensorOpGenerator::new(bounds);
-    let (cpu, torch) = (ndarray(), libtorch());
+    let (cpu, torch) = (flex(), libtorch());
     let mut per_operation: BTreeMap<&str, Errors> = BTreeMap::new();
 
     for seed in 0..cases {
@@ -106,7 +106,7 @@ fn main() {
     }
 
     println!(
-        "{cases} cases, |value| <= {}, dim <= {}, burn-ndarray vs burn-tch\n",
+        "{cases} cases, |value| <= {}, dim <= {}, burn-flex vs burn-tch\n",
         bounds.magnitude, bounds.max_dim
     );
     println!("relative error per operation (worst element of each case)\n");

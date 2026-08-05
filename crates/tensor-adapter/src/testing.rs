@@ -66,20 +66,24 @@ impl<B: Backend> Implementation for FaultyBackend<B> {
 
 /// A CPU backend wrong by a known amount.
 ///
-/// Mirrors `ndarray()` and `libtorch()`, so a caller can construct one without naming
+/// Mirrors `flex()` and `libtorch()`, so a caller can construct one without naming
 /// `burn`'s types — the same reason those constructors exist. Callers outside this crate
 /// should not have to depend on `burn` just to build a backend.
-pub type FaultyNdArray = FaultyBackend<burn::backend::NdArray<f32>>;
+/// Named for its *role*, not its backend. This wraps whichever CPU backend the project
+/// currently treats as its reference — it was `ndarray` until PHASE-7A and is now `flex`.
+/// Naming it after the backend meant the safeguard silently kept testing a backend that
+/// had been swapped out, which is the one thing a fault injector must never do.
+pub type FaultyCpu = FaultyBackend<burn::backend::Flex<f32>>;
 
 /// Construct the CPU backend with a deliberate fault of `bias` in its first output value.
-pub fn faulty(bias: f32) -> FaultyNdArray {
-    FaultyBackend::new(crate::backends::ndarray(), bias)
+pub fn faulty(bias: f32) -> FaultyCpu {
+    FaultyBackend::new(crate::backends::flex(), bias)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{libtorch, ndarray};
+    use crate::backends::{flex, libtorch};
     use crate::generator::FixedAddGenerator;
     use crate::normalize::{CanonicalTensor, TensorNormalizer};
     use diff_fuzzer_core::{
@@ -95,7 +99,7 @@ mod tests {
     /// the two backends simply disagreeing about everything.
     #[test]
     fn two_correct_backends_agree() {
-        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
         let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&cpu, &torch];
 
@@ -113,8 +117,8 @@ mod tests {
     /// anything, and every clean run it reports is worthless.
     #[test]
     fn an_injected_fault_is_caught() {
-        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
-        let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+        let correct = NormalizedRunner::new(flex(), TensorNormalizer);
+        let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.5), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&correct, &faulty];
 
         let outcome = run_once(
@@ -141,7 +145,7 @@ mod tests {
     /// resembles a real finding, where the two sides are genuinely different systems.
     #[test]
     fn a_fault_is_caught_across_different_backends() {
-        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
         let faulty_torch =
             NormalizedRunner::new(FaultyBackend::new(libtorch(), -2.0), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&cpu, &faulty_torch];
@@ -159,8 +163,8 @@ mod tests {
     /// replayed is a defect in this tool, not a discovery about anything else.
     #[test]
     fn a_caught_divergence_replays_from_its_seed() {
-        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
-        let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+        let correct = NormalizedRunner::new(flex(), TensorNormalizer);
+        let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.5), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&correct, &faulty];
 
         let first = run_once(
@@ -186,8 +190,8 @@ mod tests {
     /// too small" is actually decided.
     #[test]
     fn a_zero_fault_is_not_a_divergence() {
-        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
-        let unfaulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.0), TensorNormalizer);
+        let correct = NormalizedRunner::new(flex(), TensorNormalizer);
+        let unfaulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.0), TensorNormalizer);
         let runners: [AnyRunner; 2] = [&correct, &unfaulty];
 
         let outcome = run_once(

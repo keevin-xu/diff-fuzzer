@@ -18,7 +18,7 @@
 //! cargo run --release -p tensor-adapter --example overflow_downstream
 //! ```
 
-use burn::backend::{LibTorch, NdArray};
+use burn::backend::{Flex, LibTorch};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 
@@ -61,7 +61,7 @@ fn values<B: Backend>(tensor: Tensor<B, 2>) -> Vec<f32> {
 }
 
 fn main() {
-    probe::<NdArray<f32>>("ndarray");
+    probe::<Flex<f32>>("flex");
     println!();
     probe::<LibTorch<f32>>("libtorch");
 

@@ -38,15 +38,14 @@ pub mod testing;
 pub mod tolerance;
 
 pub use backends::{
-    BurnBackend, FlexBackend, LibTorchBackend, MAX_RANK, NdArrayBackend, WgpuBackend, flex,
-    libtorch, ndarray, wgpu,
+    BurnBackend, FlexBackend, LibTorchBackend, MAX_RANK, WgpuBackend, flex, libtorch, wgpu,
 };
-pub use environment::{BURN_VERSION, LIBTORCH_VERSION, TCH_VERSION, environment};
+pub use environment::{BURN_VERSION, FLEX_VERSION, LIBTORCH_VERSION, TCH_VERSION, environment};
 pub use generator::{FixedAddGenerator, TensorOpGenerator};
 pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use known::{KNOWN, Known, Status, known_issue};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use ops::Bounds;
 pub use signature::{DisagreeingPair, signature, signature_across};
-pub use testing::{FaultyBackend, FaultyNdArray, faulty};
+pub use testing::{FaultyBackend, FaultyCpu, faulty};
 pub use tolerance::{OpClass, TensorTolerancePolicy};

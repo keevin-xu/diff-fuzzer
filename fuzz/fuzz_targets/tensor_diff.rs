@@ -31,8 +31,8 @@ use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tensor_adapter::{
-    CanonicalTensor, FaultyNdArray, TensorNormalizer, TensorOp, TensorTolerancePolicy, environment,
-    faulty as faulty_backend, libtorch, ndarray, negatives,
+    CanonicalTensor, FaultyCpu, TensorNormalizer, TensorOp, TensorTolerancePolicy, environment,
+    faulty as faulty_backend, libtorch, flex, negatives,
 };
 
 /// Everything that is expensive to build, constructed once and reused.
@@ -42,10 +42,10 @@ use tensor_adapter::{
 /// itself the bottleneck, and **throughput is bugs found**: a harness that halves the
 /// execution rate halves the ground covered in a campaign.
 struct Harness {
-    cpu: NormalizedRunner<tensor_adapter::NdArrayBackend, TensorNormalizer>,
+    cpu: NormalizedRunner<tensor_adapter::FlexBackend, TensorNormalizer>,
     torch: NormalizedRunner<tensor_adapter::LibTorchBackend, TensorNormalizer>,
     /// A backend wrong by a known amount, used only when the fault switch is set.
-    faulty: NormalizedRunner<FaultyNdArray, TensorNormalizer>,
+    faulty: NormalizedRunner<FaultyCpu, TensorNormalizer>,
     oracle: DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy>,
     /// Whether to compare against the faulty backend instead of libtorch.
     inject_fault: bool,
@@ -55,7 +55,7 @@ static HARNESS: OnceLock<Harness> = OnceLock::new();
 
 fn harness() -> &'static Harness {
     HARNESS.get_or_init(|| Harness {
-        cpu: NormalizedRunner::new(ndarray(), TensorNormalizer),
+        cpu: NormalizedRunner::new(flex(), TensorNormalizer),
         torch: NormalizedRunner::new(libtorch(), TensorNormalizer),
         faulty: NormalizedRunner::new(faulty_backend(0.5), TensorNormalizer),
         oracle: DifferentialOracle::new(TensorTolerancePolicy),

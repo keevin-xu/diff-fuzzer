@@ -27,7 +27,7 @@ repository = "https://github.com/kevinxu/diff-fuzzer"
 # `default-features = false` drops burn's training stack (train/dataset/vision/rl).
 # We only ever build and compare individual tensor ops, so none of that is needed.
 # Backends are opt-in features, and both sides of the differential are enabled here:
-#   "ndarray" — pure-Rust CPU kernels
+#   "flex"    — pure-Rust CPU kernels (replaced "ndarray" at PHASE-7A)
 #   "tch"     — libtorch (PyTorch's C++ library) via the `tch` bindings
 #   "wgpu"    — GPU, via Metal on this machine
 # burn-tch enables tch's `download-libtorch` feature, so the libtorch binaries are
@@ -39,13 +39,12 @@ repository = "https://github.com/kevinxu/diff-fuzzer"
 # rather than assumed (PHASE-7 step 7.4).
 burn = { version = "0.21.0", default-features = false, features = [
     "std",
-    "ndarray",
+    # `flex` replaced `ndarray` at PHASE-7A: burn's README no longer lists `ndarray` among
+    # its first-party CPU backends, and a bug found in a backend the maintainers have moved
+    # off is a bug nobody will fix.
+    "flex",
     "tch",
     "wgpu",
-    # Added 2026-08-05 to measure whether it reproduces the burn#5284 overflow before
-    # deciding whether it can replace ndarray, which burn no longer lists as a first-party
-    # CPU backend.
-    "flex",
 ] }
 
 # Engine dependencies.

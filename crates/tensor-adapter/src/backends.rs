@@ -15,7 +15,7 @@
 //! everything else treat rank as an ordinary value.
 
 use crate::input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
-use burn::backend::{Flex, LibTorch, NdArray, Wgpu};
+use burn::backend::{Flex, LibTorch, Wgpu};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use diff_fuzzer_core::{Implementation, RunError};
@@ -137,16 +137,8 @@ impl<B: Backend> Implementation for BurnBackend<B> {
     }
 }
 
-/// The pure-Rust CPU backend.
-pub type NdArrayBackend = BurnBackend<NdArray<f32>>;
-
 /// The libtorch backend — the same arithmetic, performed by PyTorch's C++ kernels.
 pub type LibTorchBackend = BurnBackend<LibTorch<f32>>;
-
-/// Construct the CPU backend under test.
-pub fn ndarray() -> NdArrayBackend {
-    BurnBackend::new("burn-ndarray")
-}
 
 /// Construct the libtorch backend under test.
 pub fn libtorch() -> LibTorchBackend {
@@ -155,7 +147,7 @@ pub fn libtorch() -> LibTorchBackend {
 
 /// The wgpu backend — the same arithmetic again, this time on the GPU.
 ///
-/// **Note the second type parameter.** `NdArray<f32>` and `LibTorch<f32>` name only their
+/// **Note the second type parameter.** `Flex<f32>` and `LibTorch<f32>` name only their
 /// float type; `Wgpu` names its integer type as well, because a GPU kernel must know both
 /// at compile time. That difference is absorbed here and reaches nothing else: the generic
 /// `BurnBackend<B>` only requires `B: Backend`, so every operation, every rank, and the
@@ -197,7 +189,7 @@ mod tests {
     /// what was expected. Most tests below care that the two agree, which is the
     /// property the whole tool depends on.
     fn on_both(op: &TensorOp, expected_shape: &[usize]) -> (Vec<f32>, Vec<f32>) {
-        let cpu = ndarray().run(op).expect("cpu backend supports this");
+        let cpu = flex().run(op).expect("cpu backend supports this");
         let torch = libtorch().run(op).expect("libtorch supports this");
         assert_eq!(cpu.shape.to_vec(), expected_shape.to_vec());
         assert_eq!(torch.shape.to_vec(), expected_shape.to_vec());
@@ -332,7 +324,7 @@ mod tests {
 
     #[test]
     fn backends_identify_themselves_distinctly() {
-        assert_ne!(ndarray().name(), libtorch().name());
+        assert_ne!(flex().name(), libtorch().name());
     }
 
     /// Running the same case twice on one backend must give the same answer. If that
@@ -340,7 +332,7 @@ mod tests {
     /// difference might just be noise from one of them.
     #[test]
     fn a_backend_is_self_consistent() {
-        let backend = ndarray();
+        let backend = flex();
         let op = TensorOp::unary(UnaryOp::Exp, value(&[3], &[0.5, 1.0, 2.0]));
         let first = values(backend.run(&op).unwrap());
         let second = values(backend.run(&op).unwrap());

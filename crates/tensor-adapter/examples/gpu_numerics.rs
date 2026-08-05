@@ -39,7 +39,7 @@
 use burn::tensor::TensorData;
 use diff_fuzzer_core::{Implementation, SeededRng};
 use rand::RngExt;
-use tensor_adapter::{BinaryOp, TensorOp, TensorValue, UnaryOp, flex, libtorch, ndarray, wgpu};
+use tensor_adapter::{BinaryOp, TensorOp, TensorValue, UnaryOp, flex, libtorch, wgpu};
 
 /// Distance between two floats counted in representable values between them.
 ///
@@ -67,7 +67,7 @@ fn ulps_apart(a: f32, b: f32) -> Option<u32> {
 
 fn run(op: &TensorOp, backend: &str) -> Option<Vec<f32>> {
     let out: TensorData = match backend {
-        "cpu" => ndarray().run(op).ok()?,
+        "cpu" => flex().run(op).ok()?,
         "tch" => libtorch().run(op).ok()?,
         "flex" => flex().run(op).ok()?,
         _ => wgpu().run(op).ok()?,
@@ -222,7 +222,9 @@ fn main() {
     // question is whether it conforms, which decides whether `Tolerance::EXACT` carries
     // over unchanged or whether a pure-Rust CPU backend has a finding of its own.
     println!("flex vs the established CPU backends (IEEE-754 requires 0 ULP):");
-    for (other, label) in [("cpu", "ndarray"), ("tch", "tch")] {
+    // The `ndarray` column is gone with the backend; its measurement is recorded
+    // permanently in `SPECS.md` §2b.2 and does not need re-running.
+    for (other, label) in [("tch", "tch")] {
         for (op_name, builder) in cpu_ops() {
             measure_pair(
                 "flex",

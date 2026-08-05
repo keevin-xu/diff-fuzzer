@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo run -p tensor-adapter --example hello_tensor`
 
-use burn::backend::{LibTorch, NdArray};
+use burn::backend::{Flex, LibTorch};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 
@@ -57,11 +57,11 @@ fn matmul_2x3_by_3x2<B: Backend>(device: &B::Device) -> Vec<f32> {
 fn main() {
     // Each backend names its own device type, and both default to "the only device
     // available" here: the CPU.
-    let cpu = matmul_2x3_by_3x2::<NdArray<f32>>(&Default::default());
+    let cpu = matmul_2x3_by_3x2::<Flex<f32>>(&Default::default());
     let torch = matmul_2x3_by_3x2::<LibTorch<f32>>(&Default::default());
 
     println!("same matmul, two backends  (a 2x3 · b 3x2)");
-    println!("  ndarray (pure Rust CPU) : {cpu:?}");
+    println!("  flex (pure Rust CPU) : {cpu:?}");
     println!("  libtorch (PyTorch C++)  : {torch:?}");
     println!("  expected                : [58.0, 64.0, 139.0, 154.0]");
 

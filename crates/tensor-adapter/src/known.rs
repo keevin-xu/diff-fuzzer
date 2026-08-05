@@ -148,7 +148,7 @@ mod tests {
     /// did not.** A case is not a class.
     #[test]
     fn the_recorded_class_is_still_reachable_from_real_backends() {
-        use crate::backends::{libtorch, ndarray};
+        use crate::backends::{flex, libtorch};
         use crate::normalize::TensorNormalizer;
         use crate::signature::signature_across;
         use crate::tolerance::TensorTolerancePolicy;
@@ -172,7 +172,7 @@ mod tests {
         );
 
         let outputs: Vec<(String, CanonicalTensor)> = [
-            ("burn-ndarray", ndarray().run(&case)),
+            ("burn-flex", flex().run(&case)),
             ("burn-tch", libtorch().run(&case)),
         ]
         .into_iter()

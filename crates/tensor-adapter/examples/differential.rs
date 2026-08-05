@@ -13,8 +13,7 @@ use diff_fuzzer_core::{
     driver::run_once,
 };
 use tensor_adapter::{
-    CanonicalTensor, FaultyBackend, FixedAddGenerator, TensorNormalizer, TensorOp, libtorch,
-    ndarray,
+    CanonicalTensor, FaultyBackend, FixedAddGenerator, TensorNormalizer, TensorOp, flex, libtorch,
 };
 
 fn main() {
@@ -29,7 +28,7 @@ fn main() {
     // two have the same type from the driver's point of view, despite producing
     // different kinds of tensor internally — which is why the driver takes a list and
     // not exactly two arguments.
-    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
 
@@ -60,7 +59,7 @@ fn main() {
     // Two correct backends agreeing proves very little on its own — a comparison that
     // had quietly stopped working would report exactly the same thing. So: introduce a
     // backend known to be wrong by a fixed amount, and confirm it gets caught.
-    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+    let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.5), TensorNormalizer);
     let with_fault: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &faulty];
 
     println!("\nwith a deliberately faulty backend:");

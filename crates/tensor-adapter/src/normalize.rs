@@ -122,7 +122,7 @@ impl ApproxEq for CanonicalTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{libtorch, ndarray};
+    use crate::backends::{flex, libtorch};
     use crate::input::{BinaryOp, TensorOp, TensorValue};
     use diff_fuzzer_core::Implementation;
 
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn normalizing_keeps_shape_dtype_and_values() {
-        let out = ndarray().run(&case()).unwrap();
+        let out = flex().run(&case()).unwrap();
         let canon = TensorNormalizer.normalize(out);
 
         assert_eq!(canon.shape, vec![2, 2]);
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn both_backends_report_the_same_element_type() {
         let case = case();
-        let from_cpu = TensorNormalizer.normalize(ndarray().run(&case).unwrap());
+        let from_cpu = TensorNormalizer.normalize(flex().run(&case).unwrap());
         let from_torch = TensorNormalizer.normalize(libtorch().run(&case).unwrap());
 
         assert_eq!(from_cpu.dtype, from_torch.dtype);
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn both_backends_normalize_to_the_same_result() {
         let case = case();
-        let from_cpu = TensorNormalizer.normalize(ndarray().run(&case).unwrap());
+        let from_cpu = TensorNormalizer.normalize(flex().run(&case).unwrap());
         let from_torch = TensorNormalizer.normalize(libtorch().run(&case).unwrap());
 
         assert_eq!(from_cpu, from_torch);

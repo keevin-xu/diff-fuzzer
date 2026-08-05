@@ -17,7 +17,7 @@ use diff_fuzzer_core::{
 };
 use tensor_adapter::{
     BinaryOp, CanonicalTensor, FaultyBackend, ReduceOp, TensorNormalizer, TensorOp, TensorValue,
-    UnaryOp, environment, libtorch, ndarray, repro::reproduce,
+    UnaryOp, environment, flex, libtorch, repro::reproduce,
 };
 
 type AnyRunner<'a> = &'a dyn Runner<In = TensorOp, Canon = CanonicalTensor>;
@@ -57,8 +57,8 @@ fn filled(shape: &[usize], fill: f32) -> TensorValue {
 /// Used as a **signature**: the injected fault offsets one value by a known amount, so
 /// this number identifies *which* bug a case exhibits, and it must survive shrinking.
 fn worst_absolute_error(case: &TensorOp) -> Option<f64> {
-    let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
-    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+    let correct = NormalizedRunner::new(flex(), TensorNormalizer);
+    let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.5), TensorNormalizer);
 
     let a = correct.run_and_normalize(case).ok()?;
     let b = faulty.run_and_normalize(case).ok()?;
@@ -78,8 +78,8 @@ fn element_count(case: &TensorOp) -> usize {
 
 /// Does this case still diverge between a correct backend and a faulty one?
 fn still_diverges(case: &TensorOp) -> bool {
-    let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
-    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+    let correct = NormalizedRunner::new(flex(), TensorNormalizer);
+    let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.5), TensorNormalizer);
 
     let (Ok(a), Ok(b)) = (
         correct.run_and_normalize(case),
@@ -116,11 +116,8 @@ fn a_divergence_survives_shrinking_saving_and_reloading() {
         input: minimized.input.clone(),
         minimisation: MinimisationRecord::from(&minimized),
         outputs: vec![
-            ("burn-ndarray".to_string(), "recorded".to_string()),
-            (
-                "burn-ndarray+fault(0.5)".to_string(),
-                "recorded".to_string(),
-            ),
+            ("burn-flex".to_string(), "recorded".to_string()),
+            ("burn-flex+fault(0.5)".to_string(), "recorded".to_string()),
         ],
         tolerance: TOLERANCE,
         environment: environment(),
@@ -134,8 +131,8 @@ fn a_divergence_survives_shrinking_saving_and_reloading() {
     assert_eq!(loaded.input, minimized.input, "the case changed on disk");
 
     // Reproduce from what was loaded, not from what is still in memory.
-    let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
-    let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 0.5), TensorNormalizer);
+    let correct = NormalizedRunner::new(flex(), TensorNormalizer);
+    let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 0.5), TensorNormalizer);
     let implementations: [AnyRunner; 2] = [&correct, &faulty];
 
     let outcome = reproduce(&loaded, &implementations);
@@ -177,7 +174,7 @@ fn minimisation_substantially_reduces_the_case() {
 fn the_minimised_case_still_runs_on_a_real_backend() {
     let minimized = minimize(large_case(), still_diverges);
 
-    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
 
     assert!(cpu.run_and_normalize(&minimized.input).is_ok());
@@ -215,7 +212,7 @@ fn a_report_that_no_longer_diverges_is_reported_as_such() {
     };
 
     // Replayed against two *correct* backends, so the fault is absent.
-    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let implementations: [AnyRunner; 2] = [&cpu, &torch];
 
@@ -300,8 +297,8 @@ fn shrinking_preserves_the_nature_of_the_divergence() {
 #[test]
 fn a_small_fault_is_still_caught_and_shrunk() {
     let tiny = |case: &TensorOp| -> bool {
-        let correct = NormalizedRunner::new(ndarray(), TensorNormalizer);
-        let faulty = NormalizedRunner::new(FaultyBackend::new(ndarray(), 1e-4), TensorNormalizer);
+        let correct = NormalizedRunner::new(flex(), TensorNormalizer);
+        let faulty = NormalizedRunner::new(FaultyBackend::new(flex(), 1e-4), TensorNormalizer);
 
         let (Ok(a), Ok(b)) = (
             correct.run_and_normalize(case),
@@ -326,7 +323,7 @@ fn a_small_fault_is_still_caught_and_shrunk() {
 #[test]
 fn a_fault_on_either_implementation_shrinks_the_same_way() {
     let against_libtorch = |case: &TensorOp| -> bool {
-        let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+        let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
         let faulty = NormalizedRunner::new(FaultyBackend::new(libtorch(), 0.5), TensorNormalizer);
 
         let (Ok(a), Ok(b)) = (cpu.run_and_normalize(case), faulty.run_and_normalize(case)) else {

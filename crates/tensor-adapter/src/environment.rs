@@ -19,6 +19,9 @@ pub const BURN_VERSION: &str = "0.21.0";
 /// The Rust bindings the libtorch backend goes through.
 pub const TCH_VERSION: &str = "0.22.0";
 
+/// The pure-Rust CPU backend, replacing `ndarray` at PHASE-7A.
+pub const FLEX_VERSION: &str = "0.21.0";
+
 /// PyTorch's C++ library, downloaded by `torch-sys`'s build script.
 ///
 /// Not verifiable from `Cargo.lock` — it is not a Rust crate — so this one is tied to
@@ -31,6 +34,7 @@ pub fn environment() -> Environment {
     Environment::detect()
         .with("burn", BURN_VERSION)
         .with("tch", TCH_VERSION)
+        .with("burn-flex", FLEX_VERSION)
         .with("libtorch", LIBTORCH_VERSION)
 }
 
@@ -64,7 +68,11 @@ mod tests {
     /// build until the constant follows.
     #[test]
     fn recorded_versions_match_the_lockfile() {
-        for (crate_name, recorded) in [("burn", BURN_VERSION), ("tch", TCH_VERSION)] {
+        for (crate_name, recorded) in [
+            ("burn", BURN_VERSION),
+            ("tch", TCH_VERSION),
+            ("burn-flex", FLEX_VERSION),
+        ] {
             let locked = locked_version(crate_name)
                 .unwrap_or_else(|| panic!("{crate_name} not found in Cargo.lock"));
 

@@ -28,7 +28,7 @@ use diff_fuzzer_core::{
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    Bounds, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy, libtorch, ndarray,
+    Bounds, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy, flex, libtorch,
 };
 
 /// One rounding step for `f32`.
@@ -72,7 +72,7 @@ fn main() {
     println!("triage: {} findings from {path}\n", findings.len());
 
     let generator = TensorOpGenerator::new(bounds);
-    let (cpu, torch) = (ndarray(), libtorch());
+    let (cpu, torch) = (flex(), libtorch());
     let policy = TensorTolerancePolicy;
 
     let mut triaged = Vec::new();
@@ -84,7 +84,7 @@ fn main() {
         let right = TensorNormalizer.normalize(torch.run(&case).expect("valid case"));
 
         // Rung 1: does it still diverge, from the seed alone?
-        let tolerance = policy.tolerance_for(&case, ("burn-ndarray", "burn-tch"));
+        let tolerance = policy.tolerance_for(&case, ("burn-flex", "burn-tch"));
         let reproduced = !compare(&left.values, &right.values, tolerance).agrees();
 
         // Rung 2: how does the error compare with what the arithmetic predicts?

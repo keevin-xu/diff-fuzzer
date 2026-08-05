@@ -12,7 +12,7 @@ use diff_fuzzer_core::{
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    Bounds, CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, libtorch, ndarray,
+    Bounds, CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, flex, libtorch,
 };
 
 type AnyRunner<'a> = &'a dyn Runner<In = TensorOp, Canon = CanonicalTensor>;
@@ -27,7 +27,7 @@ type AnyRunner<'a> = &'a dyn Runner<In = TensorOp, Canon = CanonicalTensor>;
 #[test]
 fn every_generated_case_executes_on_both_backends() {
     let generator = TensorOpGenerator::default();
-    let (cpu, torch) = (ndarray(), libtorch());
+    let (cpu, torch) = (flex(), libtorch());
 
     let mut rejected = Vec::new();
 
@@ -65,7 +65,7 @@ fn every_generated_case_executes_on_both_backends() {
 #[test]
 fn both_backends_agree_on_result_shapes() {
     let generator = TensorOpGenerator::default();
-    let (cpu, torch) = (ndarray(), libtorch());
+    let (cpu, torch) = (flex(), libtorch());
 
     for seed in 0..2_000 {
         let case = generator.generate(&mut SeededRng::from_seed(seed));
@@ -87,7 +87,7 @@ fn both_backends_agree_on_result_shapes() {
 #[test]
 fn no_generated_case_is_skipped() {
     let generator = TensorOpGenerator::default();
-    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [AnyRunner; 2] = [&cpu, &torch];
     // Exact comparison for now: the tolerance policy that varies by operation
@@ -121,7 +121,7 @@ fn tens_of_thousands_of_cases_all_execute() {
     const HIGH: u64 = 10_000;
 
     let generator = TensorOpGenerator::default();
-    let (cpu, torch) = (ndarray(), libtorch());
+    let (cpu, torch) = (flex(), libtorch());
 
     // Three regions: low sequential, scattered across the range by a large odd stride,
     // and the very top of the range.
@@ -172,7 +172,7 @@ fn degenerate_shapes_still_execute() {
         magnitude: 1.0,
         ..Bounds::default()
     });
-    let (cpu, torch) = (ndarray(), libtorch());
+    let (cpu, torch) = (flex(), libtorch());
 
     for seed in 0..500 {
         let case = generator.generate(&mut SeededRng::from_seed(seed));

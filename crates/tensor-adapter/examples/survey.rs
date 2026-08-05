@@ -15,8 +15,8 @@ use diff_fuzzer_core::{
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy,
-    libtorch, ndarray,
+    CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy, flex,
+    libtorch,
 };
 
 const CASES: u64 = 5_000;
@@ -30,7 +30,7 @@ struct Tally {
 
 fn main() {
     let generator = TensorOpGenerator::default();
-    let cpu = NormalizedRunner::new(ndarray(), TensorNormalizer);
+    let cpu = NormalizedRunner::new(flex(), TensorNormalizer);
     let torch = NormalizedRunner::new(libtorch(), TensorNormalizer);
     let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&cpu, &torch];
     // Tolerance is chosen per case from the operation and the size of its arguments.
@@ -71,7 +71,7 @@ fn main() {
 
     let elapsed = started.elapsed();
 
-    println!("{CASES} cases, derived per-operation tolerance, burn-ndarray vs burn-tch\n");
+    println!("{CASES} cases, derived per-operation tolerance, burn-flex vs burn-tch\n");
     println!(
         "  agreed   {:>6}  ({:.1}%)",
         totals.agreed,

@@ -251,13 +251,13 @@ mod tests {
     /// cannot run is one the fuzzer will carry around forever, learning nothing.
     #[test]
     fn every_seed_runs_on_a_real_backend() {
-        use crate::backends::ndarray;
+        use crate::backends::flex;
         use diff_fuzzer_core::Implementation;
 
         for (index, seed) in seed_corpus().iter().enumerate() {
             let case = decode(seed);
             assert!(
-                ndarray().run(&case).is_ok(),
+                flex().run(&case).is_ok(),
                 "seed {index} ({}) does not run",
                 case.name()
             );

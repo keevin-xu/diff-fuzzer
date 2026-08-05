@@ -23,21 +23,21 @@
 use diff_fuzzer_core::{Agreement, ApproxEq, Implementation, Normalizer, TolerancePolicy};
 use tensor_adapter::{
     BinaryOp, ReduceOp, TensorNormalizer, TensorOp, TensorTolerancePolicy, TensorValue, UnaryOp,
-    libtorch, ndarray,
+    flex, libtorch,
 };
 
 /// Run a case on both backends and return their canonical results.
 fn on_both(case: &TensorOp) -> (Vec<f32>, Vec<f32>) {
-    let cpu = TensorNormalizer.normalize(ndarray().run(case).expect("valid case"));
+    let cpu = TensorNormalizer.normalize(flex().run(case).expect("valid case"));
     let torch = TensorNormalizer.normalize(libtorch().run(case).expect("valid case"));
     (cpu.values, torch.values)
 }
 
 /// Do the backends agree under the project's own tolerance policy?
 fn agree(case: &TensorOp) -> bool {
-    let cpu = TensorNormalizer.normalize(ndarray().run(case).expect("valid case"));
+    let cpu = TensorNormalizer.normalize(flex().run(case).expect("valid case"));
     let torch = TensorNormalizer.normalize(libtorch().run(case).expect("valid case"));
-    let tolerance = TensorTolerancePolicy.tolerance_for(case, ("burn-ndarray", "burn-tch"));
+    let tolerance = TensorTolerancePolicy.tolerance_for(case, ("burn-flex", "burn-tch"));
 
     matches!(cpu.approx_compare(&torch, tolerance), Agreement::Agree(_))
 }

@@ -22,8 +22,8 @@ use diff_fuzzer_core::{
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    CanonicalTensor, DisagreeingPair, Known, TensorNormalizer, TensorOp, known_issue, libtorch,
-    ndarray, signature_across, wgpu,
+    CanonicalTensor, DisagreeingPair, Known, TensorNormalizer, TensorOp, flex, known_issue,
+    libtorch, signature_across, wgpu,
 };
 
 /// One representative of a problem, plus how often it was hit.
@@ -307,12 +307,12 @@ fn fingerprint_of(report: &DivergenceReport<TensorOp>) -> (String, Option<Disagr
 /// The GPU is included so a divergence that only it exhibits is labelled from the pair that
 /// actually disagreed. Cheap: triage runs once over a directory, not per fuzzing execution.
 fn backends() -> Vec<Box<dyn Implementation<In = TensorOp, Out = burn::tensor::TensorData>>> {
-    vec![Box::new(ndarray()), Box::new(libtorch()), Box::new(wgpu())]
+    vec![Box::new(flex()), Box::new(libtorch()), Box::new(wgpu())]
 }
 
 /// Does this report's case still diverge, under the tolerance it was judged against?
 fn still_diverges(report: &DivergenceReport<TensorOp>) -> bool {
-    let (cpu, torch) = (ndarray(), libtorch());
+    let (cpu, torch) = (flex(), libtorch());
     let (Ok(left), Ok(right)) = (cpu.run(&report.input), torch.run(&report.input)) else {
         return false;
     };
