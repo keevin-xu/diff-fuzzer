@@ -46,7 +46,7 @@ pub use environment::{BURN_VERSION, FLEX_VERSION, LIBTORCH_VERSION, TCH_VERSION,
 pub use features::{FEATURES, FeatureVec, extract};
 pub use generator::{FixedAddGenerator, TensorOpGenerator};
 pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
-pub use known::{KNOWN, Known, Status, known_issue};
+pub use known::{KNOWN, Known, Relation, Status, known_by_predicate, known_issue};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use ops::Bounds;
 pub use predicate::Predicate;

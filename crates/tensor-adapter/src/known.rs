@@ -100,6 +100,56 @@ pub const KNOWN: &[Known] = &[Known {
     predicate: None,
 }];
 
+/// How a group's **symptom** and its **trigger** line up.
+///
+/// The whole point of adding predicates on top of signatures is that these two can
+/// disagree, and each way of disagreeing means something different.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// Signature known, trigger known. Ordinary: a problem already investigated.
+    Understood,
+    /// **Known trigger, unrecognised signature** — the *split* signal. One bug appearing
+    /// under two symptoms, which is what would have connected the rank-3 matmul case to
+    /// the rank-2 one instead of presenting it as unrelated.
+    SameCauseNewSymptom,
+    /// **Known signature, no trigger explains it** — the *merge* signal, and the dangerous
+    /// direction. A class believed to hold one problem may hold two, and symptom grouping
+    /// cannot see the difference. **This has never once been observable in this project**;
+    /// it becomes observable here.
+    KnownSymptomUnexplained,
+    /// Neither. Genuinely new, and the top of the queue.
+    Novel,
+}
+
+impl Relation {
+    pub fn of(signature: &str, explained_by: Option<&'static Known>) -> Self {
+        match (known_issue(signature).is_some(), explained_by.is_some()) {
+            (true, true) => Relation::Understood,
+            (false, true) => Relation::SameCauseNewSymptom,
+            (true, false) => Relation::KnownSymptomUnexplained,
+            (false, false) => Relation::Novel,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Relation::Understood => "known problem, known trigger",
+            Relation::SameCauseNewSymptom => {
+                "⚠ KNOWN TRIGGER, NEW SIGNATURE — possibly one bug under two symptoms"
+            }
+            Relation::KnownSymptomUnexplained => {
+                "⚠ KNOWN SIGNATURE, NO TRIGGER EXPLAINS IT — the class may hold two problems"
+            }
+            Relation::Novel => "not seen before",
+        }
+    }
+
+    /// Whether this needs a human. Both disagreements do, and so does anything novel.
+    pub fn needs_attention(self) -> bool {
+        self != Relation::Understood
+    }
+}
+
 /// Look up a class by the **trigger** its case carries, rather than by symptom.
 ///
 /// This is the lookup a signature cannot perform: it asks *"does anything already explain
@@ -273,6 +323,68 @@ mod tests {
         );
 
         assert!(known_by_predicate(extract(&case)).is_none());
+    }
+
+    /// A stand-in class, so the four relations can be tested without depending on what
+    /// the real registry happens to contain today.
+    const STUB: Known = Known {
+        signature: "stub/rank2/undefined",
+        status: Status::Reported,
+        reference: "local",
+        note: "test fixture",
+        predicate: None,
+    };
+
+    /// **The split signal.** A trigger we understand, under a signature we have not seen —
+    /// one bug wearing two symptoms. This is what would have connected the rank-3 matmul
+    /// case to the rank-2 one instead of presenting it as unrelated.
+    #[test]
+    fn a_known_trigger_under_a_new_signature_is_the_split_signal() {
+        let relation = Relation::of("never-seen/rank9/undefined", Some(&STUB));
+
+        assert_eq!(relation, Relation::SameCauseNewSymptom);
+        assert!(relation.needs_attention());
+        assert!(relation.label().contains("NEW SIGNATURE"));
+    }
+
+    /// **The merge signal, and the dangerous direction.** A signature we recognise, whose
+    /// trigger nothing explains — the class may hold a second problem, and symptom grouping
+    /// cannot see the difference.
+    ///
+    /// **This has never been observable in this project.** Before predicates, a recognised
+    /// signature was simply "known" and sorted below the fold. It is observable now.
+    #[test]
+    fn a_known_signature_with_no_explaining_trigger_is_the_merge_signal() {
+        let known = KNOWN[0].signature;
+        let relation = Relation::of(known, None);
+
+        assert_eq!(relation, Relation::KnownSymptomUnexplained);
+        assert!(
+            relation.needs_attention(),
+            "a recognised signature must NOT be treated as settled just because it is \
+             recognised — that is precisely how a class holding two bugs stays invisible"
+        );
+    }
+
+    /// Only the fully-understood case is quiet. Everything else reaches a person.
+    #[test]
+    fn only_a_known_signature_with_a_known_trigger_is_quiet() {
+        assert!(!Relation::of(KNOWN[0].signature, Some(&STUB)).needs_attention());
+
+        assert!(Relation::of("new/rank1/numeric/rounding", None).needs_attention());
+        assert!(Relation::of("new/rank1/numeric/rounding", Some(&STUB)).needs_attention());
+        assert!(Relation::of(KNOWN[0].signature, None).needs_attention());
+    }
+
+    /// Novel is the ordinary case for a fresh finding, and must not be confused with
+    /// either disagreement — they carry different next actions.
+    #[test]
+    fn an_unrecognised_signature_with_no_trigger_is_simply_novel() {
+        let relation = Relation::of("brand-new/rank1/structural", None);
+
+        assert_eq!(relation, Relation::Novel);
+        assert!(relation.needs_attention());
+        assert!(!relation.label().contains('⚠'), "novel is not a warning");
     }
 
     /// Two entries for one signature would make lookup order-dependent.

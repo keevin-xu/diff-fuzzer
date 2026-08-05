@@ -22,8 +22,8 @@ use diff_fuzzer_core::{
 };
 use std::collections::BTreeMap;
 use tensor_adapter::{
-    CanonicalTensor, DisagreeingPair, Known, TensorNormalizer, TensorOp, flex, known_issue,
-    libtorch, signature_across, wgpu,
+    CanonicalTensor, DisagreeingPair, Known, Relation, TensorNormalizer, TensorOp, extract, flex,
+    known_by_predicate, known_issue, libtorch, signature_across, wgpu,
 };
 
 /// One representative of a problem, plus how often it was hit.
@@ -43,6 +43,13 @@ struct Group {
     smallest_path: std::path::PathBuf,
     reproduced: usize,
     checked: usize,
+    /// Which recorded class, if any, **explains the trigger** of the smallest case.
+    ///
+    /// Distinct from matching a signature. A signature match says "this looked like
+    /// something we have seen"; a predicate match says "something we understand explains
+    /// why an input like this fails". The two can disagree, and where they do is the most
+    /// informative thing this tool produces — see [`Relation`].
+    explained_by: Option<&'static Known>,
 }
 
 fn main() {
@@ -76,6 +83,8 @@ fn main() {
         // about the target.
         let reproduced = still_diverges(&report);
         let size = element_count(&report.input);
+        // Computed from the **case**, so it is available for an input nobody has run.
+        let explained_by = known_by_predicate(extract(&report.input));
 
         groups
             .entry(fingerprint)
@@ -87,6 +96,7 @@ fn main() {
                     group.smallest_size = size;
                     group.smallest = report.clone();
                     group.smallest_path = path.clone();
+                    group.explained_by = explained_by;
                 }
             })
             .or_insert_with(|| Group {
@@ -97,6 +107,7 @@ fn main() {
                 smallest_path: path,
                 reproduced: reproduced as usize,
                 checked: 1,
+                explained_by,
             });
     }
 
@@ -133,9 +144,13 @@ fn write_index(
     let (fresh, familiar): (Vec<_>, Vec<_>) = {
         let mut ordered: Vec<(&String, &Group)> = groups.iter().collect();
         ordered.sort_by_key(|(_, group)| std::cmp::Reverse(group.occurrences));
-        ordered
-            .into_iter()
-            .partition(|(signature, _)| known_issue(signature).is_none())
+        // **Partitioned by whether a human is needed, not by whether the signature is
+        // recognised.** A known signature whose trigger nothing explains belongs at the
+        // top — that is the merge signal, and sorting it below with the familiar problems
+        // is exactly how a class holding two bugs stays invisible.
+        ordered.into_iter().partition(|(signature, group)| {
+            Relation::of(signature, group.explained_by).needs_attention()
+        })
     };
 
     out.push_str("# Triage\n\n");
@@ -173,8 +188,13 @@ fn write_index(
         );
     } else {
         out.push_str(
-            "Not seen before. Work each up the ladder: does it reproduce → is it our\n\
-             tool → is it float noise → is it legal → report it.\n\n",
+            "Each of these needs a person. Work it up the ladder: does it reproduce → is it\n\
+             our tool → is it float noise → is it legal → report it.\n\n\
+             **Three different reasons appear here**, and they are not equally urgent. A\n\
+             *novel* group is simply new. A group whose **trigger is known but signature is\n\
+             not** is likely one bug wearing two symptoms. A group whose **signature is known\n\
+             but trigger is not** is the dangerous one: the class may hold a second problem\n\
+             that symptom grouping cannot see.\n\n",
         );
         for (signature, group) in &fresh {
             section(&mut out, signature, group, None);
@@ -201,6 +221,15 @@ fn write_index(
 /// One signature's entry.
 fn section(out: &mut String, signature: &str, group: &Group, known: Option<&'static Known>) {
     out.push_str(&format!("### `{signature}`\n\n"));
+
+    let relation = Relation::of(signature, group.explained_by);
+    out.push_str(&format!("**{}**\n\n", relation.label()));
+    if let Some(explained) = group.explained_by {
+        out.push_str(&format!(
+            "Trigger explained by [{}]({}).\n\n",
+            explained.signature, explained.reference
+        ));
+    }
 
     if let Some(known) = known {
         out.push_str(&format!(
@@ -351,6 +380,10 @@ fn report(groups: &BTreeMap<String, Group>, seen: &Seen) {
         // matches; it did not establish that N cases share a mechanism. A count that reads
         // as N confirmations of one bug overstates what was computed.
         println!("   {} case(s) matched this signature", group.occurrences);
+        println!(
+            "   {}",
+            Relation::of(fingerprint, group.explained_by).label()
+        );
         if let Some(pair) = &group.disagreeing {
             println!("   disagreeing pair: {} vs {}", pair.left, pair.right);
         }
