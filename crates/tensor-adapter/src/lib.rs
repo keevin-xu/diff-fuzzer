@@ -22,6 +22,7 @@ pub mod backends;
 #[cfg(feature = "fuzzing")]
 pub mod decode;
 pub mod environment;
+pub mod features;
 pub mod generator;
 pub mod input;
 pub mod known;
@@ -41,6 +42,7 @@ pub use backends::{
     BurnBackend, FlexBackend, LibTorchBackend, MAX_RANK, WgpuBackend, flex, libtorch, wgpu,
 };
 pub use environment::{BURN_VERSION, FLEX_VERSION, LIBTORCH_VERSION, TCH_VERSION, environment};
+pub use features::{FEATURES, FeatureVec, extract};
 pub use generator::{FixedAddGenerator, TensorOpGenerator};
 pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use known::{KNOWN, Known, Status, known_issue};
