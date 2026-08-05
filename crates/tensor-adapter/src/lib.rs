@@ -29,6 +29,7 @@ pub mod known;
 pub mod negatives;
 pub mod normalize;
 pub mod ops;
+pub mod predicate;
 pub mod repro;
 /// A starting corpus for the fuzzer. Requires the `fuzzing` feature.
 #[cfg(feature = "fuzzing")]
@@ -48,6 +49,7 @@ pub use input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 pub use known::{KNOWN, Known, Status, known_issue};
 pub use normalize::{CanonicalTensor, TensorNormalizer};
 pub use ops::Bounds;
+pub use predicate::Predicate;
 pub use signature::{DisagreeingPair, signature, signature_across};
 pub use testing::{FaultyBackend, FaultyCpu, faulty};
 pub use tolerance::{OpClass, TensorTolerancePolicy};

@@ -19,6 +19,8 @@
 //!
 //! **Not a verdict.** An entry means "we looked", not "it is fine". `Status` records which.
 
+use crate::predicate::Predicate;
+
 /// What was concluded about a signature, and how much that conclusion is worth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -61,6 +63,18 @@ pub struct Known {
     pub reference: &'static str,
     /// One line on what it is, so a reader need not open the reference.
     pub note: &'static str,
+    /// The trigger this class is believed to have, if one has been ratified.
+    ///
+    /// **`None` is the honest default and is not a placeholder.** A signature says what a
+    /// disagreement *looked like*; a predicate claims what an input must *contain* to cause
+    /// it. The second is a much stronger statement and is only earned by a search that has
+    /// scored a candidate against cases which did **not** diverge.
+    ///
+    /// The obvious rule for the one entry here — `overflow_product ∧ mixed_sign_overflow` —
+    /// is deliberately **not** recorded: it was measured to match non-diverging cases too,
+    /// making it necessary and not sufficient. Writing it down would turn a falsified guess
+    /// into a recorded fact.
+    pub predicate: Option<Predicate>,
 }
 
 /// Every signature investigated so far.
@@ -80,7 +94,24 @@ pub const KNOWN: &[Known] = &[Known {
            libtorch's GEMM fuses inside a 4x8 micro-kernel and not in the trailing-corner \
            cleanup, so disagreeing elements number (m mod 4) * (n mod 8). Maintainer \
            notes burn has no explicit cross-backend numerical-agreement contract yet",
+    // Left `None` until a search proposes one and a human ratifies it (7B.5–7B.7). The
+    // tempting `overflow_product AND mixed_sign_overflow` was falsified by measurement:
+    // it matches cases that agree.
+    predicate: None,
 }];
+
+/// Look up a class by the **trigger** its case carries, rather than by symptom.
+///
+/// This is the lookup a signature cannot perform: it asks *"does anything already explain
+/// an input like this?"*, which is answerable for a case that has never been run.
+///
+/// Returns `None` while no entry has a ratified predicate — which is the state today, and
+/// is why `PHASE-7B`'s search exists.
+pub fn known_by_predicate(features: crate::features::FeatureVec) -> Option<&'static Known> {
+    KNOWN
+        .iter()
+        .find(|known| known.predicate.is_some_and(|p| p.matches(features)))
+}
 
 /// Look up what is known about a signature, if anything.
 pub fn known_issue(signature: &str) -> Option<&'static Known> {
@@ -207,6 +238,41 @@ mod tests {
     #[test]
     fn an_unrecognised_signature_is_not_known() {
         assert!(known_issue("exp/rank1/numeric/1e-6").is_none());
+    }
+
+    /// **Guards a deliberate absence.** No entry has a ratified predicate yet, and that is
+    /// a decision rather than an oversight: the obvious rule for the one class here was
+    /// *measured* to match cases that agree, so recording it would turn a falsified guess
+    /// into a stated fact.
+    ///
+    /// If this test fails, someone has added one. That is fine — provided it came from the
+    /// search in 7B.5 with evidence, and not from writing down the plausible-looking rule.
+    #[test]
+    fn no_predicate_is_recorded_without_a_search_having_earned_it() {
+        for entry in KNOWN {
+            assert!(
+                entry.predicate.is_none(),
+                "{} has a predicate. If a search proposed and a human ratified it, update \
+                 this test and record the evidence in DECISIONS.md. If it was written by \
+                 hand because it looked right, that is the failure this test exists for.",
+                entry.signature
+            );
+        }
+    }
+
+    /// The trigger lookup answers `None` while no predicate is ratified — it must not fall
+    /// back to matching on something weaker, which would quietly reintroduce symptom
+    /// grouping under a name that promises otherwise.
+    #[test]
+    fn a_trigger_lookup_finds_nothing_while_no_predicate_is_ratified() {
+        use crate::features::extract;
+
+        let case = TensorOp::matmul(
+            TensorValue::new(vec![1, 2], vec![1e30, -1e30]),
+            TensorValue::new(vec![2, 1], vec![1e30, 1e30]),
+        );
+
+        assert!(known_by_predicate(extract(&case)).is_none());
     }
 
     /// Two entries for one signature would make lookup order-dependent.
