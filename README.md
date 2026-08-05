@@ -4,8 +4,8 @@ A **differential testing + fuzzing framework**, written in **Rust**, whose first
 
 ## Status
 
-Generated tensor operations run on **three `burn` backends** — `burn-ndarray` (pure-Rust
-CPU), `burn-tch` (libtorch/CPU), and `burn-wgpu` (GPU, via Metal) — and their results are
+Generated tensor operations run on **three `burn` backends** — `burn-flex` (pure-Rust CPU),
+`burn-tch` (libtorch/CPU), and `burn-wgpu` (GPU, via Metal) — and their results are
 compared within a tolerance derived per operation *and per backend pair*. Generation is
 coverage-guided via `cargo-fuzz`; divergences are automatically shrunk to a small
 reproduction, de-duplicated, and written to disk with the seed and library versions needed
@@ -37,6 +37,35 @@ observe.
 Scale so far: a four-hour campaign at ~3,500 executions/second (**50,491,268 cases**), plus
 seeded campaigns. All findings collapse to two distinct problems.
 
+Those campaigns ran against `burn-ndarray`, which `burn` has since stopped listing among its
+first-party CPU backends; it was replaced by `burn-flex`. **810 of the 814 recorded findings
+no longer reproduce** on the new pair — a fact the tool reports about *itself*, since a
+recorded problem that can no longer be produced is a claim the repository can no longer
+support.
+
+### Grouping findings by cause, not by symptom
+
+Two findings sharing a *signature* look alike; that is not evidence they share a bug. So the
+tool also proposes a **predicate**: a claim about the *input*, of the form
+`overflow_product ∧ magnitude_ratio_extreme`, built from 17 boolean properties of a case.
+
+The difference is that a signature can only describe the past, while a predicate makes a
+falsifiable claim about inputs nobody has run. It is tested that way: enumerate all 6,018
+rules over at most three properties, discard any that fires on a case that did **not**
+diverge, then generate fresh cases the rule matches and measure how often *those* diverge.
+
+Run against the recorded findings, it proposed three rules and **rejected all three**, and
+left **763 of 814 findings unexplained** — no rule over the current vocabulary separates them
+from passing cases. That gap is the report's most useful output, and it is written down
+rather than dropped. Reaching the filed bug's real trigger would need a property the 17
+cannot express: whether *one output element* falls outside both tile boundaries at once.
+
+The rates are only readable because the report also measures a **baseline** — the divergence
+rate for cases drawn with no rule at all. On the current backend pair that is **7 in 4,000**
+under wide bounds and **0 in 4,000** under default ones, which is both the first evidence
+that `flex` disagrees with libtorch and the reason a rejected candidate is reported with its
+lift above baseline (9.9×) rather than as a bare failure.
+
 ### How the numbers are justified
 
 Every threshold is **derived from a specification, then checked against measurement** —
@@ -61,8 +90,12 @@ full statement, including what the comparison is blind to.
 - **A GPU campaign judges far less than its case count suggests.** Subnormals are injected
   deliberately, and any case containing one is unjudged against the GPU — 1,150 of 2,000 in
   a recent run. The skip column says so.
-- **Grouping is by symptom, not cause.** Findings sharing a signature are not proven to
-  share a bug; the mechanism for grouping by *trigger* is designed but unbuilt.
+- **No predicate has been ratified.** The trigger-grouping machinery is built and every
+  candidate it has produced so far failed validation. It is a mechanism that makes
+  falsifiable claims, not a validated classifier, and the sample is far too small to be one.
+- **The negative pool contains no near-misses.** Those are cases one edit away from
+  diverging, and they are the only negatives strong enough to make a surviving rule mean
+  much. Every candidate report says so on its own face.
 - **No broadcasting**, and seven planned operations are unimplemented.
 - **One `SPECS.md` claim is still uncited** — the IEEE-754 correctly-rounded requirement
   that the strictest tolerance tier rests on. Listed explicitly in that file's §5.
@@ -78,5 +111,5 @@ We generate structured, valid tensor operations, run each one through **three ba
 - **Language:** Rust, throughout the whole project.
 - **First software type:** deep-learning / tensor libraries.
 - **First oracle:** differential (metamorphic added later — designed for from day one).
-- **Implementations (Route A):** the `burn` framework across three backends — `burn-ndarray` (pure-Rust CPU), `burn-tch` (libtorch/CPU), and `burn-wgpu` (Metal GPU). Adding the third cost **4 lines of production code and no changes to the engine**.
+- **Implementations (Route A):** the `burn` framework across three backends — `burn-flex` (pure-Rust CPU), `burn-tch` (libtorch/CPU), and `burn-wgpu` (Metal GPU). Adding the third cost **4 lines of production code and no changes to the engine**. *Replacing* one CPU backend with another later touched 25 files — all of them the adapter, its examples, and the fuzz target, mostly mechanical renames — and **still not one line of the engine**, which is the claim the split exists to support.
 - **Future (documented, not built yet):** metamorphic oracles (autodiff vs. numerical gradient), and a second software type (SQL engines) as a second adapter on the same core.
