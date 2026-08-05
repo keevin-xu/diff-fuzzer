@@ -89,6 +89,90 @@ impl Source {
 pub struct Negative {
     pub case: TensorOp,
     pub source: Source,
+    /// **Which generator produced it** — not the same question as [`Source`].
+    ///
+    /// `Source` says how hard the negative is to satisfy. This says which *distribution* it
+    /// was drawn from, and the two are independent: a near-miss from a fuzzing run and a
+    /// near-miss from a seeded campaign are equally hard and come from entirely different
+    /// input distributions.
+    ///
+    /// **The search needs this to avoid learning the wrong thing.** Score fuzz-derived
+    /// findings against seeded negatives and the two pools differ on four axes — magnitude
+    /// 10 versus 1000, dimension 8 versus 64, special-value rate 0 versus 0.125, domains
+    /// unrestricted versus restricted. A rule separating those pools would score *perfectly*
+    /// while describing which generator ran, not what triggers a bug.
+    ///
+    /// Defaults to [`Provenance::Unknown`] when reading files written before this existed —
+    /// which is honest: their provenance genuinely is unrecorded, and a search should treat
+    /// them with suspicion rather than assume.
+    #[serde(default)]
+    pub provenance: Provenance,
+}
+
+/// Which generator a case came from.
+///
+/// Deliberately coarse. The question a search must answer is "were these drawn from the
+/// same distribution?", and a finer taxonomy would invite false confidence about pools that
+/// merely *look* similar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Provenance {
+    /// Bytes mutated by libFuzzer and decoded — a corpus-biased, evolving distribution.
+    Fuzzer,
+    /// The seeded generator at its default bounds.
+    SeededDefault,
+    /// The seeded generator at wide bounds — larger shapes and magnitudes.
+    SeededWide,
+    /// Built by hand for an experiment. Belongs to no distribution, which is exactly why
+    /// such cases are strong evidence individually and useless for distribution matching.
+    Constructed,
+    /// Recorded before provenance existed, or from a source that did not say.
+    #[default]
+    Unknown,
+}
+
+impl Provenance {
+    /// A short name, used in reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            Provenance::Fuzzer => "fuzzer",
+            Provenance::SeededDefault => "seeded-default",
+            Provenance::SeededWide => "seeded-wide",
+            Provenance::Constructed => "constructed",
+            Provenance::Unknown => "unknown",
+        }
+    }
+
+    /// Read from the `generator` string a `DivergenceReport` records.
+    ///
+    /// Parsing prose is unpleasant, and it is what the recorded field contains. Anything
+    /// unrecognised becomes `Unknown` rather than a guess.
+    pub fn from_generator(description: &str) -> Self {
+        if description.contains("fuzzer bytes") {
+            Provenance::Fuzzer
+        } else if description.contains("magnitude: 1000") || description.contains("max_dim: 64") {
+            Provenance::SeededWide
+        } else if description.starts_with("Bounds") {
+            Provenance::SeededDefault
+        } else {
+            Provenance::Unknown
+        }
+    }
+
+    /// Whether two pools may be scored against each other.
+    ///
+    /// **`Constructed` matches anything**: a hand-built near-miss is not drawn from a
+    /// distribution at all, so it cannot introduce a distributional confound. It is the one
+    /// kind of negative that is always safe to include.
+    ///
+    /// **`Unknown` matches nothing.** A pool whose origin was never recorded cannot be
+    /// shown to match, and assuming it does is precisely the leak this guard exists for.
+    pub fn comparable_with(self, other: Self) -> bool {
+        match (self, other) {
+            (Provenance::Unknown, _) | (_, Provenance::Unknown) => false,
+            (Provenance::Constructed, _) | (_, Provenance::Constructed) => true,
+            (a, b) => a == b,
+        }
+    }
 }
 
 /// Whether a case carries anything a trigger rule might plausibly key on.
@@ -142,13 +226,19 @@ pub fn is_interesting(case: &TensorOp) -> bool {
 /// Named by a hash of the case, so a case seen twice overwrites rather than accumulating —
 /// the same content-derived naming the findings use, and for the same reason: a directory
 /// that grows without bound stops being readable.
-pub fn save_case(directory: impl AsRef<Path>, case: &TensorOp, source: Source) -> io::Result<()> {
+pub fn save_case(
+    directory: impl AsRef<Path>,
+    case: &TensorOp,
+    source: Source,
+    provenance: Provenance,
+) -> io::Result<()> {
     let directory = directory.as_ref().join(source.label());
     std::fs::create_dir_all(&directory)?;
 
     let record = Negative {
         case: case.clone(),
         source,
+        provenance,
     };
     let path = directory.join(format!("neg-{}-{:x}.json", case.name(), digest(case)));
     std::fs::write(path, serde_json::to_string(&record)?)
@@ -157,7 +247,12 @@ pub fn save_case(directory: impl AsRef<Path>, case: &TensorOp, source: Source) -
 /// Write a batch of cases sharing one source, as a single file.
 ///
 /// For cases produced by a deliberate experiment, which are only meaningful read as a set.
-pub fn save_batch(path: impl AsRef<Path>, cases: &[TensorOp], source: Source) -> io::Result<()> {
+pub fn save_batch(
+    path: impl AsRef<Path>,
+    cases: &[TensorOp],
+    source: Source,
+    provenance: Provenance,
+) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -167,6 +262,7 @@ pub fn save_batch(path: impl AsRef<Path>, cases: &[TensorOp], source: Source) ->
         .map(|case| Negative {
             case: case.clone(),
             source,
+            provenance,
         })
         .collect();
     std::fs::write(path, serde_json::to_string_pretty(&records)?)
@@ -210,11 +306,13 @@ pub fn load(directory: impl AsRef<Path>) -> Vec<Negative> {
                 cases.extend(batch.into_iter().map(|case| Negative {
                     case,
                     source: Source::Constructed,
+                    provenance: Provenance::Constructed,
                 }));
             } else if let Ok(case) = serde_json::from_str::<TensorOp>(&text) {
                 cases.push(Negative {
                     case,
                     source: Source::Constructed,
+                    provenance: Provenance::Constructed,
                 });
             } else {
                 eprintln!("could not parse {} as a negative", path.display());
@@ -255,6 +353,125 @@ fn digest(case: &TensorOp) -> u64 {
     hasher.finish()
 }
 
+/// A set of negatives a candidate rule can be scored against.
+///
+/// Exists so the two rules that make scoring honest cannot be forgotten: **refuse to score
+/// across mismatched distributions**, and **report survival by source rather than as a
+/// total**.
+#[derive(Debug, Clone, Default)]
+pub struct Pool {
+    negatives: Vec<Negative>,
+}
+
+/// Why a pool could not be used, when it could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolError {
+    /// The positives and the negatives came from different generators.
+    ///
+    /// **Not a technicality.** The two distributions differ on magnitude, dimension,
+    /// special-value rate and domain restriction, so a rule separating them scores
+    /// perfectly while describing which generator ran. Declining is the correct output.
+    DistributionMismatch {
+        positives: Provenance,
+        negatives: Vec<Provenance>,
+    },
+    /// Nothing to score against. A rule that survives an empty set has survived nothing.
+    Empty,
+}
+
+impl std::fmt::Display for PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PoolError::DistributionMismatch {
+                positives,
+                negatives,
+            } => write!(
+                f,
+                "findings came from {} but the negatives are {} — scoring across these \
+                 would learn which generator produced a case, not what triggers a bug",
+                positives.label(),
+                negatives
+                    .iter()
+                    .map(|p| p.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            PoolError::Empty => write!(
+                f,
+                "no negatives; a rule surviving none has survived nothing"
+            ),
+        }
+    }
+}
+
+impl Pool {
+    /// Build a pool usable against findings of a given provenance.
+    ///
+    /// Keeps only negatives drawn from a comparable distribution, and **fails rather than
+    /// silently narrowing to nothing** — a search that quietly ends up with an empty pool
+    /// would report every candidate as surviving.
+    pub fn matched(all: Vec<Negative>, positives: Provenance) -> Result<Self, PoolError> {
+        let kept: Vec<Negative> = all
+            .into_iter()
+            .filter(|n| n.provenance.comparable_with(positives))
+            .collect();
+
+        if kept.is_empty() {
+            return Err(PoolError::Empty);
+        }
+        Ok(Self { negatives: kept })
+    }
+
+    /// Every negative, regardless of provenance. **For inspection, never for scoring.**
+    pub fn unchecked(all: Vec<Negative>) -> Self {
+        Self { negatives: all }
+    }
+
+    pub fn len(&self) -> usize {
+        self.negatives.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.negatives.is_empty()
+    }
+
+    pub fn cases(&self) -> impl Iterator<Item = &TensorOp> {
+        self.negatives.iter().map(|n| &n.case)
+    }
+
+    /// How many negatives of each source a rule failed to exclude.
+    ///
+    /// **Returned by source, never as a total, and that is the point.** "Survived 12
+    /// near-misses" and "survived 500 ordinary cases" are different claims about a rule's
+    /// strength, and a single number conflates them — which is the easiest way to satisfy a
+    /// gate's negative-result requirement by accident.
+    pub fn matched_by_source(
+        &self,
+        mut matches: impl FnMut(&TensorOp) -> bool,
+    ) -> Vec<(Source, usize, usize)> {
+        [
+            Source::NearMiss,
+            Source::Constructed,
+            Source::Interesting,
+            Source::Ordinary,
+        ]
+        .into_iter()
+        .filter_map(|source| {
+            let of_source: Vec<&Negative> = self
+                .negatives
+                .iter()
+                .filter(|n| n.source == source)
+                .collect();
+            if of_source.is_empty() {
+                return None;
+            }
+            let hit = of_source.iter().filter(|n| matches(&n.case)).count();
+            Some((source, hit, of_source.len()))
+        })
+        .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,7 +490,7 @@ mod tests {
     #[test]
     fn a_saved_case_loads_back_with_its_source() {
         let dir = temp_dir("roundtrip");
-        save_case(&dir, &case(1.5), Source::NearMiss).expect("writable");
+        save_case(&dir, &case(1.5), Source::NearMiss, Provenance::Fuzzer).expect("writable");
 
         let loaded = load(&dir);
         assert_eq!(loaded.len(), 1);
@@ -287,8 +504,8 @@ mod tests {
     #[test]
     fn saving_the_same_case_twice_leaves_one_file() {
         let dir = temp_dir("dedup");
-        save_case(&dir, &case(2.0), Source::Ordinary).expect("writable");
-        save_case(&dir, &case(2.0), Source::Ordinary).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
 
         assert_eq!(load(&dir).len(), 1);
     }
@@ -296,9 +513,9 @@ mod tests {
     #[test]
     fn sources_are_kept_apart_on_disk_and_counted_separately() {
         let dir = temp_dir("sources");
-        save_case(&dir, &case(1.0), Source::NearMiss).expect("writable");
-        save_case(&dir, &case(2.0), Source::Ordinary).expect("writable");
-        save_case(&dir, &case(3.0), Source::Ordinary).expect("writable");
+        save_case(&dir, &case(1.0), Source::NearMiss, Provenance::Fuzzer).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
+        save_case(&dir, &case(3.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
 
         let counts = by_source(&load(&dir));
         assert_eq!(counts, vec![(Source::NearMiss, 1), (Source::Ordinary, 2)]);
@@ -324,6 +541,114 @@ mod tests {
     }
 
     // --- the stratification test ---------------------------------------------------
+
+    // --- the pool: distribution matching and survival reporting ---------------------
+
+    fn negative(value: f32, source: Source, provenance: Provenance) -> Negative {
+        Negative {
+            case: case(value),
+            source,
+            provenance,
+        }
+    }
+
+    /// **The leak this guard exists to prevent.** Fuzz findings and seeded negatives differ
+    /// on magnitude, dimension, special-value rate and domain restriction — a rule
+    /// separating those pools would score *perfectly* while describing which generator ran.
+    #[test]
+    fn a_pool_refuses_to_mix_distributions() {
+        let seeded = vec![negative(1.0, Source::Ordinary, Provenance::SeededWide)];
+
+        let result = Pool::matched(seeded, Provenance::Fuzzer);
+        assert_eq!(result.unwrap_err(), PoolError::Empty);
+    }
+
+    /// Mismatched negatives are dropped, not silently tolerated — and if nothing survives
+    /// the filter, the pool **fails** rather than becoming an empty set that every
+    /// candidate would trivially survive.
+    #[test]
+    fn mismatched_negatives_are_excluded_and_matching_ones_kept() {
+        let mixed = vec![
+            negative(1.0, Source::Ordinary, Provenance::Fuzzer),
+            negative(2.0, Source::Ordinary, Provenance::SeededWide),
+        ];
+
+        let pool = Pool::matched(mixed, Provenance::Fuzzer).expect("one matches");
+        assert_eq!(pool.len(), 1);
+    }
+
+    /// **Hand-built cases belong to no distribution**, so they cannot introduce a
+    /// distributional confound and are always safe to score against. They are also the
+    /// strongest negatives available, which makes excluding them costly.
+    #[test]
+    fn constructed_negatives_are_comparable_with_anything() {
+        let built = vec![negative(1.0, Source::Constructed, Provenance::Constructed)];
+
+        assert!(Pool::matched(built.clone(), Provenance::Fuzzer).is_ok());
+        assert!(Pool::matched(built, Provenance::SeededWide).is_ok());
+    }
+
+    /// **An unrecorded origin cannot be shown to match**, and assuming it does is exactly
+    /// the leak. Negatives written before provenance existed land here.
+    #[test]
+    fn negatives_of_unknown_origin_are_never_comparable() {
+        let unknown = vec![negative(1.0, Source::Ordinary, Provenance::Unknown)];
+
+        assert_eq!(
+            Pool::matched(unknown, Provenance::Fuzzer).unwrap_err(),
+            PoolError::Empty
+        );
+        assert!(!Provenance::Unknown.comparable_with(Provenance::Unknown));
+    }
+
+    /// **Survival is reported per source, never as a total.** "Survived 12 near-misses" and
+    /// "survived 500 ordinary cases" are different claims about a rule's strength, and one
+    /// number conflates them.
+    #[test]
+    fn survival_is_reported_by_source_rather_than_as_a_total() {
+        let pool = Pool::unchecked(vec![
+            negative(1.0, Source::NearMiss, Provenance::Fuzzer),
+            negative(2.0, Source::Ordinary, Provenance::Fuzzer),
+            negative(3.0, Source::Ordinary, Provenance::Fuzzer),
+        ]);
+
+        // A rule that fires on everything: the breakdown must show both sources separately.
+        let breakdown = pool.matched_by_source(|_| true);
+
+        assert_eq!(
+            breakdown,
+            vec![(Source::NearMiss, 1, 1), (Source::Ordinary, 2, 2)]
+        );
+    }
+
+    /// A source with no members is omitted rather than reported as `0 of 0`, which reads as
+    /// a rule having survived something it was never tested against.
+    #[test]
+    fn a_source_with_no_negatives_is_omitted_from_the_breakdown() {
+        let pool = Pool::unchecked(vec![negative(1.0, Source::NearMiss, Provenance::Fuzzer)]);
+
+        let breakdown = pool.matched_by_source(|_| false);
+        assert_eq!(breakdown, vec![(Source::NearMiss, 0, 1)]);
+    }
+
+    /// Provenance is read from the string a report actually records.
+    #[test]
+    fn provenance_is_recognised_from_a_recorded_generator_description() {
+        assert_eq!(
+            Provenance::from_generator("decoded from fuzzer bytes"),
+            Provenance::Fuzzer
+        );
+        assert_eq!(
+            Provenance::from_generator("Bounds { max_rank: 3, max_dim: 64, magnitude: 1000.0 }"),
+            Provenance::SeededWide
+        );
+        assert_eq!(
+            Provenance::from_generator("Bounds { max_rank: 4, max_dim: 8, magnitude: 10.0 }"),
+            Provenance::SeededDefault
+        );
+        // Anything unrecognised becomes Unknown rather than a guess.
+        assert_eq!(Provenance::from_generator("who knows"), Provenance::Unknown);
+    }
 
     #[test]
     fn ordinary_values_are_not_interesting() {

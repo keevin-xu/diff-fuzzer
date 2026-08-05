@@ -327,7 +327,12 @@ fn write_negatives(cases: &[(String, TensorOp)]) {
     let path = format!("{dir}/batched_probe.json");
     // Recorded as `Constructed`: built by hand to probe a specific hypothesis, which makes
     // them stronger evidence than anything sampled and worth distinguishing in a report.
-    match negatives::save_batch(&path, &only_cases, Source::Constructed) {
+    match negatives::save_batch(
+        &path,
+        &only_cases,
+        Source::Constructed,
+        negatives::Provenance::Constructed,
+    ) {
         Ok(()) => println!("\n{} non-diverging case(s) written to {path}", cases.len()),
         Err(error) => eprintln!("\ncould not write {path}: {error}"),
     }

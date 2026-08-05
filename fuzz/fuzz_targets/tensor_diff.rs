@@ -289,7 +289,8 @@ fn save_negative(case: &TensorOp, source: negatives::Source) {
         env!("CARGO_MANIFEST_DIR"),
         run_label()
     );
-    let _ = negatives::save_case(&directory, case, source);
+    // The fuzz target's cases always come from decoded fuzzer bytes.
+    let _ = negatives::save_case(&directory, case, source, negatives::Provenance::Fuzzer);
 }
 
 /// Which run's directory this process should file its findings under.
