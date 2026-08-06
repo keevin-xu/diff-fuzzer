@@ -14,7 +14,7 @@
 
 use crate::ast::SqlCase;
 use crate::backends::{DuckDbImpl, SqliteImpl};
-use crate::generator::FixedCaseGenerator;
+use crate::generator::SqlGenerator;
 use crate::normalize::{CanonicalResult, SqlNormalizer};
 use crate::oracle::SqlDifferentialOracle;
 use diff_fuzzer_core::driver::{RunOutcome, run_once};
@@ -37,7 +37,12 @@ pub fn check_case(seed: u64) -> RunOutcome {
     // driver iterates over this without knowing either engine exists.
     let runners: [&dyn Runner<In = SqlCase, Canon = CanonicalResult>; 2] = [&sqlite, &duckdb];
 
-    run_once(seed, &FixedCaseGenerator, &runners, &SqlDifferentialOracle)
+    run_once(
+        seed,
+        &SqlGenerator::default(),
+        &runners,
+        &SqlDifferentialOracle,
+    )
 }
 
 #[cfg(test)]

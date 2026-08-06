@@ -175,35 +175,67 @@ fn generate_scalar(
                 let column = matching[rng.random_range(0..matching.len())];
                 Expr::Column(reference(table, &column.name))
             } else if choice < 85 {
-                // Arithmetic, which brings overflow with it — `i64::MAX + 1` is in reach
-                // because the value pool contains `i64::MAX` deliberately. The engines may
-                // well disagree about overflow; that is a *candidate finding*, not a
-                // validity problem, and S4 decides whether it is legal.
+                // Arithmetic, over **small literals only, and never nested**.
+                //
+                // Measured, not guessed: with column operands and the interesting-value
+                // pool in play, `i64::MAX + 1` is reachable — and the engines then part
+                // company. SQLite silently promotes the overflowed result to `REAL`
+                // (observed: `Real(9.223372036854776e18)`), while DuckDB raises a
+                // conversion error. Both behaviours are plausible and neither is obviously
+                // wrong, so this is a legal-difference question, not a bug — and it
+                // accounted for *every* unjudged case in a 10,000-case run.
+                //
+                // Bounding both operands to ±100 with no nesting caps any result at 10,000,
+                // inside even a 32-bit column. That trades away overflow coverage
+                // deliberately: it is a rich area (`PENDING` 2.6) and it comes back at S4 as
+                // a *catalogued* experiment, once each engine's behaviour is cited rather
+                // than observed. Keeping it now would mean an oracle whose noisiest signal
+                // is a difference we cannot yet defend.
                 Expr::Binary {
                     op: match rng.random_range(0..3) {
                         0 => BinaryOp::Add,
                         1 => BinaryOp::Subtract,
                         _ => BinaryOp::Multiply,
                     },
-                    left: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
-                    right: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
+                    left: Box::new(Expr::Literal(crate::schema::Literal::Integer(
+                        rng.random_range(-100..=100),
+                    ))),
+                    right: Box::new(Expr::Literal(crate::schema::Literal::Integer(
+                        rng.random_range(-100..=100),
+                    ))),
                 }
             } else if choice < 92 {
+                // Negation, over a small literal for the same reason: `-(i32::MIN)` has no
+                // representation in 32 bits, and the two engines need not agree on what to
+                // do about that.
                 Expr::Unary {
                     op: UnaryOp::Negate,
-                    operand: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
+                    operand: Box::new(Expr::Literal(crate::schema::Literal::Integer(
+                        rng.random_range(-100..=100),
+                    ))),
                 }
             } else {
-                // A cast, but only between the integer widths — a widening that cannot
-                // fail. `CAST(text AS INTEGER)` is exactly where the engines are documented
-                // to differ (`SPECS.md` §5.5, unretrieved), so it is not generated.
+                // A cast, and only ever a **widening** one.
+                //
+                // The first version of this generated either integer width as the target
+                // and called it "a widening that cannot fail". That was wrong, and running
+                // it said so: `CAST(<bigint> AS INTEGER)` is a *narrowing* cast, which
+                // DuckDB refuses when the value exceeds `INT32` while SQLite accepts it —
+                // DuckDB's `INTEGER` is four bytes, SQLite's storage class is variable
+                // width (`SPECS.md` §2.1, §3.4). Every remaining one-sided refusal in a
+                // 2,000-case run was this.
+                //
+                // `CAST(text AS INTEGER)` is a separate documented difference
+                // (`SPECS.md` §5.5, unretrieved) and is not generated at all.
                 Expr::Cast {
-                    expr: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
-                    to: if rng.random_range(0..2) == 0 {
-                        SqlType::Integer
-                    } else {
-                        SqlType::BigInt
-                    },
+                    expr: Box::new(generate_scalar(
+                        rng,
+                        table,
+                        SqlType::Integer,
+                        bounds,
+                        depth + 1,
+                    )),
+                    to: SqlType::BigInt,
                 }
             }
         }

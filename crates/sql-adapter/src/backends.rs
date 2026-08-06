@@ -22,6 +22,7 @@
 
 use crate::ast::SqlCase;
 use crate::outcome::{Cell, ErrorClass, SqlOutcome};
+use crate::render::Dialect;
 use diff_fuzzer_core::traits::{Implementation, RunError};
 
 /// How SQLite identifies itself in findings, negatives, and reports.
@@ -58,14 +59,23 @@ impl Implementation for SqliteImpl {
         let conn = rusqlite::Connection::open_in_memory()
             .map_err(|error| setup_failed(SQLITE_NAME, error))?;
 
-        for statement in case.schema.iter().chain(case.data.iter()) {
+        // The case is a tree; this is where it becomes text, spelled the way *this* engine
+        // spells things. Both engines render from one definition of execution order, so
+        // neither can differ merely by applying the case differently.
+        let statements = case.statements(Dialect::Sqlite);
+        let (setup, query) = statements
+            .split_last()
+            .map(|(query, setup)| (setup, query))
+            .expect("a case always renders at least the query");
+
+        for statement in setup {
             conn.execute(statement, [])
                 .map_err(|error| setup_failed(SQLITE_NAME, error))?;
         }
 
         // From here on, a complaint from the engine is an *answer*: the query was put to
         // it and refused.
-        let mut prepared = match conn.prepare(&case.query) {
+        let mut prepared = match conn.prepare(query) {
             Ok(prepared) => prepared,
             Err(_) => return Ok(SqlOutcome::Error(ErrorClass::Other)),
         };
@@ -120,12 +130,18 @@ impl Implementation for DuckDbImpl {
         let conn = duckdb::Connection::open_in_memory()
             .map_err(|error| setup_failed(DUCKDB_NAME, error))?;
 
-        for statement in case.schema.iter().chain(case.data.iter()) {
+        let statements = case.statements(Dialect::DuckDb);
+        let (setup, query) = statements
+            .split_last()
+            .map(|(query, setup)| (setup, query))
+            .expect("a case always renders at least the query");
+
+        for statement in setup {
             conn.execute(statement, [])
                 .map_err(|error| setup_failed(DUCKDB_NAME, error))?;
         }
 
-        let mut prepared = match conn.prepare(&case.query) {
+        let mut prepared = match conn.prepare(query) {
             Ok(prepared) => prepared,
             Err(_) => return Ok(SqlOutcome::Error(ErrorClass::Other)),
         };
@@ -243,6 +259,7 @@ fn duckdb_cell(value: duckdb::types::Value) -> Result<Cell, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{ColumnRef, Expr};
 
     /// The constants must equal what the implementations actually report.
     ///
@@ -313,14 +330,21 @@ mod tests {
     }
 
     /// A query the engine refuses is an *answer*, not a failure to run.
+    ///
+    /// The case is built by hand rather than generated, and would fail `validate()` — which
+    /// is the point. The generator cannot produce an unresolvable column reference, so the
+    /// only way to reach this path deliberately is to construct one.
     #[test]
     fn a_refused_query_is_an_outcome_not_a_run_error() {
-        let case = SqlCase {
-            schema: vec!["CREATE TABLE t (a INTEGER)".to_string()],
-            data: vec![],
-            // `no_such_column` resolves against nothing: both engines refuse it.
-            query: "SELECT no_such_column FROM t".to_string(),
-        };
+        let mut case = SqlCase::fixed_example();
+        case.query.projection = vec![Expr::Column(ColumnRef {
+            table: "t0".to_string(),
+            column: "no_such_column".to_string(),
+        })];
+        assert!(
+            case.validate().is_err(),
+            "this case is deliberately invalid"
+        );
 
         assert_eq!(
             SqliteImpl
@@ -337,13 +361,14 @@ mod tests {
     }
 
     /// Setup failing is different: the query never ran, so there is nothing to compare.
+    ///
+    /// A table with no columns renders as `CREATE TABLE "t0" ()`, which neither engine
+    /// accepts — the shortest route to a setup failure now that the renderer makes
+    /// malformed SQL otherwise unreachable.
     #[test]
     fn a_broken_schema_is_a_run_error() {
-        let case = SqlCase {
-            schema: vec!["CREATE TABLE (this is not sql".to_string()],
-            data: vec![],
-            query: "SELECT 1".to_string(),
-        };
+        let mut case = SqlCase::fixed_example();
+        case.schema[0].columns.clear();
 
         assert!(matches!(
             SqliteImpl.run(&case),

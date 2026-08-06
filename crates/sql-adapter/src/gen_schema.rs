@@ -70,8 +70,26 @@ impl Bounds {
     }
 }
 
-/// Integer values worth trying, beyond whatever uniform sampling produces.
-const INTERESTING_INTEGERS: [i64; 7] = [0, 1, -1, 2, -2, i64::MAX, i64::MIN];
+/// Integer values worth trying, **for a 64-bit `BIGINT` column**.
+const INTERESTING_BIGINTS: [i64; 7] = [0, 1, -1, 2, -2, i64::MAX, i64::MIN];
+
+/// Integer values worth trying, **for a 32-bit `INTEGER` column**.
+///
+/// # The engines do not agree on what `INTEGER` means
+///
+/// DuckDB's `INTEGER` is `INT4` — four bytes, range −2³¹ to 2³¹−1. SQLite's `INTEGER` is a
+/// storage class of variable width, "stored in 0, 1, 2, 3, 4, 6, or 8 bytes depending on the
+/// magnitude of the value" — so it swallows a 64-bit value happily.
+///
+/// This was found by *running*: a generated case put `i64::MIN` in an `INTEGER` column,
+/// SQLite accepted it, and DuckDB refused the `INSERT` with a conversion error. The case
+/// was then skipped rather than judged, which is the correct outcome and a useless one —
+/// a case neither engine judged teaches nothing.
+///
+/// The fix is correct-by-construction rather than a catalog entry: a literal is drawn from
+/// **its declared column's range**, so an `INTEGER` column never sees a value that only one
+/// engine can store. Cited in `SPECS.md` §2.1, §3.4 and §4.4.
+const INTERESTING_INTS: [i64; 7] = [0, 1, -1, 2, -2, i32::MAX as i64, i32::MIN as i64];
 
 /// Text values worth trying.
 ///
@@ -157,13 +175,20 @@ pub fn generate_literal(rng: &mut SeededRng, sql_type: SqlType) -> Literal {
     }
 
     match sql_type {
+        // The pool differs by declared width, because the engines do not agree on what
+        // `INTEGER` holds — see [`INTERESTING_INTS`]. Drawing from the column's own range is
+        // what keeps a case judgeable by both engines instead of skipped by one.
         SqlType::Integer | SqlType::BigInt => {
+            let pool: &[i64] = if sql_type == SqlType::Integer {
+                &INTERESTING_INTS
+            } else {
+                &INTERESTING_BIGINTS
+            };
+
             // Mostly from the pool, sometimes an arbitrary value — the pool finds edges,
             // arbitrary values find everything the pool's author did not think of.
             if rng.random_range(0..100) < 75 {
-                Literal::Integer(
-                    INTERESTING_INTEGERS[rng.random_range(0..INTERESTING_INTEGERS.len())],
-                )
+                Literal::Integer(pool[rng.random_range(0..pool.len())])
             } else {
                 Literal::Integer(rng.random_range(-1000..=1000))
             }
@@ -337,7 +362,13 @@ mod tests {
                         Literal::Text(text) if text.is_empty() => saw_empty_text = true,
                         Literal::Text(text) if text == "NULL" => saw_the_text_null = true,
                         Literal::Text(text) if text == "'" => saw_quote = true,
-                        Literal::Integer(number) if *number == i64::MAX || *number == i64::MIN => {
+                        // Both widths' boundaries count: a 32-bit column's extremes are as
+                        // much an edge as a 64-bit column's, and after the INTEGER/BIGINT
+                        // discovery they are what an `INTEGER` column actually receives.
+                        Literal::Integer(number)
+                            if [i64::MAX, i64::MIN, i32::MAX as i64, i32::MIN as i64]
+                                .contains(number) =>
+                        {
                             saw_extreme_integer = true;
                         }
                         _ => {}

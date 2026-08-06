@@ -1,39 +1,63 @@
 //! Producing cases to test.
 //!
-//! **This is a placeholder, and it is the largest thing still missing.** Real generation —
-//! a schema, seeded rows, and a type-aware query built so that every case is valid by
-//! construction — is S2, and it is the single biggest piece of domain knowledge in this
-//! adapter. What lives here now returns one fixed case, which is enough to prove that a
-//! case can travel through every seam.
+//! The two halves live in [`crate::gen_schema`] and [`crate::gen_query`]; this binds them
+//! to the engine's [`Generator`] seam and fixes the order they run in — **state first, then
+//! a query against that state**. The order is the whole reason cases are valid by
+//! construction: a query built with the schema and data in hand can only reference columns
+//! that exist, at types that match, and can only carry a `LIMIT` when the rows it will
+//! order are actually distinct.
 //!
-//! The trait is bound now rather than later for one reason: it makes the shape of the
-//! eventual work visible. `generate` receives `&mut SeededRng` and nothing else, so every
-//! choice a real generator makes must come from that seed — which is what makes a run
-//! replayable.
+//! `generate` receives `&mut SeededRng` and nothing else, so every choice traces back to
+//! one 64-bit seed. That is what makes a run replayable — though a finding still records
+//! the whole case rather than the seed, because a seed only reproduces a case for the exact
+//! generator that produced it, and generators change.
 
 use crate::ast::SqlCase;
+use crate::gen_query::generate_query;
+use crate::gen_schema::{Bounds, generate_data, generate_schema};
 use diff_fuzzer_core::rng::SeededRng;
 use diff_fuzzer_core::traits::Generator;
 
-/// Returns one fixed case, ignoring the seed.
-///
-/// Named for what it is. A type called `SqlGenerator` that generated nothing would be a
-/// small lie that survives until someone trusts it.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FixedCaseGenerator;
+/// Generates valid `SqlCase`s within [`Bounds`].
+#[derive(Debug, Clone, Copy)]
+pub struct SqlGenerator {
+    bounds: Bounds,
+}
 
-impl Generator for FixedCaseGenerator {
+impl SqlGenerator {
+    pub fn new(bounds: Bounds) -> Self {
+        Self { bounds }
+    }
+
+    /// The bounds in force, which a report must record beside any finding.
+    ///
+    /// Two cases drawn under different bounds come from different distributions, even
+    /// though both would describe themselves as "generated" — which is how the tensor
+    /// domain ended up scoring findings against a pool that was not comparable to them.
+    pub fn description(&self) -> String {
+        self.bounds.description()
+    }
+}
+
+impl Default for SqlGenerator {
+    fn default() -> Self {
+        Self::new(Bounds::V1)
+    }
+}
+
+impl Generator for SqlGenerator {
     type In = SqlCase;
 
-    /// The `rng` is deliberately unused, and the underscore says so at the call site.
-    ///
-    /// Not a stub to be filled in — S2 replaces this type entirely. Until then, every
-    /// seed produces the same case, which makes the determinism test at S1.8 true but
-    /// weak: it proves the *pipeline* is deterministic, not the generator, because there
-    /// is no generator yet. Saying so is the point; a determinism test that passes because
-    /// nothing varies would otherwise read as evidence it is not.
-    fn generate(&self, _rng: &mut SeededRng) -> SqlCase {
-        SqlCase::fixed_example()
+    fn generate(&self, rng: &mut SeededRng) -> SqlCase {
+        let schema = generate_schema(rng, self.bounds);
+        let data = generate_data(rng, &schema, self.bounds);
+        let query = generate_query(rng, &schema, &data, self.bounds);
+
+        SqlCase {
+            schema,
+            data,
+            query,
+        }
     }
 }
 
@@ -41,18 +65,45 @@ impl Generator for FixedCaseGenerator {
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_seed_produces_the_fixed_case_for_now() {
-        let mut first = SeededRng::from_seed(1);
-        let mut second = SeededRng::from_seed(999_999);
+    fn generate(seed: u64) -> SqlCase {
+        SqlGenerator::default().generate(&mut SeededRng::from_seed(seed))
+    }
 
-        assert_eq!(
-            FixedCaseGenerator.generate(&mut first),
-            FixedCaseGenerator.generate(&mut second)
+    #[test]
+    fn the_same_seed_gives_the_same_case() {
+        // The real determinism test, which S1's placeholder could not be: different seeds
+        // now genuinely produce different cases, so this asserts something.
+        for seed in [0, 1, 42, 9_999] {
+            assert_eq!(generate(seed), generate(seed));
+        }
+    }
+
+    #[test]
+    fn different_seeds_give_different_cases() {
+        let distinct = (0..50)
+            .map(|seed| serde_json::to_string(&generate(seed)).expect("serializes"))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct > 40,
+            "only {distinct} distinct cases from 50 seeds"
         );
+    }
+
+    #[test]
+    fn every_generated_case_validates() {
+        for seed in 0..500 {
+            generate(seed)
+                .validate()
+                .unwrap_or_else(|problem| panic!("seed {seed}: {problem}"));
+        }
+    }
+
+    #[test]
+    fn the_description_names_the_bounds_in_force() {
         assert_eq!(
-            FixedCaseGenerator.generate(&mut first),
-            SqlCase::fixed_example()
+            SqlGenerator::default().description(),
+            Bounds::V1.description()
         );
     }
 }

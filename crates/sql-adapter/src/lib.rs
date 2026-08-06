@@ -57,6 +57,8 @@ pub mod oracle;
 pub mod ordering;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
+/// Turning the tree into SQL text, once per engine.
+pub mod render;
 /// The typed tree a case is made of: types, tables, values, expressions, one query.
 pub mod schema;
 /// An engine that is wrong on purpose, so "found nothing" can mean something.
