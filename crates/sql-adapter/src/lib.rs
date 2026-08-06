@@ -43,6 +43,8 @@ pub mod ast;
 pub mod backends;
 /// Running one case end to end: generate, run both engines, normalize, judge.
 pub mod driver;
+/// Turning an engine's complaint into a class, so wording is never compared.
+pub mod errors;
 /// Generating the query, against a schema and data that already exist.
 pub mod gen_query;
 /// Generating the state a query runs against: tables, and the rows in them.

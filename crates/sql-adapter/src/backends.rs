@@ -21,7 +21,8 @@
 //! must not be quietly filed alongside "could not run".
 
 use crate::ast::SqlCase;
-use crate::outcome::{Cell, ErrorClass, SqlOutcome};
+use crate::errors::classify;
+use crate::outcome::{Cell, SqlOutcome};
 use crate::render::Dialect;
 use diff_fuzzer_core::traits::{Implementation, RunError};
 
@@ -77,12 +78,14 @@ impl Implementation for SqliteImpl {
         // it and refused.
         let mut prepared = match conn.prepare(query) {
             Ok(prepared) => prepared,
-            Err(_) => return Ok(SqlOutcome::Error(ErrorClass::Other)),
+            // The engine's own words, reduced to a class. Comparing the words themselves
+            // would report wording as a divergence.
+            Err(error) => return Ok(SqlOutcome::Error(classify(&error.to_string()))),
         };
 
         let mut rows = match prepared.query([]) {
             Ok(rows) => rows,
-            Err(_) => return Ok(SqlOutcome::Error(ErrorClass::Other)),
+            Err(error) => return Ok(SqlOutcome::Error(classify(&error.to_string()))),
         };
 
         // Taken *after* running the query, not before — see the note on the DuckDB
@@ -143,12 +146,14 @@ impl Implementation for DuckDbImpl {
 
         let mut prepared = match conn.prepare(query) {
             Ok(prepared) => prepared,
-            Err(_) => return Ok(SqlOutcome::Error(ErrorClass::Other)),
+            // The engine's own words, reduced to a class. Comparing the words themselves
+            // would report wording as a divergence.
+            Err(error) => return Ok(SqlOutcome::Error(classify(&error.to_string()))),
         };
 
         let mut rows = match prepared.query([]) {
             Ok(rows) => rows,
-            Err(_) => return Ok(SqlOutcome::Error(ErrorClass::Other)),
+            Err(error) => return Ok(SqlOutcome::Error(classify(&error.to_string()))),
         };
 
         // **After** the query, not before. DuckDB's `Statement::column_count()` panics
@@ -259,6 +264,7 @@ fn duckdb_cell(value: duckdb::types::Value) -> Result<Cell, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outcome::ErrorClass;
     use crate::schema::{ColumnRef, Expr};
 
     /// The constants must equal what the implementations actually report.
