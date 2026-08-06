@@ -43,6 +43,8 @@ pub mod ast;
 pub mod backends;
 /// Turning what an engine returned into a comparable canonical form.
 pub mod normalize;
+/// Deciding whether the engines disagreed.
+pub mod oracle;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
 
