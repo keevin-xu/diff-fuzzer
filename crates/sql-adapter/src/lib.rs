@@ -43,6 +43,8 @@ pub mod ast;
 pub mod backends;
 /// Running one case end to end: generate, run both engines, normalize, judge.
 pub mod driver;
+/// Generating the query, against a schema and data that already exist.
+pub mod gen_query;
 /// Generating the state a query runs against: tables, and the rows in them.
 pub mod gen_schema;
 /// Producing cases to test. A placeholder until S2.
@@ -51,6 +53,8 @@ pub mod generator;
 pub mod normalize;
 /// Deciding whether the engines disagreed.
 pub mod oracle;
+/// Whether a query's `ORDER BY` actually orders the rows of this case.
+pub mod ordering;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
 /// The typed tree a case is made of: types, tables, values, expressions, one query.

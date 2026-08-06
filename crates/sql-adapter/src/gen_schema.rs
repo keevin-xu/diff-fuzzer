@@ -38,6 +38,12 @@ pub struct Bounds {
     pub max_tables: usize,
     pub max_columns: usize,
     pub max_rows: usize,
+    /// How deeply expressions may nest.
+    ///
+    /// Bounds *size*, which bounds runtime and how painful minimization is. Note that
+    /// bounding each knob does not bound the case: depth is exponential in node count, so
+    /// this number is small on purpose.
+    pub max_expr_depth: usize,
 }
 
 impl Bounds {
@@ -49,6 +55,7 @@ impl Bounds {
         max_tables: 2,
         max_columns: 4,
         max_rows: 8,
+        max_expr_depth: 3,
     };
 
     /// A description that names the parameters, for recording alongside a case.
@@ -57,8 +64,8 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={})",
-            self.max_tables, self.max_columns, self.max_rows
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={})",
+            self.max_tables, self.max_columns, self.max_rows, self.max_expr_depth
         )
     }
 }
@@ -193,6 +200,7 @@ mod tests {
         assert!(description.contains(&Bounds::V1.max_tables.to_string()));
         assert!(description.contains(&Bounds::V1.max_columns.to_string()));
         assert!(description.contains(&Bounds::V1.max_rows.to_string()));
+        assert!(description.contains(&Bounds::V1.max_expr_depth.to_string()));
 
         let wider = Bounds {
             max_rows: Bounds::V1.max_rows + 1,
