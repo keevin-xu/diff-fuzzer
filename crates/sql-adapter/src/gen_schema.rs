@@ -38,6 +38,14 @@ pub struct Bounds {
     pub max_tables: usize,
     pub max_columns: usize,
     pub max_rows: usize,
+    /// Whether the generator may emit aggregates and `GROUP BY`.
+    ///
+    /// The first widening past the v1 subset, and pointed where DuckDB plausibly differs
+    /// from SQLite: it is an analytics engine, and grouping is its home ground. `NULL`
+    /// handling inside aggregates is the classic place engines part company — `COUNT(x)`
+    /// skips `NULL`s while `COUNT(*)` does not, and an aggregate over *no* rows has to
+    /// decide what to return.
+    pub aggregates: bool,
     /// Whether arithmetic may overflow.
     ///
     /// `false` (v1) bounds arithmetic to small literals so a result cannot leave any
@@ -69,6 +77,14 @@ impl Bounds {
         max_rows: 8,
         max_expr_depth: 3,
         wide_arithmetic: false,
+        aggregates: false,
+    };
+
+    /// V1 plus aggregates and `GROUP BY`. One axis, as always, so a difference in yield is
+    /// attributable to this change and nothing else.
+    pub const V1_AGGREGATES: Bounds = Bounds {
+        aggregates: true,
+        ..Bounds::V1
     };
 
     /// V1 with overflow reachable. Everything else identical, so a difference in yield
@@ -85,12 +101,13 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={})",
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={})",
             self.max_tables,
             self.max_columns,
             self.max_rows,
             self.max_expr_depth,
-            self.wide_arithmetic
+            self.wide_arithmetic,
+            self.aggregates
         )
     }
 }
@@ -256,6 +273,10 @@ mod tests {
         assert_ne!(
             Bounds::V1.description(),
             Bounds::V1_WIDE_ARITHMETIC.description()
+        );
+        assert_ne!(
+            Bounds::V1.description(),
+            Bounds::V1_AGGREGATES.description()
         );
 
         let wider = Bounds {

@@ -68,6 +68,7 @@ fn main() {
     // be measured against each other rather than one being chosen by argument.
     let bounds = match arguments.next().as_deref() {
         Some("wide") => sql_adapter::gen_schema::Bounds::V1_WIDE_ARITHMETIC,
+        Some("aggregates") => sql_adapter::gen_schema::Bounds::V1_AGGREGATES,
         _ => sql_adapter::gen_schema::Bounds::V1,
     };
 

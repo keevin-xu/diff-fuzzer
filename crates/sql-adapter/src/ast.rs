@@ -86,6 +86,22 @@ impl SqlCase {
     /// case rather than to the query, because ties in the data are what break a total order
     /// — see [`crate::ordering`].
     pub fn is_totally_ordered(&self) -> bool {
+        // **A grouped or aggregated query is never treated as totally ordered.**
+        //
+        // `orders_rows_totally` asks whether the *seeded rows* tie on the ordering columns —
+        // but a grouped query does not return seeded rows, it returns one row per group, and
+        // an aggregate with no `GROUP BY` returns exactly one row from all of them. The
+        // question the function answers is simply not the question being asked.
+        //
+        // Rather than teach it to compute groups, take the safe answer: not ordered, so both
+        // sides are sorted before comparing and no `LIMIT` is ever attached. Being wrong this
+        // way costs the ability to catch an ordering bug in a grouped query; being wrong the
+        // other way would invent divergences on every grouped query with a tie. The first is
+        // a gap, the second is noise that would swamp the oracle.
+        if !self.query.group_by.is_empty() || self.aggregates() {
+            return false;
+        }
+
         match self.queried_table() {
             Some(table) => crate::ordering::orders_rows_totally(
                 &self.query.order_by,
@@ -94,6 +110,14 @@ impl SqlCase {
             ),
             None => false,
         }
+    }
+
+    /// Does the query aggregate — collapsing many rows into one?
+    pub fn aggregates(&self) -> bool {
+        self.query
+            .projection
+            .iter()
+            .any(crate::schema::Expr::contains_aggregate)
     }
 
     /// A small fixed case, for tests that need a known answer rather than a generated one.
@@ -135,6 +159,7 @@ impl SqlCase {
             query: SelectStmt {
                 projection: vec![Expr::Column(reference("c0")), Expr::Column(reference("c1"))],
                 from: "t0".to_string(),
+                group_by: vec![],
                 filter: Some(Expr::Binary {
                     op: crate::schema::BinaryOp::Greater,
                     left: Box::new(Expr::Column(reference("c0"))),
@@ -220,6 +245,45 @@ impl SqlCase {
             }
         }
 
+        // Grouping rules. SQLite permits a bare column alongside an aggregate without
+        // grouping by it (picking an arbitrary row); DuckDB refuses. Generating only the
+        // strict form is what both accept — so this is a validity rule here, not a legal
+        // difference to catalog.
+        if !self.query.group_by.is_empty() {
+            for key in &self.query.group_by {
+                if key.table != table.name || table.column(&key.column).is_none() {
+                    return Err(format!(
+                        "GROUP BY names {}.{}, which is not a column of {}",
+                        key.table, key.column, table.name
+                    ));
+                }
+            }
+            for expression in &self.query.projection {
+                let grouped_column = match expression {
+                    crate::schema::Expr::Column(reference) => {
+                        self.query.group_by.iter().any(|key| key == reference)
+                    }
+                    _ => false,
+                };
+                if !grouped_column && !expression.contains_aggregate() {
+                    return Err(
+                        "a grouped query may project only its grouping columns and aggregates"
+                            .to_string(),
+                    );
+                }
+            }
+        } else if self.aggregates() {
+            // Mixing an aggregate with a bare column and no `GROUP BY` is the same trap.
+            for expression in &self.query.projection {
+                if !expression.contains_aggregate() {
+                    return Err(
+                        "an aggregate query without GROUP BY may not project bare columns"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         // The rule that cannot be expressed in the type system, and that a shrinker could
         // otherwise break by deleting a row: a `LIMIT` without a total order lets two
         // engines return different rows, both legally.
@@ -259,6 +323,7 @@ mod tests {
                     column: "c0".to_string(),
                 })],
                 from: "t0".to_string(),
+                group_by: vec![],
                 filter: None,
                 order_by: vec![],
                 limit: None,

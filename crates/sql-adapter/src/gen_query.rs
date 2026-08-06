@@ -19,7 +19,8 @@
 use crate::gen_schema::Bounds;
 use crate::ordering::orders_rows_totally;
 use crate::schema::{
-    BinaryOp, ColumnRef, Direction, Expr, InsertRows, OrderKey, SelectStmt, SqlType, Table, UnaryOp,
+    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, OrderKey, SelectStmt, SqlType,
+    Table, UnaryOp,
 };
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
@@ -42,15 +43,61 @@ pub fn generate_query(
         .map(|insert| insert.rows.as_slice())
         .unwrap_or_default();
 
-    let projection = generate_projection(rng, table, bounds);
+    // Three shapes of query, when aggregates are enabled: plain rows, a whole-table
+    // aggregate, and a grouped aggregate. Chosen up front because the choice constrains
+    // what the projection may contain — a grouped query may project only its grouping
+    // columns and aggregates, and getting that wrong produces SQL DuckDB refuses.
+    let shape = if bounds.aggregates {
+        match rng.random_range(0..100) {
+            0..=49 => QueryShape::Rows,
+            50..=69 => QueryShape::WholeTableAggregate,
+            _ => QueryShape::Grouped,
+        }
+    } else {
+        QueryShape::Rows
+    };
+
+    let (projection, group_by) = match shape {
+        QueryShape::Rows => (generate_projection(rng, table, bounds), Vec::new()),
+        QueryShape::WholeTableAggregate => {
+            let count = rng.random_range(1..=2);
+            let projection = (0..count).map(|_| generate_aggregate(rng, table)).collect();
+            (projection, Vec::new())
+        }
+        QueryShape::Grouped => {
+            let key = &table.columns[rng.random_range(0..table.columns.len())];
+            let key_ref = reference(table, &key.name);
+            let mut projection = vec![Expr::Column(key_ref.clone())];
+            for _ in 0..rng.random_range(1..=2) {
+                projection.push(generate_aggregate(rng, table));
+            }
+            (projection, vec![key_ref])
+        }
+    };
+
     let filter = (rng.random_range(0..100) < 70).then(|| generate_predicate(rng, table, bounds, 0));
-    let order_by = generate_order_by(rng, table);
+
+    // **`ORDER BY` is only generated for row queries.** A grouped query may order only by
+    // its grouping columns or by an aggregate — SQLite tolerates more, DuckDB refuses — and
+    // an aggregate with no `GROUP BY` returns a single row, so ordering it says nothing.
+    // Generating the strict form is what both engines accept.
+    let order_by = match shape {
+        QueryShape::Rows => generate_order_by(rng, table),
+        QueryShape::WholeTableAggregate | QueryShape::Grouped => Vec::new(),
+    };
 
     // **The rule that needs the data.** A `LIMIT` on a query whose order is not total lets
     // two engines return different *rows*, both legally — a difference no normalization can
     // repair and no catalog entry could honestly excuse. So the limit is only offered when
     // the order has been shown to be total for this case's rows.
-    let limit = if orders_rows_totally(&order_by, table, rows) && rng.random_range(0..100) < 30 {
+    // The same restriction, for the same reason plus one more: a grouped query's output rows
+    // are *groups*, not seeded rows, so `orders_rows_totally` — which inspects the seeded
+    // rows — is answering a different question entirely. Rather than teach it to compute
+    // groups, only row queries are eligible for a `LIMIT`.
+    let limit = if shape == QueryShape::Rows
+        && orders_rows_totally(&order_by, table, rows)
+        && rng.random_range(0..100) < 30
+    {
         Some(rng.random_range(0..=rows.len() as u32))
     } else {
         None
@@ -59,9 +106,55 @@ pub fn generate_query(
     SelectStmt {
         projection,
         from: table.name.clone(),
+        group_by,
         filter,
         order_by,
         limit,
+    }
+}
+
+/// What kind of query to build. The shape decides what a legal projection looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryShape {
+    /// Ordinary row-returning `SELECT`.
+    Rows,
+    /// Aggregates with no `GROUP BY`: one row from the whole table — including from an
+    /// **empty** table, which is where aggregates are most likely to differ.
+    WholeTableAggregate,
+    /// `GROUP BY` one column, projecting it plus aggregates.
+    Grouped,
+}
+
+/// One aggregate over a column of this table.
+///
+/// `COUNT(*)` and `COUNT(x)` are both generated because they ask different questions —
+/// `COUNT(x)` skips `NULL`s — and the generator puts `NULL`s in a quarter of all cells, so
+/// the difference is exercised rather than theoretical.
+///
+/// `SUM` is restricted to 32-bit `INTEGER` columns: DuckDB widens a sum to `HUGEINT` while
+/// SQLite keeps an integer until it overflows into `REAL`, so summing a `BIGINT` column of
+/// extreme values would reproduce the documented overflow difference instead of testing
+/// aggregation. With at most 8 rows of values below 2^31, a sum cannot leave `i64`.
+fn generate_aggregate(rng: &mut SeededRng, table: &Table) -> Expr {
+    let column = &table.columns[rng.random_range(0..table.columns.len())];
+    let column_ref = Expr::Column(reference(table, &column.name));
+
+    let summable = column.sql_type == SqlType::Integer;
+    let choice = rng.random_range(0..100);
+
+    let (func, arg) = match choice {
+        0..=24 => (AggregateFunc::CountRows, None),
+        25..=49 => (AggregateFunc::Count, Some(column_ref)),
+        50..=69 => (AggregateFunc::Min, Some(column_ref)),
+        70..=89 => (AggregateFunc::Max, Some(column_ref)),
+        _ if summable => (AggregateFunc::Sum, Some(column_ref)),
+        // Not summable: fall back to counting rows rather than skewing toward one column.
+        _ => (AggregateFunc::CountRows, None),
+    };
+
+    Expr::Aggregate {
+        func,
+        arg: arg.map(Box::new),
     }
 }
 
@@ -443,6 +536,20 @@ mod tests {
             Expr::Cast { expr, to } => {
                 assert_types_agree(expr, table, seed);
                 Some(*to)
+            }
+            Expr::Aggregate { func, arg } => {
+                if let Some(inner) = arg {
+                    assert_types_agree(inner, table, seed);
+                }
+                match func {
+                    // A count is a number whatever it counted.
+                    AggregateFunc::CountRows | AggregateFunc::Count => Some(SqlType::BigInt),
+                    // MIN/MAX/SUM carry their argument's type — and SUM is only ever
+                    // generated over an integer column.
+                    _ => arg
+                        .as_ref()
+                        .and_then(|inner| assert_types_agree(inner, table, seed)),
+                }
             }
             Expr::Binary { op, left, right } => {
                 let left_type = assert_types_agree(left, table, seed);

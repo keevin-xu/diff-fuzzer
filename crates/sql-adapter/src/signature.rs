@@ -116,6 +116,14 @@ pub fn clause_shape(case: &SqlCase) -> Vec<&'static str> {
     if !case.query.order_by.is_empty() {
         tags.insert("order-by");
     }
+    if !case.query.group_by.is_empty() {
+        tags.insert("group-by");
+    }
+    // An aggregate over an empty table is its own phenomenon — the row count collapses to
+    // one whatever the data — so it earns a tag rather than hiding inside "empty-table".
+    if case.aggregates() && case.queried_rows().is_empty() {
+        tags.insert("aggregate-over-empty");
+    }
     if case.query.limit.is_some() {
         tags.insert("limit");
     }
@@ -155,6 +163,18 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
                 UnaryOp::IsNotNull => "is-not-null",
             });
             collect_expr_tags(operand, tags);
+        }
+        Expr::Aggregate { func, arg } => {
+            tags.insert(match func {
+                crate::schema::AggregateFunc::CountRows => "count-rows",
+                crate::schema::AggregateFunc::Count => "count",
+                crate::schema::AggregateFunc::Min => "min",
+                crate::schema::AggregateFunc::Max => "max",
+                crate::schema::AggregateFunc::Sum => "sum",
+            });
+            if let Some(inner) = arg {
+                collect_expr_tags(inner, tags);
+            }
         }
         Expr::Binary { op, left, right } => {
             tags.insert(match op {

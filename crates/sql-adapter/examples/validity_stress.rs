@@ -78,7 +78,12 @@ fn main() {
         .and_then(|argument| argument.parse().ok())
         .unwrap_or(10_000);
 
-    let generator = SqlGenerator::default();
+    let bounds = match std::env::args().nth(2).as_deref() {
+        Some("aggregates") => sql_adapter::gen_schema::Bounds::V1_AGGREGATES,
+        Some("wide") => sql_adapter::gen_schema::Bounds::V1_WIDE_ARITHMETIC,
+        _ => sql_adapter::gen_schema::Bounds::V1,
+    };
+    let generator = SqlGenerator::new(bounds);
     println!("generator: {}", generator.description());
     println!("cases:     {total}");
 

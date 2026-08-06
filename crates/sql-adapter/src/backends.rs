@@ -256,6 +256,14 @@ fn duckdb_cell(value: duckdb::types::Value) -> Result<Cell, RunError> {
         Value::SmallInt(number) => Ok(Cell::Integer(number.into())),
         Value::Int(number) => Ok(Cell::Integer(number.into())),
         Value::BigInt(number) => Ok(Cell::Integer(number)),
+        // `SUM` over an integer column returns `HUGEINT` in DuckDB while SQLite keeps an
+        // ordinary integer (measured). The 128-bit container is a *representation*
+        // difference, not a value one, so a value that fits is converted — and one that does
+        // not is **refused rather than truncated**, since a silently narrowed sum would make
+        // the engines agree on a number neither returned.
+        Value::HugeInt(number) => i64::try_from(number)
+            .map(Cell::Integer)
+            .map_err(|_| unrepresentable(DUCKDB_NAME, Value::HugeInt(number))),
         Value::Text(text) => Ok(Cell::Text(text)),
         other => Err(unrepresentable(DUCKDB_NAME, other)),
     }

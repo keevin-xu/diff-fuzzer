@@ -213,6 +213,33 @@ pub enum UnaryOp {
     IsNotNull,
 }
 
+/// An aggregate function.
+///
+/// Deliberately excludes `AVG`: it returns `REAL` on SQLite and `DOUBLE` on DuckDB
+/// (measured), and floating point is the one thing this subset exists to keep out — an
+/// average would reintroduce it under a name that does not look numeric-fragile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggregateFunc {
+    /// `COUNT(*)` — counts rows, including those that are entirely `NULL`.
+    CountRows,
+    /// `COUNT(expr)` — counts non-`NULL` values, which is a different question and a
+    /// classic place for engines to differ.
+    Count,
+    Min,
+    Max,
+    /// `SUM(expr)`. Restricted at generation to 32-bit columns: DuckDB widens a sum to
+    /// `HUGEINT` while SQLite keeps it in an integer until it overflows into `REAL`, so an
+    /// unrestricted sum reproduces the overflow difference rather than testing aggregation.
+    Sum,
+}
+
+impl AggregateFunc {
+    /// Does this aggregate take an argument? `COUNT(*)` does not.
+    pub fn takes_argument(self) -> bool {
+        self != AggregateFunc::CountRows
+    }
+}
+
 /// An expression.
 ///
 /// Recursive, and therefore boxed: a `Box<Expr>` is a pointer to another expression, which
@@ -237,6 +264,12 @@ pub enum Expr {
         expr: Box<Expr>,
         to: SqlType,
     },
+    /// An aggregate over the rows of a group (or of the whole table, with no `GROUP BY`).
+    Aggregate {
+        func: AggregateFunc,
+        /// `None` only for `COUNT(*)`.
+        arg: Option<Box<Expr>>,
+    },
 }
 
 impl Expr {
@@ -250,6 +283,7 @@ impl Expr {
             Expr::Unary { operand, .. } => 1 + operand.node_count(),
             Expr::Binary { left, right, .. } => 1 + left.node_count() + right.node_count(),
             Expr::Cast { expr, .. } => 1 + expr.node_count(),
+            Expr::Aggregate { arg, .. } => 1 + arg.as_ref().map_or(0, |inner| inner.node_count()),
         }
     }
 
@@ -274,6 +308,27 @@ impl Expr {
                 right.collect_columns(found);
             }
             Expr::Cast { expr, .. } => expr.collect_columns(found),
+            Expr::Aggregate { arg, .. } => {
+                if let Some(inner) = arg {
+                    inner.collect_columns(found);
+                }
+            }
+        }
+    }
+
+    /// Is this expression an aggregate, or does it contain one?
+    ///
+    /// A projection that aggregates behaves completely differently from one that does not:
+    /// it collapses rows. The generator and the validity rules both need to ask.
+    pub fn contains_aggregate(&self) -> bool {
+        match self {
+            Expr::Aggregate { .. } => true,
+            Expr::Column(_) | Expr::Literal(_) => false,
+            Expr::Unary { operand, .. } => operand.contains_aggregate(),
+            Expr::Binary { left, right, .. } => {
+                left.contains_aggregate() || right.contains_aggregate()
+            }
+            Expr::Cast { expr, .. } => expr.contains_aggregate(),
         }
     }
 
@@ -290,6 +345,9 @@ impl Expr {
                 left.contains_null_literal() || right.contains_null_literal()
             }
             Expr::Cast { expr, .. } => expr.contains_null_literal(),
+            Expr::Aggregate { arg, .. } => arg
+                .as_ref()
+                .is_some_and(|inner| inner.contains_null_literal()),
         }
     }
 }
@@ -329,6 +387,12 @@ pub struct SelectStmt {
     pub from: String,
     /// `WHERE`, if any.
     pub filter: Option<Expr>,
+    /// `GROUP BY` columns. Empty means no grouping.
+    ///
+    /// When non-empty, every projected expression must be either one of these columns or an
+    /// aggregate — SQLite permits looser forms and DuckDB refuses them, so the strict rule is
+    /// the one that both accept.
+    pub group_by: Vec<ColumnRef>,
     /// `ORDER BY` keys, in order. Empty means the engine may return rows in any order.
     pub order_by: Vec<OrderKey>,
     /// `LIMIT`, if any.
@@ -477,6 +541,7 @@ mod tests {
         let statement = SelectStmt {
             projection: vec![Expr::Column(column_ref("a"))],
             from: "t".to_string(),
+            group_by: vec![],
             filter: Some(Expr::Binary {
                 op: BinaryOp::Greater,
                 left: Box::new(Expr::Column(column_ref("a"))),

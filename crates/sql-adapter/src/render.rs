@@ -19,8 +19,8 @@
 //!   validity failure on both engines at once, which looks like agreement.
 
 use crate::schema::{
-    BinaryOp, ColumnRef, Direction, Expr, InsertRows, Literal, OrderKey, SelectStmt, SqlType,
-    Table, UnaryOp,
+    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, Literal, OrderKey, SelectStmt,
+    SqlType, Table, UnaryOp,
 };
 
 /// Which engine's spelling to use.
@@ -117,6 +117,13 @@ pub fn render_select(query: &SelectStmt, dialect: Dialect) -> String {
         sql.push_str(&format!(" WHERE {}", render_expr(filter, dialect)));
     }
 
+    // `GROUP BY` comes after `WHERE` and before `ORDER BY`. Rendering it out of order would
+    // be a syntax error on both engines — which at least fails loudly.
+    if !query.group_by.is_empty() {
+        let columns: Vec<String> = query.group_by.iter().map(render_column_ref).collect();
+        sql.push_str(&format!(" GROUP BY {}", columns.join(", ")));
+    }
+
     if !query.order_by.is_empty() {
         let keys: Vec<String> = query.order_by.iter().map(render_order_key).collect();
         sql.push_str(&format!(" ORDER BY {}", keys.join(", ")));
@@ -173,6 +180,28 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
             render_expr(expr, dialect),
             type_name(*to, dialect)
         ),
+        Expr::Aggregate { func, arg } => match (func, arg) {
+            (AggregateFunc::CountRows, _) => "COUNT(*)".to_string(),
+            (function, Some(inner)) => {
+                format!(
+                    "{}({})",
+                    aggregate_name(*function),
+                    render_expr(inner, dialect)
+                )
+            }
+            // Unreachable for generated cases — only `COUNT(*)` omits its argument — but
+            // rendering something that does not parse would be worse than saying so.
+            (function, None) => format!("{}(*)", aggregate_name(*function)),
+        },
+    }
+}
+
+fn aggregate_name(func: AggregateFunc) -> &'static str {
+    match func {
+        AggregateFunc::CountRows | AggregateFunc::Count => "COUNT",
+        AggregateFunc::Min => "MIN",
+        AggregateFunc::Max => "MAX",
+        AggregateFunc::Sum => "SUM",
     }
 }
 
@@ -360,6 +389,7 @@ mod tests {
             &SelectStmt {
                 projection: vec![Expr::Literal(Literal::Integer(1))],
                 from: "t0".to_string(),
+                group_by: vec![],
                 filter: None,
                 order_by: vec![],
                 limit: None,
