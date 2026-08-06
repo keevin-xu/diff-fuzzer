@@ -41,6 +41,8 @@
 pub mod ast;
 /// The two engines under comparison, each behind the shared `Implementation` seam.
 pub mod backends;
+/// Turning what an engine returned into a comparable canonical form.
+pub mod normalize;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
 
