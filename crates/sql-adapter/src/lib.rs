@@ -37,6 +37,11 @@
 //!   decisions, and the cited evidence behind them, kept as separate documents on
 //!   purpose.
 
+/// What a test case is: schema, seed rows, and one query, carried together.
+pub mod ast;
+/// What running a case produces: rows, or a refusal.
+pub mod outcome;
+
 /// Where this domain's outputs live, relative to the repository root.
 ///
 /// **One constant, so a domain is a constant rather than a search-and-replace.** Findings,

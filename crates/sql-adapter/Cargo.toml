@@ -10,6 +10,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The dependency arrow points this way and never the other way: the adapter knows about
+# the engine, the engine knows nothing about SQL. Cargo enforces that, not discipline —
+# a `use sql_adapter::..` inside the engine would not compile.
+diff-fuzzer-core = { path = "../diff-fuzzer-core" }
+# A finding must serialize whole. The seed alone does not reproduce a case: it only does
+# so for the exact generator that produced it, and generators change.
+serde.workspace = true
+
 # The two engines under comparison. Versions and features are pinned once, in the root
 # [workspace.dependencies]; `.workspace = true` just says "use that".
 #
@@ -18,6 +26,12 @@ repository.workspace = true
 # one correct. The oracle only ever reports *that* they differ.
 rusqlite.workspace = true
 duckdb.workspace = true
+
+[dev-dependencies]
+# Only the tests need JSON today — they check that a case survives being written and read
+# back, which is the property a saved finding depends on. It becomes a real dependency at
+# S5, when reports are actually written to disk.
+serde_json.workspace = true
 
 # Note what is NOT here: `tensor-adapter`. The triage and predicate machinery this domain
 # reuses lives in that crate, and it will be *copied* rather than depended on — depending

@@ -5145,8 +5145,11 @@ dependencies = [
 name = "sql-adapter"
 version = "0.1.0"
 dependencies = [
+ "diff-fuzzer-core",
  "duckdb",
  "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
