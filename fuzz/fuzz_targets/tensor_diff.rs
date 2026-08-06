@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tensor_adapter::{
     CanonicalTensor, FaultyCpu, TensorNormalizer, TensorOp, TensorTolerancePolicy, environment,
-    faulty as faulty_backend, libtorch, flex, negatives,
+    faulty as faulty_backend, flex, libtorch, negatives, wgpu,
 };
 
 /// Everything that is expensive to build, constructed once and reused.
@@ -44,6 +44,17 @@ use tensor_adapter::{
 struct Harness {
     cpu: NormalizedRunner<tensor_adapter::FlexBackend, TensorNormalizer>,
     torch: NormalizedRunner<tensor_adapter::LibTorchBackend, TensorNormalizer>,
+    /// The GPU, and **the reason this harness is three-way rather than two-way.**
+    ///
+    /// Two implementations hide bugs a third exposes: with two, every disagreement is
+    /// symmetric and neither side can be named the outlier. The two CPU backends also share
+    /// an instruction set and a set of assumptions, so a fault common to both is invisible
+    /// — which is precisely the blind spot a differential oracle is supposed to close.
+    ///
+    /// Its pairs are skipped more often (a subnormal input is unjudgeable against Metal's
+    /// flush-to-zero), but that costs nothing: the oracle compares **all pairs**, so a
+    /// skipped GPU pair leaves the CPU-versus-CPU judgment untouched.
+    gpu: NormalizedRunner<tensor_adapter::WgpuBackend, TensorNormalizer>,
     /// A backend wrong by a known amount, used only when the fault switch is set.
     faulty: NormalizedRunner<FaultyCpu, TensorNormalizer>,
     oracle: DifferentialOracle<TensorOp, CanonicalTensor, TensorTolerancePolicy>,
@@ -57,6 +68,7 @@ fn harness() -> &'static Harness {
     HARNESS.get_or_init(|| Harness {
         cpu: NormalizedRunner::new(flex(), TensorNormalizer),
         torch: NormalizedRunner::new(libtorch(), TensorNormalizer),
+        gpu: NormalizedRunner::new(wgpu(), TensorNormalizer),
         faulty: NormalizedRunner::new(faulty_backend(0.5), TensorNormalizer),
         oracle: DifferentialOracle::new(TensorTolerancePolicy),
         // **The switch that makes a clean campaign mean something.**
@@ -96,7 +108,14 @@ fuzz_target!(|case: TensorOp| {
     } else {
         &harness.torch
     };
-    let runners: [&dyn Runner<In = TensorOp, Canon = CanonicalTensor>; 2] = [&harness.cpu, second];
+    // Three implementations when comparing for real; two under fault injection, where the
+    // point is to prove a *known* wrong answer is caught rather than to survey backends.
+    let runners: Vec<&dyn Runner<In = TensorOp, Canon = CanonicalTensor>> = if harness.inject_fault
+    {
+        vec![&harness.cpu, second]
+    } else {
+        vec![&harness.cpu, second, &harness.gpu]
+    };
 
     let outputs = run_all(&case, &runners);
     match harness.oracle.check(&case, &outputs) {
@@ -311,7 +330,16 @@ fn sampling_context() -> negatives::SamplingContext {
     } else {
         harness.torch.name()
     };
-    negatives::SamplingContext::new(negatives::FUZZER_GENERATOR, &[harness.cpu.name(), second])
+    if harness.inject_fault {
+        return negatives::SamplingContext::new(
+            negatives::FUZZER_GENERATOR,
+            &[harness.cpu.name(), second],
+        );
+    }
+    negatives::SamplingContext::new(
+        negatives::FUZZER_GENERATOR,
+        &[harness.cpu.name(), second, harness.gpu.name()],
+    )
 }
 
 /// Which run's directory this process should file its findings under.
