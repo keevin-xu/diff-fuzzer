@@ -1,0 +1,18 @@
+[package]
+name = "sql-adapter"
+description = "The SQL adapter: valid query generation, SQLite/DuckDB implementations, and result-set normalization."
+# These four are inherited from [workspace.package] in the root Cargo.toml rather than
+# repeated here. One version number for the whole project means a saved finding names a
+# version that actually identifies the code that produced it.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Nothing yet. The two engines (`rusqlite`, `duckdb`) arrive in the next step, pinned in
+# the root [workspace.dependencies] so their versions live in exactly one place.
+#
+# Note what will NOT be here: `tensor-adapter`. The triage and predicate machinery this
+# domain reuses lives in that crate, and it will be *copied* rather than depended on —
+# depending on it would drag libtorch and wgpu into every SQL build.

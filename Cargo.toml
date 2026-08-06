@@ -1,7 +1,16 @@
 [workspace]
-# The two crates that make up this project. `fuzz/` is deliberately NOT a member —
-# cargo-fuzz crates are built separately with nightly (PHASE-6, step 6.1).
-members = ["crates/diff-fuzzer-core", "crates/tensor-adapter"]
+# The engine plus one crate per kind of software under test. `fuzz/` is deliberately NOT
+# a member — cargo-fuzz crates are built separately with nightly (PHASE-6, step 6.1).
+#
+# `sql-adapter` is the second domain (SQLite vs DuckDB). It sits beside `tensor-adapter`
+# rather than inside it: the two share the engine and nothing else, and neither may
+# depend on the other — a SQL build must never compile libtorch, and a tensor build must
+# never compile DuckDB.
+members = [
+    "crates/diff-fuzzer-core",
+    "crates/tensor-adapter",
+    "crates/sql-adapter",
+]
 
 # Resolver 3 is the current dependency resolver (required for edition 2024).
 # A virtual workspace (one with no [package] of its own) must state it explicitly.

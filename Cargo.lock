@@ -4695,6 +4695,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sql-adapter"
+version = "0.1.0"
+
+[[package]]
 name = "stable-vec"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
