@@ -37,5 +37,47 @@
 //!   decisions, and the cited evidence behind them, kept as separate documents on
 //!   purpose.
 
-// Nothing is implemented yet: this step exists to prove the crate joins the workspace
-// and builds without disturbing anything already here. The types arrive next.
+/// Where this domain's outputs live, relative to the repository root.
+///
+/// **One constant, so a domain is a constant rather than a search-and-replace.** Findings,
+/// negatives and their archives all hang off it, and nothing else in this crate spells a
+/// path prefix — the same rule the tensor adapter follows with `findings/tensor`.
+///
+/// Scoped by domain because the file *names* would otherwise collide while the file
+/// *contents* are unrelated: a `join-3f2a.json` and a `matmul-3f2a.json` share nothing but
+/// a hash.
+pub const FINDINGS_ROOT: &str = "findings/sql";
+
+/// Where this domain's non-diverging cases live.
+///
+/// A case that was judged and **agreed** is evidence, not absence of evidence: a later
+/// claim about what triggers a divergence is only worth something if it can be scored
+/// against cases that did *not* diverge.
+pub const NEGATIVES_ROOT: &str = "findings/sql/negatives";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The negatives directory must sit *under* the findings root.
+    ///
+    /// Trivial to state and trivial to break: these are two separate string literals, and
+    /// nothing but this test ties them together. The tensor domain learned the general
+    /// lesson the expensive way — a value matched by string equality needs a single
+    /// definition, or the mismatch shows up as *missing data* rather than as a typo, which
+    /// is how it survives review.
+    #[test]
+    fn negatives_live_under_findings_root() {
+        assert!(
+            NEGATIVES_ROOT.starts_with(FINDINGS_ROOT),
+            "negatives root {NEGATIVES_ROOT} must be under findings root {FINDINGS_ROOT}"
+        );
+    }
+
+    /// This domain must not write where the tensor domain writes.
+    #[test]
+    fn findings_root_is_domain_scoped() {
+        assert_eq!(FINDINGS_ROOT, "findings/sql");
+        assert_ne!(FINDINGS_ROOT, "findings/tensor");
+    }
+}

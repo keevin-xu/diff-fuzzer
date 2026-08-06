@@ -75,3 +75,21 @@ tracing = "0.1.44"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing-subscriber = "0.3.23"
+
+# ---------------------------------------------------------------------------------
+# SQL domain (crates/sql-adapter). Used by that crate only; the tensor adapter never
+# sees them, and `cargo build -p tensor-adapter` does not compile either engine.
+# ---------------------------------------------------------------------------------
+#
+# Both use `bundled`, meaning the engine's own C/C++ source is compiled from the crate
+# rather than linked against whatever the machine happens to have installed. That costs
+# build time once and buys the thing this project cannot do without: a finding names an
+# engine version, and that version has to be a property of the code, not of the laptop.
+# A system SQLite would make the same commit produce different results on two machines.
+#
+# The consequence to remember at PHASE-S6: both engines are native code compiled by
+# build scripts, which cargo-fuzz does not instrument (it sets RUSTFLAGS, not CFLAGS).
+# Whether coverage-guided fuzzing sees anything but our own decoder is measured there,
+# not assumed here (`planning/sql-duckdb/PENDING.md` 1.7).
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+duckdb = { version = "1.10505.0", features = ["bundled"] }

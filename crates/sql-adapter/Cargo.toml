@@ -10,9 +10,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Nothing yet. The two engines (`rusqlite`, `duckdb`) arrive in the next step, pinned in
-# the root [workspace.dependencies] so their versions live in exactly one place.
+# The two engines under comparison. Versions and features are pinned once, in the root
+# [workspace.dependencies]; `.workspace = true` just says "use that".
 #
-# Note what will NOT be here: `tensor-adapter`. The triage and predicate machinery this
-# domain reuses lives in that crate, and it will be *copied* rather than depended on —
-# depending on it would drag libtorch and wgpu into every SQL build.
+# They are peers here, not reference-and-candidate: SQLite is the mature engine and a
+# disagreement is far likelier to be DuckDB's, but nothing in the code declares either
+# one correct. The oracle only ever reports *that* they differ.
+rusqlite.workspace = true
+duckdb.workspace = true
+
+# Note what is NOT here: `tensor-adapter`. The triage and predicate machinery this domain
+# reuses lives in that crate, and it will be *copied* rather than depended on — depending
+# on it would drag libtorch and wgpu into every SQL build.
