@@ -51,6 +51,8 @@ pub mod normalize;
 pub mod oracle;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
+/// The typed tree a case is made of: types, tables, values, expressions, one query.
+pub mod schema;
 /// An engine that is wrong on purpose, so "found nothing" can mean something.
 pub mod testing;
 
