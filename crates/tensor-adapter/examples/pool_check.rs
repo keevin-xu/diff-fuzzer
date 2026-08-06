@@ -2,7 +2,7 @@
 use tensor_adapter::negatives::{self, Pool, SamplingContext};
 
 fn main() {
-    let all = negatives::load("findings/negatives");
+    let all = negatives::load(tensor_adapter::NEGATIVES_ROOT);
     println!("{} negatives on disk\n", all.len());
 
     for (label, ctx) in contexts() {
@@ -15,7 +15,7 @@ fn main() {
 
 /// The contexts a campaign might plausibly want to score against.
 fn contexts() -> Vec<(String, SamplingContext)> {
-    let pair = ["flex", "libtorch"];
+    let pair = [tensor_adapter::FLEX_NAME, tensor_adapter::LIBTORCH_NAME];
     vec![
         (
             "fuzzer (current bounds)".to_string(),

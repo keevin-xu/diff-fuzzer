@@ -317,7 +317,7 @@ fn main() {
 
 /// Record the non-diverging cases where a future search can score against them.
 fn write_negatives(cases: &[(String, TensorOp)]) {
-    let dir = "findings/negatives";
+    let dir = tensor_adapter::NEGATIVES_ROOT;
     if let Err(error) = std::fs::create_dir_all(dir) {
         eprintln!("\ncould not create {dir}: {error}");
         return;

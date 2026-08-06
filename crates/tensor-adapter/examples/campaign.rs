@@ -168,7 +168,7 @@ fn main() {
     // says what the campaign was rather than inventing a plausible one.
     let run = std::env::var("DIFF_FUZZER_RUN")
         .unwrap_or_else(|_| format!("seeded-{}", if wide { "wide" } else { "default" }));
-    let run_dir = format!("findings/runs/{run}");
+    let run_dir = format!("{}/runs/{run}", tensor_adapter::FINDINGS_ROOT);
 
     // Opened up front rather than on the first divergence, so a permissions or path
     // problem surfaces immediately instead of after an hour of work is already lost.

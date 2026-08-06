@@ -140,9 +140,18 @@ impl<B: Backend> Implementation for BurnBackend<B> {
 /// The libtorch backend — the same arithmetic, performed by PyTorch's C++ kernels.
 pub type LibTorchBackend = BurnBackend<LibTorch<f32>>;
 
+/// The name every report, signature and sampling context uses for libtorch.
+///
+/// **A constant, not a literal repeated at each call site.** These names are matched
+/// verbatim when deciding whether a negative may be scored against a finding, so a report
+/// saying `burn-tch` and a scoring context saying `libtorch` silently never match — the
+/// pool refuses everything and the reason looks like a data problem rather than a typo.
+/// That happened once; hence the constants.
+pub const LIBTORCH_NAME: &str = "burn-tch";
+
 /// Construct the libtorch backend under test.
 pub fn libtorch() -> LibTorchBackend {
-    BurnBackend::new("burn-tch")
+    BurnBackend::new(LIBTORCH_NAME)
 }
 
 /// The wgpu backend — the same arithmetic again, this time on the GPU.
@@ -157,9 +166,12 @@ pub type WgpuBackend = BurnBackend<Wgpu<f32, i32>>;
 /// The flex backend — burn's current first-party pure-Rust CPU option.
 pub type FlexBackend = BurnBackend<Flex<f32>>;
 
+/// The name every report, signature and sampling context uses for flex. See [`LIBTORCH_NAME`].
+pub const FLEX_NAME: &str = "burn-flex";
+
 /// Construct the flex CPU backend under test.
 pub fn flex() -> FlexBackend {
-    BurnBackend::new("burn-flex")
+    BurnBackend::new(FLEX_NAME)
 }
 
 /// Construct the GPU backend under test.
@@ -169,13 +181,26 @@ pub fn flex() -> FlexBackend {
 /// A GPU shares none of it, and its reductions are not even deterministic between runs of
 /// the same input (see `examples/wgpu_check.rs`) — so what counts as a legal difference
 /// has to be re-derived rather than inherited. That work is step 7.4, not here.
+/// The name every report, signature and sampling context uses for wgpu. See [`LIBTORCH_NAME`].
+pub const WGPU_NAME: &str = "burn-wgpu";
+
 pub fn wgpu() -> WgpuBackend {
-    BurnBackend::new("burn-wgpu")
+    BurnBackend::new(WGPU_NAME)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The names are matched verbatim when scoring negatives**, so a constant that drifts
+    /// from what the runner reports makes every pool refuse everything — and the failure
+    /// reads as missing data rather than as a typo.
+    #[test]
+    fn the_name_constants_match_what_the_runners_report() {
+        assert_eq!(flex().name(), FLEX_NAME);
+        assert_eq!(libtorch().name(), LIBTORCH_NAME);
+        assert_eq!(wgpu().name(), WGPU_NAME);
+    }
 
     fn value(shape: &[usize], data: &[f32]) -> TensorValue {
         TensorValue::new(shape.to_vec(), data.to_vec())

@@ -15,8 +15,11 @@ fn main() {
     collect(Path::new(&dir), &mut findings);
     println!("{} findings loaded from {dir}", findings.len());
 
-    let all = negatives::load("findings/negatives");
-    let context = SamplingContext::new(negatives::FUZZER_GENERATOR, &["flex", "libtorch"]);
+    let all = negatives::load(tensor_adapter::NEGATIVES_ROOT);
+    let context = SamplingContext::new(
+        negatives::FUZZER_GENERATOR,
+        &[tensor_adapter::FLEX_NAME, tensor_adapter::LIBTORCH_NAME],
+    );
     let pool = match Pool::matched(all, &context) {
         Ok(p) => p,
         Err(e) => {

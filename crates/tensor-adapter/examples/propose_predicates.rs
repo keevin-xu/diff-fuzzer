@@ -60,7 +60,7 @@ const EVERYTHING: tensor_adapter::Predicate = tensor_adapter::Predicate {
 fn main() {
     let dir = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "findings/runs".to_string());
+        .unwrap_or_else(|| format!("{}/runs", tensor_adapter::FINDINGS_ROOT));
 
     let findings = load_findings(Path::new(&dir));
     println!("{} findings loaded from {dir}", findings.len());
@@ -71,8 +71,11 @@ fn main() {
 
     // The context the findings themselves were produced under. Negatives are only usable
     // if they were drawn the same way AND observed on the same backends.
-    let context = SamplingContext::new(negatives::FUZZER_GENERATOR, &["flex", "libtorch"]);
-    let pool = match Pool::matched(negatives::load("findings/negatives"), &context) {
+    let context = SamplingContext::new(
+        negatives::FUZZER_GENERATOR,
+        &[tensor_adapter::FLEX_NAME, tensor_adapter::LIBTORCH_NAME],
+    );
+    let pool = match Pool::matched(negatives::load(tensor_adapter::NEGATIVES_ROOT), &context) {
         Ok(pool) => pool,
         Err(error) => {
             // Declining is the correct outcome, not a crash: scoring against a mismatched

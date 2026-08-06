@@ -28,8 +28,11 @@ fn load_findings(root: &str) -> Vec<TensorOp> {
 }
 
 fn main() {
-    let findings = load_findings("findings/runs/archive/pre-flex-swap");
-    let negs = negatives::load("findings/negatives");
+    let findings = load_findings(&format!(
+        "{}/runs/archive/pre-flex-swap",
+        tensor_adapter::FINDINGS_ROOT
+    ));
+    let negs = negatives::load(tensor_adapter::NEGATIVES_ROOT);
     println!(
         "{} archived findings, {} negatives\n",
         findings.len(),

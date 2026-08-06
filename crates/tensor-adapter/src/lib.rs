@@ -17,6 +17,20 @@
 //! backend, canonicalising what comes back, and — replacing the placeholder generator
 //! here — building cases that satisfy each operation's own rules.
 
+/// Where this domain's outputs live, relative to the repository root.
+///
+/// **One constant, because a second domain is then a second constant** rather than a
+/// search-and-replace across every example and harness. Findings, negatives and their
+/// archives all hang off it, and nothing else in the crate names a path prefix.
+///
+/// Scoped by domain (`findings/tensor`) rather than flat, so a SQL adapter writing to
+/// `findings/sql` cannot collide with this one — the two produce entirely different case
+/// types under the same file names.
+pub const FINDINGS_ROOT: &str = "findings/tensor";
+
+/// Where this domain's non-diverging cases live.
+pub const NEGATIVES_ROOT: &str = "findings/tensor/negatives";
+
 pub mod backends;
 /// Decoding fuzzer bytes into cases. Requires the `fuzzing` feature.
 #[cfg(feature = "fuzzing")]
@@ -42,7 +56,8 @@ pub mod tolerance;
 pub mod validation;
 
 pub use backends::{
-    BurnBackend, FlexBackend, LibTorchBackend, MAX_RANK, WgpuBackend, flex, libtorch, wgpu,
+    BurnBackend, FLEX_NAME, FlexBackend, LIBTORCH_NAME, LibTorchBackend, MAX_RANK, WGPU_NAME,
+    WgpuBackend, flex, libtorch, wgpu,
 };
 pub use environment::{BURN_VERSION, FLEX_VERSION, LIBTORCH_VERSION, TCH_VERSION, environment};
 pub use features::{FEATURES, FeatureVec, extract};

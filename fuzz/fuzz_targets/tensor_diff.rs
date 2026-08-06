@@ -198,8 +198,9 @@ fuzz_target!(|case: TensorOp| {
     // that survives. (Unlike `DYLD_*` on macOS, which SIP strips — the reason fork mode
     // was silently spawning children that died before executing anything.)
     let path = format!(
-        "{}/../findings/runs/{}/{}/fuzz-{}-{:x}.json",
+        "{}/../{}/runs/{}/{}/fuzz-{}-{:x}.json",
         env!("CARGO_MANIFEST_DIR"),
+        tensor_adapter::FINDINGS_ROOT,
         run_label(),
         case.name(),
         case.name(),
@@ -285,8 +286,9 @@ fn sample_negative(case: &TensorOp) {
 /// Record a case that did *not* diverge, under its source.
 fn save_negative(case: &TensorOp, source: negatives::Source) {
     let directory = format!(
-        "{}/../findings/negatives/{}",
+        "{}/../{}/negatives/{}",
         env!("CARGO_MANIFEST_DIR"),
+        tensor_adapter::FINDINGS_ROOT,
         run_label()
     );
     // The fuzz target's cases always come from decoded fuzzer bytes, compared on the two
