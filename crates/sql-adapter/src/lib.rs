@@ -41,12 +41,18 @@
 pub mod ast;
 /// The two engines under comparison, each behind the shared `Implementation` seam.
 pub mod backends;
+/// Running one case end to end: generate, run both engines, normalize, judge.
+pub mod driver;
+/// Producing cases to test. A placeholder until S2.
+pub mod generator;
 /// Turning what an engine returned into a comparable canonical form.
 pub mod normalize;
 /// Deciding whether the engines disagreed.
 pub mod oracle;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
+/// An engine that is wrong on purpose, so "found nothing" can mean something.
+pub mod testing;
 
 /// Where this domain's outputs live, relative to the repository root.
 ///
