@@ -117,11 +117,26 @@ pub fn render_select(query: &SelectStmt, dialect: Dialect) -> String {
         sql.push_str(&format!(" WHERE {}", render_expr(filter, dialect)));
     }
 
+    // A set operation joins two whole queries, so it goes after this query's own clauses
+    // and before any ordering — which is why the generator never puts `ORDER BY` or `LIMIT`
+    // on either branch: they would bind to the branch rather than to the combined result,
+    // and the two engines need not agree about that.
+    // (Rendered before GROUP BY's position check below only in source order; the actual
+    // clause order is enforced by where each `push_str` happens.)
+
     // `GROUP BY` comes after `WHERE` and before `ORDER BY`. Rendering it out of order would
     // be a syntax error on both engines — which at least fails loudly.
     if !query.group_by.is_empty() {
         let columns: Vec<String> = query.group_by.iter().map(render_column_ref).collect();
         sql.push_str(&format!(" GROUP BY {}", columns.join(", ")));
+    }
+
+    if let Some(branch) = &query.set_op {
+        sql.push_str(&format!(
+            " {} {}",
+            branch.op.as_sql(),
+            render_select(&branch.right, dialect)
+        ));
     }
 
     if !query.order_by.is_empty() {
@@ -389,6 +404,7 @@ mod tests {
             &SelectStmt {
                 projection: vec![Expr::Literal(Literal::Integer(1))],
                 from: "t0".to_string(),
+                set_op: None,
                 group_by: vec![],
                 filter: None,
                 order_by: vec![],

@@ -102,6 +102,13 @@ impl SqlCase {
             return false;
         }
 
+        // A set operation's output rows are neither branch's rows: `UNION` may drop
+        // duplicates, `EXCEPT` removes matches. The seeded rows the ordering check inspects
+        // are not what comes back, so — as with grouping — take the safe answer.
+        if self.query.set_op.is_some() {
+            return false;
+        }
+
         match self.queried_table() {
             Some(table) => crate::ordering::orders_rows_totally(
                 &self.query.order_by,
@@ -159,6 +166,7 @@ impl SqlCase {
             query: SelectStmt {
                 projection: vec![Expr::Column(reference("c0")), Expr::Column(reference("c1"))],
                 from: "t0".to_string(),
+                set_op: None,
                 group_by: vec![],
                 filter: Some(Expr::Binary {
                     op: crate::schema::BinaryOp::Greater,
@@ -284,6 +292,29 @@ impl SqlCase {
             }
         }
 
+        // Set-operation rules. Both branches must project the same number of columns, and
+        // neither may carry its own `ORDER BY` or `LIMIT` — those would bind to one branch
+        // rather than to the combined result, which is not a question worth asking the two
+        // engines to agree about.
+        if let Some(branch) = &self.query.set_op {
+            if branch.right.projection.len() != self.query.projection.len() {
+                return Err(format!(
+                    "a set operation joins {} columns to {}",
+                    self.query.projection.len(),
+                    branch.right.projection.len()
+                ));
+            }
+            if !branch.right.order_by.is_empty() || branch.right.limit.is_some() {
+                return Err("a set operation's right branch may not order or limit".to_string());
+            }
+            if branch.right.set_op.is_some() {
+                return Err("set operations are not chained (precedence is undecided)".to_string());
+            }
+            if branch.right.from != self.query.from {
+                return Err("both branches must read the same table in v1".to_string());
+            }
+        }
+
         // The rule that cannot be expressed in the type system, and that a shrinker could
         // otherwise break by deleting a row: a `LIMIT` without a total order lets two
         // engines return different rows, both legally.
@@ -323,6 +354,7 @@ mod tests {
                     column: "c0".to_string(),
                 })],
                 from: "t0".to_string(),
+                set_op: None,
                 group_by: vec![],
                 filter: None,
                 order_by: vec![],

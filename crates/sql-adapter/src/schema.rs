@@ -374,6 +374,50 @@ pub struct OrderKey {
     pub nulls_first: bool,
 }
 
+/// A set operation combining two queries.
+///
+/// **`UNION`, `INTERSECT` and `EXCEPT` deduplicate; `UNION ALL` does not** — which makes the
+/// pair a natural probe: the same two branches under `UNION` and `UNION ALL` must differ
+/// exactly by the duplicates.
+///
+/// They are also the place `NULL` stops behaving as it does elsewhere. SQL's `=` says
+/// `NULL = NULL` is unknown, but set operations treat two `NULL`s as *the same value* for
+/// deduplication and matching. An engine that implemented one rule where the other applies
+/// would diverge here and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetOp {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+impl SetOp {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION",
+            SetOp::UnionAll => "UNION ALL",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        }
+    }
+
+    /// Does this operation remove duplicate rows?
+    pub fn deduplicates(self) -> bool {
+        self != SetOp::UnionAll
+    }
+}
+
+/// The right-hand side of a set operation.
+///
+/// Boxed because it contains a [`SelectStmt`], which contains this — the same recursion
+/// problem `Expr` has, and the same answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetBranch {
+    pub op: SetOp,
+    pub right: Box<SelectStmt>,
+}
+
 /// The query under test.
 ///
 /// One `SELECT` over one table in v1. Joins, grouping and subqueries are where DuckDB's
@@ -387,6 +431,14 @@ pub struct SelectStmt {
     pub from: String,
     /// `WHERE`, if any.
     pub filter: Option<Expr>,
+    /// A set operation with another query, if any.
+    ///
+    /// Deliberately **not chained**: at most one operation, so no case can depend on the
+    /// precedence of `INTERSECT` against `UNION`/`EXCEPT` — which is a documented divergence
+    /// (SQLite gives them equal precedence left-to-right; SQL92 binds `INTERSECT` tighter),
+    /// and one whose DuckDB side has not been retrieved. Chaining is a separate axis to add
+    /// deliberately, not something to inherit by accident.
+    pub set_op: Option<SetBranch>,
     /// `GROUP BY` columns. Empty means no grouping.
     ///
     /// When non-empty, every projected expression must be either one of these columns or an
@@ -541,6 +593,7 @@ mod tests {
         let statement = SelectStmt {
             projection: vec![Expr::Column(column_ref("a"))],
             from: "t".to_string(),
+            set_op: None,
             group_by: vec![],
             filter: Some(Expr::Binary {
                 op: BinaryOp::Greater,

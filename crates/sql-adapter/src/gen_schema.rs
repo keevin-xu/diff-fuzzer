@@ -38,6 +38,13 @@ pub struct Bounds {
     pub max_tables: usize,
     pub max_columns: usize,
     pub max_rows: usize,
+    /// Whether the generator may emit a set operation (`UNION`, `UNION ALL`, `INTERSECT`,
+    /// `EXCEPT`).
+    ///
+    /// The second widening, aimed where the two engines share least code and where `NULL`
+    /// changes its own rules: set operations treat two `NULL`s as *the same value* for
+    /// deduplication, unlike `=` everywhere else in SQL.
+    pub set_ops: bool,
     /// Whether the generator may emit aggregates and `GROUP BY`.
     ///
     /// The first widening past the v1 subset, and pointed where DuckDB plausibly differs
@@ -78,6 +85,13 @@ impl Bounds {
         max_expr_depth: 3,
         wide_arithmetic: false,
         aggregates: false,
+        set_ops: false,
+    };
+
+    /// V1 plus set operations. One axis, as always.
+    pub const V1_SET_OPS: Bounds = Bounds {
+        set_ops: true,
+        ..Bounds::V1
     };
 
     /// V1 plus aggregates and `GROUP BY`. One axis, as always, so a difference in yield is
@@ -101,13 +115,14 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={})",
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={})",
             self.max_tables,
             self.max_columns,
             self.max_rows,
             self.max_expr_depth,
             self.wide_arithmetic,
-            self.aggregates
+            self.aggregates,
+            self.set_ops
         )
     }
 }

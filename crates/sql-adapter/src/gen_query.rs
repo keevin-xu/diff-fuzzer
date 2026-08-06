@@ -19,8 +19,8 @@
 use crate::gen_schema::Bounds;
 use crate::ordering::orders_rows_totally;
 use crate::schema::{
-    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, OrderKey, SelectStmt, SqlType,
-    Table, UnaryOp,
+    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, OrderKey, SelectStmt,
+    SetBranch, SetOp, SqlType, Table, UnaryOp,
 };
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
@@ -77,11 +77,21 @@ pub fn generate_query(
 
     let filter = (rng.random_range(0..100) < 70).then(|| generate_predicate(rng, table, bounds, 0));
 
+    // Decided **before** the ordering, because it constrains it. Getting this order wrong is
+    // not hypothetical: an earlier version suppressed `ORDER BY` for every row query whenever
+    // set operations were *enabled*, so a run meant to add one axis silently removed another
+    // and produced a corpus with **no ordered queries at all**.
+    let wants_set_op = bounds.set_ops && shape == QueryShape::Rows && rng.random_range(0..100) < 55;
+
     // **`ORDER BY` is only generated for row queries.** A grouped query may order only by
     // its grouping columns or by an aggregate — SQLite tolerates more, DuckDB refuses — and
     // an aggregate with no `GROUP BY` returns a single row, so ordering it says nothing.
     // Generating the strict form is what both engines accept.
     let order_by = match shape {
+        // No ordering when *this query* has a set operation: an `ORDER BY` would attach to a
+        // branch rather than to the combined result. Note the condition is `wants_set_op`,
+        // not `bounds.set_ops` — a row query that did not get one still gets ordered.
+        QueryShape::Rows if wants_set_op => Vec::new(),
         QueryShape::Rows => generate_order_by(rng, table),
         QueryShape::WholeTableAggregate | QueryShape::Grouped => Vec::new(),
     };
@@ -103,9 +113,39 @@ pub fn generate_query(
         None
     };
 
+    // A set operation, when enabled and when the query is the plain row shape. The right
+    // branch projects **the same expressions** as the left, which guarantees identical arity
+    // and identical types — the two things a set operation requires — while a different
+    // `WHERE` is what makes the two sides actually differ. That difference is the point:
+    // `INTERSECT` and `EXCEPT` say nothing interesting about two identical row sets.
+    let set_op = if wants_set_op {
+        let op = match rng.random_range(0..4) {
+            0 => SetOp::Union,
+            1 => SetOp::UnionAll,
+            2 => SetOp::Intersect,
+            _ => SetOp::Except,
+        };
+        Some(SetBranch {
+            op,
+            right: Box::new(SelectStmt {
+                projection: projection.clone(),
+                from: table.name.clone(),
+                set_op: None,
+                group_by: Vec::new(),
+                filter: (rng.random_range(0..100) < 80)
+                    .then(|| generate_predicate(rng, table, bounds, 0)),
+                order_by: Vec::new(),
+                limit: None,
+            }),
+        })
+    } else {
+        None
+    };
+
     SelectStmt {
         projection,
         from: table.name.clone(),
+        set_op,
         group_by,
         filter,
         order_by,
