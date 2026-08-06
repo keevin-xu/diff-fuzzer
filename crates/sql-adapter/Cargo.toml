@@ -14,6 +14,10 @@ repository.workspace = true
 # the engine, the engine knows nothing about SQL. Cargo enforces that, not discipline —
 # a `use sql_adapter::..` inside the engine would not compile.
 diff-fuzzer-core = { path = "../diff-fuzzer-core" }
+# For the RNG traits only (`random_range` and friends). The generator itself is always the
+# engine's `SeededRng`, never one of this crate's own — a second source of randomness would
+# mean a finding that cannot be replayed from its seed.
+rand.workspace = true
 # A finding must serialize whole. The seed alone does not reproduce a case: it only does
 # so for the exact generator that produced it, and generators change.
 serde.workspace = true

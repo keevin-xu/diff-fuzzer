@@ -43,6 +43,8 @@ pub mod ast;
 pub mod backends;
 /// Running one case end to end: generate, run both engines, normalize, judge.
 pub mod driver;
+/// Generating the state a query runs against: tables, and the rows in them.
+pub mod gen_schema;
 /// Producing cases to test. A placeholder until S2.
 pub mod generator;
 /// Turning what an engine returned into a comparable canonical form.

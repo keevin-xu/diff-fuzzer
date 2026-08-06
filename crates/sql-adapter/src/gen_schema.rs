@@ -1,0 +1,358 @@
+//! Generating the *state* a query runs against: tables, and the rows in them.
+//!
+//! SQLancer's central idea, and the one this domain borrows: **generate the state first,
+//! then generate a query against that known state.** A query built with the schema in hand
+//! can only reference columns that exist, with types that match, so validity is a property
+//! of how the case was built rather than something checked afterwards. Generate-and-reject
+//! would instead spend the budget proving that the engines' parsers work.
+//!
+//! # What uniform sampling would never produce
+//!
+//! Sampling integers uniformly gives `0` with probability nil, never gives `i64::MIN`, and
+//! never repeats a value. Every one of those absences matters here:
+//!
+//! - **`NULL`** — three-valued logic is where engines disagree most.
+//! - **The empty string** — distinct from `NULL`, and easy for either engine to conflate.
+//! - **The text `NULL`** — the value that would collide with a real `NULL` under a careless
+//!   canonical form. Generating it means our own normalizer is under test too.
+//! - **`0`, `1`, `-1`, `i64::MIN`, `i64::MAX`** — boundaries, and the overflow edge.
+//! - **Repeated values** — the reason a query can have an `ORDER BY` and still not be
+//!   totally ordered. Ties have to occur, or the sort-mode logic is never exercised.
+//! - **An empty table** — a query over no rows at all.
+//!
+//! So values come from a deliberate pool far more often than from uniform sampling. Bugs
+//! cluster exactly where random sampling does not go.
+
+use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
+use diff_fuzzer_core::SeededRng;
+use rand::RngExt;
+
+/// How large a generated case may be.
+///
+/// **One definition, named in the generator's description**, because a negative case
+/// recorded under one set of bounds cannot be scored against findings produced under
+/// another — the distributions differ even though both say "generated". The tensor domain
+/// learned this when widened bounds silently produced an incomparable pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    pub max_tables: usize,
+    pub max_columns: usize,
+    pub max_rows: usize,
+}
+
+impl Bounds {
+    /// The v1 bounds. Small on purpose: the pipeline has to be trustworthy before breadth
+    /// is worth anything, and every bound this project has chosen by intuition was wrong —
+    /// so these are a starting point to be *measured* at S2.8 and S5, not a considered
+    /// answer.
+    pub const V1: Bounds = Bounds {
+        max_tables: 2,
+        max_columns: 4,
+        max_rows: 8,
+    };
+
+    /// A description that names the parameters, for recording alongside a case.
+    ///
+    /// Compared as an exact string when deciding whether two pools are comparable, so it
+    /// must change whenever the numbers do. The test below fails if they drift apart.
+    pub fn description(&self) -> String {
+        format!(
+            "sql-v1(tables<={}, columns<={}, rows<={})",
+            self.max_tables, self.max_columns, self.max_rows
+        )
+    }
+}
+
+/// Integer values worth trying, beyond whatever uniform sampling produces.
+const INTERESTING_INTEGERS: [i64; 7] = [0, 1, -1, 2, -2, i64::MAX, i64::MIN];
+
+/// Text values worth trying.
+///
+/// `"NULL"` is here on purpose: it is the string that would be indistinguishable from a
+/// real `NULL` under a canonical form that renders both bare. Generating it keeps our own
+/// normalizer honest. `"'"` is here because a value containing a quote is what a careless
+/// renderer turns into broken SQL.
+const INTERESTING_TEXT: [&str; 6] = ["", "NULL", "'", "a", "A", "  "];
+
+/// How often a nullable cell is actually `NULL`, in percent.
+///
+/// High — far higher than uniform sampling would give — because `NULL` propagation through
+/// comparisons is the single richest source of engine disagreement in SQL.
+const NULL_PERCENT: u32 = 25;
+
+/// Build a schema: one or two tables, each with a few typed columns.
+///
+/// Names are positional (`t0`, `c0`) rather than random. A random identifier would add
+/// noise to every minimized repro without testing anything — engines do not care what a
+/// column is called, and a human reading a finding does.
+pub fn generate_schema(rng: &mut SeededRng, bounds: Bounds) -> Vec<Table> {
+    let table_count = rng.random_range(1..=bounds.max_tables);
+
+    (0..table_count)
+        .map(|table_index| {
+            let column_count = rng.random_range(1..=bounds.max_columns);
+            let columns = (0..column_count)
+                .map(|column_index| Column {
+                    name: format!("c{column_index}"),
+                    // Only the three generated types — `DECIMAL` and `BOOLEAN` are defined
+                    // in the AST but kept out of cases until their cross-engine behaviour
+                    // is retrieved rather than recalled (`SPECS.md` §4.1–4.2).
+                    sql_type: SqlType::GENERATED[rng.random_range(0..SqlType::GENERATED.len())],
+                })
+                .collect();
+
+            Table {
+                name: format!("t{table_index}"),
+                columns,
+            }
+        })
+        .collect()
+}
+
+/// Fill each table with rows, honouring its column types.
+///
+/// Row counts start at **zero**: an empty table is a real case, and one whose absence from
+/// a corpus would go unnoticed. Aggregates over nothing, joins against nothing, and
+/// `WHERE` clauses that match nothing all begin here.
+pub fn generate_data(rng: &mut SeededRng, tables: &[Table], bounds: Bounds) -> Vec<InsertRows> {
+    tables
+        .iter()
+        .map(|table| {
+            let row_count = rng.random_range(0..=bounds.max_rows);
+            let rows = (0..row_count)
+                .map(|_| {
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| generate_literal(rng, column.sql_type))
+                        .collect()
+                })
+                .collect();
+
+            InsertRows {
+                table: table.name.clone(),
+                rows,
+            }
+        })
+        .collect()
+}
+
+/// One value of the given type — `NULL` a quarter of the time, otherwise usually a value
+/// from the interesting pool.
+///
+/// Drawing from a small pool has a second effect worth naming: **values repeat**, which is
+/// what creates ties. A generator whose values were all distinct would never produce a case
+/// where `ORDER BY c0` fails to order the rows totally, and the sort-mode decision would go
+/// permanently untested.
+pub fn generate_literal(rng: &mut SeededRng, sql_type: SqlType) -> Literal {
+    if rng.random_range(0..100) < NULL_PERCENT {
+        return Literal::Null;
+    }
+
+    match sql_type {
+        SqlType::Integer | SqlType::BigInt => {
+            // Mostly from the pool, sometimes an arbitrary value — the pool finds edges,
+            // arbitrary values find everything the pool's author did not think of.
+            if rng.random_range(0..100) < 75 {
+                Literal::Integer(
+                    INTERESTING_INTEGERS[rng.random_range(0..INTERESTING_INTEGERS.len())],
+                )
+            } else {
+                Literal::Integer(rng.random_range(-1000..=1000))
+            }
+        }
+        SqlType::Text => {
+            Literal::Text(INTERESTING_TEXT[rng.random_range(0..INTERESTING_TEXT.len())].to_string())
+        }
+        // Unreachable by construction: `generate_schema` only emits generated types, and
+        // this arm exists so that adding a type to `SqlType::GENERATED` without teaching
+        // this function about it fails loudly here rather than silently producing nothing.
+        SqlType::Decimal | SqlType::Boolean => {
+            unreachable!("{sql_type:?} is not generated in v1; see SqlType::GENERATED")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_and_data(seed: u64) -> (Vec<Table>, Vec<InsertRows>) {
+        let mut rng = SeededRng::from_seed(seed);
+        let tables = generate_schema(&mut rng, Bounds::V1);
+        let data = generate_data(&mut rng, &tables, Bounds::V1);
+        (tables, data)
+    }
+
+    #[test]
+    fn the_description_names_the_actual_bounds() {
+        // The guard against the tensor domain's silent-incomparability bug: if the numbers
+        // change and the description does not, two differently-drawn pools would both
+        // claim to be the same distribution.
+        let description = Bounds::V1.description();
+        assert!(description.contains(&Bounds::V1.max_tables.to_string()));
+        assert!(description.contains(&Bounds::V1.max_columns.to_string()));
+        assert!(description.contains(&Bounds::V1.max_rows.to_string()));
+
+        let wider = Bounds {
+            max_rows: Bounds::V1.max_rows + 1,
+            ..Bounds::V1
+        };
+        assert_ne!(wider.description(), Bounds::V1.description());
+    }
+
+    #[test]
+    fn generation_is_deterministic() {
+        assert_eq!(schema_and_data(12345), schema_and_data(12345));
+    }
+
+    #[test]
+    fn different_seeds_give_different_cases() {
+        // Weak by design — two seeds *could* coincide — but across this many it would take
+        // a broken generator. This is the test S1 could not have.
+        // Compared as JSON rather than by hashing, so the AST types are not forced to
+        // derive `Hash` for the sake of one test.
+        let distinct = (0..20)
+            .map(|seed| serde_json::to_string(&schema_and_data(seed)).expect("serializes"))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct > 10,
+            "only {distinct} distinct cases from 20 seeds"
+        );
+    }
+
+    #[test]
+    fn everything_stays_inside_the_bounds() {
+        for seed in 0..200 {
+            let (tables, data) = schema_and_data(seed);
+
+            assert!(!tables.is_empty() && tables.len() <= Bounds::V1.max_tables);
+            for table in &tables {
+                assert!(!table.columns.is_empty());
+                assert!(table.columns.len() <= Bounds::V1.max_columns);
+            }
+            for insert in &data {
+                assert!(insert.rows.len() <= Bounds::V1.max_rows);
+            }
+        }
+    }
+
+    #[test]
+    fn only_generated_types_appear() {
+        for seed in 0..200 {
+            let (tables, _) = schema_and_data(seed);
+            for table in &tables {
+                for column in &table.columns {
+                    assert!(
+                        column.sql_type.is_generated(),
+                        "{:?} must not be generated in v1",
+                        column.sql_type
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_row_matches_its_tables_column_types() {
+        // Name resolution's first half: the data must fit the schema positionally and by
+        // type, or the case is invalid before any query is even written.
+        for seed in 0..200 {
+            let (tables, data) = schema_and_data(seed);
+
+            for insert in &data {
+                let table = tables
+                    .iter()
+                    .find(|table| table.name == insert.table)
+                    .expect("data references a table that exists");
+
+                for row in &insert.rows {
+                    assert_eq!(
+                        row.len(),
+                        table.columns.len(),
+                        "row width matches the table"
+                    );
+                    for (value, column) in row.iter().zip(table.columns.iter()) {
+                        match value.sql_type() {
+                            // NULL fits any column.
+                            None => {}
+                            Some(value_type) => assert!(
+                                column.sql_type.accepts(value_type),
+                                "{value:?} does not fit a {:?} column",
+                                column.sql_type
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The awkward values have to actually occur, or generating them is a claim rather than
+    /// a fact. Each of these is a case the pipeline is specifically supposed to handle.
+    #[test]
+    fn the_values_that_uniform_sampling_would_miss_do_occur() {
+        let mut saw_null = false;
+        let mut saw_empty_text = false;
+        let mut saw_the_text_null = false;
+        let mut saw_quote = false;
+        let mut saw_extreme_integer = false;
+        let mut saw_empty_table = false;
+        let mut saw_a_tie = false;
+
+        for seed in 0..300 {
+            let (_, data) = schema_and_data(seed);
+            for insert in &data {
+                if insert.rows.is_empty() {
+                    saw_empty_table = true;
+                }
+
+                // A tie is two rows sharing a value in the same column — the reason an
+                // `ORDER BY` can exist and still not order the rows totally.
+                for column_index in 0..insert.rows.first().map_or(0, Vec::len) {
+                    let column: Vec<_> = insert
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.get(column_index))
+                        .collect();
+                    for (position, value) in column.iter().enumerate() {
+                        if column[position + 1..].contains(value) {
+                            saw_a_tie = true;
+                        }
+                    }
+                }
+
+                for value in insert.rows.iter().flatten() {
+                    match value {
+                        Literal::Null => saw_null = true,
+                        Literal::Text(text) if text.is_empty() => saw_empty_text = true,
+                        Literal::Text(text) if text == "NULL" => saw_the_text_null = true,
+                        Literal::Text(text) if text == "'" => saw_quote = true,
+                        Literal::Integer(number) if *number == i64::MAX || *number == i64::MIN => {
+                            saw_extreme_integer = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(saw_null, "NULL must occur");
+        assert!(saw_empty_text, "the empty string must occur");
+        assert!(
+            saw_the_text_null,
+            "the text 'NULL' must occur — it is what tests our own canonical form"
+        );
+        assert!(
+            saw_quote,
+            "a quote must occur — it is what tests the renderer"
+        );
+        assert!(saw_extreme_integer, "integer boundaries must occur");
+        assert!(saw_empty_table, "an empty table must occur");
+        assert!(
+            saw_a_tie,
+            "repeated values must occur, or sort modes go untested"
+        );
+    }
+}

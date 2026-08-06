@@ -5147,6 +5147,7 @@ version = "0.1.0"
 dependencies = [
  "diff-fuzzer-core",
  "duckdb",
+ "rand 0.10.2",
  "rusqlite",
  "serde",
  "serde_json",
