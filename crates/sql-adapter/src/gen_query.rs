@@ -125,12 +125,52 @@ pub fn generate_query(
             2 => SetOp::Intersect,
             _ => SetOp::Except,
         };
+        // Chaining, when enabled: a third branch under a **different** operator, because
+        // precedence is only observable when the operators differ. `A UNION B UNION C` groups
+        // the same way whichever rule applies; `A UNION B INTERSECT C` does not — it is
+        // `(A UNION B) INTERSECT C` under SQLite's documented left-to-right rule and
+        // `A UNION (B INTERSECT C)` under SQL92's. Nothing is parenthesized, deliberately:
+        // the rendered text is the probe, and each engine parses it by its own rule.
+        //
+        // Note the AST nests `A op (B op2 C)` while the text is flat. Here the *text* is the
+        // meaning, not the tree — the one place in this crate where that is true, and the
+        // reason the renderer must never start adding parentheses to set operations.
+        let inner = if bounds.chained_set_ops && rng.random_range(0..100) < 70 {
+            let second = match (op, rng.random_range(0..2)) {
+                // Pair a deduplicating union or difference with an intersection, which is
+                // exactly the pairing the two precedence rules disagree about.
+                (SetOp::Intersect, _) => {
+                    if rng.random_range(0..2) == 0 {
+                        SetOp::Union
+                    } else {
+                        SetOp::Except
+                    }
+                }
+                (_, _) => SetOp::Intersect,
+            };
+            Some(SetBranch {
+                op: second,
+                right: Box::new(SelectStmt {
+                    projection: projection.clone(),
+                    from: table.name.clone(),
+                    set_op: None,
+                    group_by: Vec::new(),
+                    filter: (rng.random_range(0..100) < 80)
+                        .then(|| generate_predicate(rng, table, bounds, 0)),
+                    order_by: Vec::new(),
+                    limit: None,
+                }),
+            })
+        } else {
+            None
+        };
+
         Some(SetBranch {
             op,
             right: Box::new(SelectStmt {
                 projection: projection.clone(),
                 from: table.name.clone(),
-                set_op: None,
+                set_op: inner,
                 group_by: Vec::new(),
                 filter: (rng.random_range(0..100) < 80)
                     .then(|| generate_predicate(rng, table, bounds, 0)),

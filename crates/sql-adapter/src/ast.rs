@@ -307,11 +307,25 @@ impl SqlCase {
             if !branch.right.order_by.is_empty() || branch.right.limit.is_some() {
                 return Err("a set operation's right branch may not order or limit".to_string());
             }
-            if branch.right.set_op.is_some() {
-                return Err("set operations are not chained (precedence is undecided)".to_string());
-            }
             if branch.right.from != self.query.from {
                 return Err("both branches must read the same table in v1".to_string());
+            }
+            // Chaining is permitted to one further level, and no more: two operations is
+            // enough for precedence to be observable, and each extra level multiplies the
+            // shapes a minimized case has to be read through.
+            if let Some(inner) = &branch.right.set_op {
+                if inner.right.set_op.is_some() {
+                    return Err("set operations chain at most twice".to_string());
+                }
+                if inner.right.projection.len() != self.query.projection.len() {
+                    return Err("every branch of a chain must project the same columns".to_string());
+                }
+                if !inner.right.order_by.is_empty() || inner.right.limit.is_some() {
+                    return Err("no branch of a chain may order or limit".to_string());
+                }
+                if inner.right.from != self.query.from {
+                    return Err("every branch must read the same table in v1".to_string());
+                }
             }
         }
 

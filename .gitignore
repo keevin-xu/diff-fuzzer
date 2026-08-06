@@ -47,3 +47,4 @@ skills/
 # (a reproduction in an issue draft, a case pinned in a test) rather than surviving by
 # accident because a directory happened to be tracked.
 findings/
+issues/README.md

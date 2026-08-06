@@ -38,6 +38,13 @@ pub struct Bounds {
     pub max_tables: usize,
     pub max_columns: usize,
     pub max_rows: usize,
+    /// Whether set operations may be **chained** — `A UNION B INTERSECT C`, unparenthesized.
+    ///
+    /// This is the probe for the one difference documented on one side only: SQLite states
+    /// that it groups `UNION`/`INTERSECT`/`EXCEPT` left-to-right and that SQL92 disagrees
+    /// (`SPECS.md` §1.4, §4.11); DuckDB documents nothing (§5.9, two failed retrievals).
+    /// Generating the construct is the only remaining way to learn what DuckDB does.
+    pub chained_set_ops: bool,
     /// Whether the generator may emit a set operation (`UNION`, `UNION ALL`, `INTERSECT`,
     /// `EXCEPT`).
     ///
@@ -86,11 +93,19 @@ impl Bounds {
         wide_arithmetic: false,
         aggregates: false,
         set_ops: false,
+        chained_set_ops: false,
     };
 
     /// V1 plus set operations. One axis, as always.
     pub const V1_SET_OPS: Bounds = Bounds {
         set_ops: true,
+        ..Bounds::V1
+    };
+
+    /// V1 plus **chained** set operations, where precedence becomes observable.
+    pub const V1_CHAINED_SET_OPS: Bounds = Bounds {
+        set_ops: true,
+        chained_set_ops: true,
         ..Bounds::V1
     };
 
@@ -115,14 +130,15 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={})",
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={})",
             self.max_tables,
             self.max_columns,
             self.max_rows,
             self.max_expr_depth,
             self.wide_arithmetic,
             self.aggregates,
-            self.set_ops
+            self.set_ops,
+            self.chained_set_ops
         )
     }
 }

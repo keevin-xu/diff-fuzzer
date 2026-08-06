@@ -129,6 +129,20 @@ pub fn clause_shape(case: &SqlCase) -> Vec<&'static str> {
         if let Some(filter) = &branch.right.filter {
             collect_expr_tags(filter, &mut tags);
         }
+        if let Some(inner) = &branch.right.set_op {
+            // Chained, and the *pair* of operators is what precedence turns on — so the tag
+            // names both rather than just saying "chained".
+            tags.insert("chained-set-op");
+            tags.insert(match inner.op {
+                crate::schema::SetOp::Union => "union",
+                crate::schema::SetOp::UnionAll => "union-all",
+                crate::schema::SetOp::Intersect => "intersect",
+                crate::schema::SetOp::Except => "except",
+            });
+            if let Some(filter) = &inner.right.filter {
+                collect_expr_tags(filter, &mut tags);
+            }
+        }
     }
     // An aggregate over an empty table is its own phenomenon — the row count collapses to
     // one whatever the data — so it earns a tag rather than hiding inside "empty-table".
