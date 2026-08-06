@@ -191,18 +191,30 @@ fn generate_scalar(
                 // a *catalogued* experiment, once each engine's behaviour is cited rather
                 // than observed. Keeping it now would mean an oracle whose noisiest signal
                 // is a difference we cannot yet defend.
-                Expr::Binary {
-                    op: match rng.random_range(0..3) {
-                        0 => BinaryOp::Add,
-                        1 => BinaryOp::Subtract,
-                        _ => BinaryOp::Multiply,
-                    },
-                    left: Box::new(Expr::Literal(crate::schema::Literal::Integer(
-                        rng.random_range(-100..=100),
-                    ))),
-                    right: Box::new(Expr::Literal(crate::schema::Literal::Integer(
-                        rng.random_range(-100..=100),
-                    ))),
+                let op = match rng.random_range(0..3) {
+                    0 => BinaryOp::Add,
+                    1 => BinaryOp::Subtract,
+                    _ => BinaryOp::Multiply,
+                };
+                if bounds.wide_arithmetic {
+                    // Overflow is reachable from here, deliberately: operands may be
+                    // columns or pool values, so `i64::MAX + 1` occurs. Measured against
+                    // the bounded setting at S5 to answer whether it finds anything.
+                    Expr::Binary {
+                        op,
+                        left: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
+                        right: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
+                    }
+                } else {
+                    Expr::Binary {
+                        op,
+                        left: Box::new(Expr::Literal(crate::schema::Literal::Integer(
+                            rng.random_range(-100..=100),
+                        ))),
+                        right: Box::new(Expr::Literal(crate::schema::Literal::Integer(
+                            rng.random_range(-100..=100),
+                        ))),
+                    }
                 }
             } else if choice < 92 {
                 // Negation, over a small literal for the same reason: `-(i32::MIN)` has no

@@ -38,6 +38,18 @@ pub struct Bounds {
     pub max_tables: usize,
     pub max_columns: usize,
     pub max_rows: usize,
+    /// Whether arithmetic may overflow.
+    ///
+    /// `false` (v1) bounds arithmetic to small literals so a result cannot leave any
+    /// integer range. `true` restores column and pool operands, which reaches
+    /// `i64::MAX + 1` — where the two engines make **incompatible documented promises**:
+    /// SQLite falls back to floating-point arithmetic, DuckDB raises (`SPECS.md` §4.9).
+    ///
+    /// It is a knob rather than a constant because the question "does widening this find
+    /// anything?" is answered by measuring both settings, not by choosing one. Note it is
+    /// part of [`Bounds::description`], so cases drawn under the two settings can never be
+    /// mistaken for one distribution.
+    pub wide_arithmetic: bool,
     /// How deeply expressions may nest.
     ///
     /// Bounds *size*, which bounds runtime and how painful minimization is. Note that
@@ -56,6 +68,15 @@ impl Bounds {
         max_columns: 4,
         max_rows: 8,
         max_expr_depth: 3,
+        wide_arithmetic: false,
+    };
+
+    /// V1 with overflow reachable. Everything else identical, so a difference in yield
+    /// between the two is attributable to this one axis — the tensor domain's rule that a
+    /// sweep must vary one thing at a time.
+    pub const V1_WIDE_ARITHMETIC: Bounds = Bounds {
+        wide_arithmetic: true,
+        ..Bounds::V1
     };
 
     /// A description that names the parameters, for recording alongside a case.
@@ -64,8 +85,12 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={})",
-            self.max_tables, self.max_columns, self.max_rows, self.max_expr_depth
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={})",
+            self.max_tables,
+            self.max_columns,
+            self.max_rows,
+            self.max_expr_depth,
+            self.wide_arithmetic
         )
     }
 }
@@ -226,6 +251,12 @@ mod tests {
         assert!(description.contains(&Bounds::V1.max_columns.to_string()));
         assert!(description.contains(&Bounds::V1.max_rows.to_string()));
         assert!(description.contains(&Bounds::V1.max_expr_depth.to_string()));
+        // The overflow axis must be visible in the description too, or two pools drawn
+        // under different settings would claim to be the same distribution.
+        assert_ne!(
+            Bounds::V1.description(),
+            Bounds::V1_WIDE_ARITHMETIC.description()
+        );
 
         let wider = Bounds {
             max_rows: Bounds::V1.max_rows + 1,

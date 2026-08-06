@@ -51,6 +51,8 @@ pub mod gen_query;
 pub mod gen_schema;
 /// Producing cases to test. A placeholder until S2.
 pub mod generator;
+/// Differences the engines are documented to have, which are therefore not bugs.
+pub mod known;
 /// Turning what an engine returned into a comparable canonical form.
 pub mod normalize;
 /// Deciding whether the engines disagreed.
@@ -61,8 +63,14 @@ pub mod ordering;
 pub mod outcome;
 /// Turning the tree into SQL text, once per engine.
 pub mod render;
+/// What a finding is, on disk.
+pub mod report;
 /// The typed tree a case is made of: types, tables, values, expressions, one query.
 pub mod schema;
+/// Making a failing case small enough to look at.
+pub mod shrink;
+/// When two findings are the same problem.
+pub mod signature;
 /// An engine that is wrong on purpose, so "found nothing" can mean something.
 pub mod testing;
 

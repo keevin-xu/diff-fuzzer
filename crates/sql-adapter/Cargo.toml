@@ -21,6 +21,10 @@ rand.workspace = true
 # A finding must serialize whole. The seed alone does not reproduce a case: it only does
 # so for the exact generator that produced it, and generators change.
 serde.workspace = true
+# Findings are written to disk as JSON. A dev-dependency until S5, when reports became
+# real: a divergence that exists only in a terminal scrollback is not a finding anyone
+# can act on.
+serde_json.workspace = true
 
 # The two engines under comparison. Versions and features are pinned once, in the root
 # [workspace.dependencies]; `.workspace = true` just says "use that".
@@ -30,12 +34,6 @@ serde.workspace = true
 # one correct. The oracle only ever reports *that* they differ.
 rusqlite.workspace = true
 duckdb.workspace = true
-
-[dev-dependencies]
-# Only the tests need JSON today — they check that a case survives being written and read
-# back, which is the property a saved finding depends on. It becomes a real dependency at
-# S5, when reports are actually written to disk.
-serde_json.workspace = true
 
 # Note what is NOT here: `tensor-adapter`. The triage and predicate machinery this domain
 # reuses lives in that crate, and it will be *copied* rather than depended on — depending

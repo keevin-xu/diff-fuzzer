@@ -20,7 +20,9 @@
 //! everything against the first.
 
 use crate::ast::SqlCase;
+use crate::known::legal_difference;
 use crate::normalize::CanonicalResult;
+use crate::signature::DisagreementKind;
 use diff_fuzzer_core::report::Divergence;
 use diff_fuzzer_core::traits::{NamedOutput, Oracle, SkipReason, Verdict};
 
@@ -124,6 +126,21 @@ impl Oracle for SqlDifferentialOracle {
 
         if complaints.is_empty() {
             return Verdict::Agree;
+        }
+
+        // **The catalog is consulted only after a real difference has been established**,
+        // and only to reclassify it — never to decide whether to look. A difference the
+        // engines are *documented* to be allowed to have is skipped with the entry named, so
+        // the filtering stays auditable: a `Skipped(KnownLegal)` says which rule suppressed
+        // it and where the evidence is, rather than vanishing into a count.
+        let canonical: Vec<&CanonicalResult> = outputs.iter().map(|named| &named.output).collect();
+        if let Some(kind) = DisagreementKind::between(canonical[0], canonical[1])
+            && let Some(entry) = legal_difference(input, kind, &canonical)
+        {
+            return Verdict::Skipped(SkipReason::KnownLegal {
+                class: entry.name.to_string(),
+                detail: format!("{} — {}", complaints.join("; "), entry.citation),
+            });
         }
 
         Verdict::Diverged(Divergence {
