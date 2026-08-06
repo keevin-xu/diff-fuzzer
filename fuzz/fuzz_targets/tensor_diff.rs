@@ -166,7 +166,7 @@ fuzz_target!(|case: TensorOp| {
         // and libFuzzer keeps the bytes in `fuzz/artifacts/` besides.
         seed: 0,
         label: case.name().to_string(),
-        generator: "decoded from fuzzer bytes".to_string(),
+        generator: negatives::FUZZER_GENERATOR.to_string(),
         input: minimized.input.clone(),
         minimisation: MinimisationRecord::from(&minimized),
         outputs: divergence.outputs,
@@ -289,8 +289,27 @@ fn save_negative(case: &TensorOp, source: negatives::Source) {
         env!("CARGO_MANIFEST_DIR"),
         run_label()
     );
-    // The fuzz target's cases always come from decoded fuzzer bytes.
-    let _ = negatives::save_case(&directory, case, source, negatives::Provenance::Fuzzer);
+    // The fuzz target's cases always come from decoded fuzzer bytes, compared on the two
+    // CPU backends. Both are recorded: a negative is only usable against findings drawn the
+    // same way *and* observed on the same implementations.
+    let _ = negatives::save_case(&directory, case, source, &sampling_context());
+}
+
+/// How this target's cases were produced, and on what.
+///
+/// The generator string names the decode bounds, so negatives recorded before those were
+/// widened do not silently pass as comparable with ones recorded after.
+fn sampling_context() -> negatives::SamplingContext {
+    let harness = harness();
+    // Read from the runners rather than hardcoded, so that a fault-injected run — which
+    // compares against a deliberately wrong backend — records negatives that can never be
+    // scored against real findings. Hardcoding the names would lose exactly that.
+    let second = if harness.inject_fault {
+        harness.faulty.name()
+    } else {
+        harness.torch.name()
+    };
+    negatives::SamplingContext::new(negatives::FUZZER_GENERATOR, &[harness.cpu.name(), second])
 }
 
 /// Which run's directory this process should file its findings under.

@@ -54,6 +54,19 @@ pub struct Bounds {
     /// they have to be injected deliberately rather than waited for.
     pub special_value_rate: f64,
 
+    /// The most elements one operand may have.
+    ///
+    /// **`max_rank` and `max_dim` multiply, so bounding each does not bound the case.** At
+    /// rank 4 and `max_dim: 64` a shape reaches 64⁴ = 16.7 million elements, and a matmul's
+    /// cost is a further factor of `n` on top. This is the only field that bounds the case
+    /// itself.
+    ///
+    /// **It is a real trade, not free.** Measured: at `max_dim: 64`, lowering this to 4,096
+    /// took the divergence rate from 9 in 2,000 to **0 in 2,000** — the large shapes that
+    /// cost the time were the same ones that produced the disagreements. Raise it to find
+    /// more per case; lower it to run more cases.
+    pub max_elements: usize,
+
     /// Whether arguments are confined to each operation's defined domain.
     ///
     /// When `true` (the default), `sqrt` receives only non-negatives and `div` only
@@ -74,6 +87,9 @@ impl Default for Bounds {
             // one interesting value, low enough that ordinary arithmetic still dominates
             // and the operations are exercised on realistic data too.
             special_value_rate: 0.125,
+            // 8⁴ — the worst case the historical `max_dim: 8` regime already allowed, so
+            // this default changes nothing about how the old campaigns behaved.
+            max_elements: 4_096,
             restrict_domains: true,
         }
     }
@@ -138,9 +154,30 @@ pub fn shape(rng: &mut SeededRng, bounds: &Bounds) -> Vec<usize> {
 /// Needed where rank is not free to vary — `matmul` requires at least two dimensions,
 /// so it picks its rank first and then asks for a shape of that size.
 pub fn shape_of_rank(rng: &mut SeededRng, rank: usize, bounds: &Bounds) -> Vec<usize> {
-    (0..rank)
+    let raw = (0..rank)
         .map(|_| rng.random_range(1..=bounds.max_dim))
-        .collect()
+        .collect();
+    clamp_to(raw, bounds.max_elements)
+}
+
+/// Shrink dimensions, largest first, until the total fits `budget`.
+///
+/// Clamping rather than rejecting: for the decoder a rejected input teaches the fuzzer
+/// nothing, and for the generator a rejected draw would silently skew the distribution
+/// toward small ranks. `matmul` passes a reduced budget, because its operand is the batch
+/// dimensions *times* `m × k`.
+pub fn clamp_to(mut shape: Vec<usize>, budget: usize) -> Vec<usize> {
+    let budget = budget.max(1);
+    while element_count(&shape) > budget {
+        let Some(largest) = shape.iter_mut().max() else {
+            break;
+        };
+        if *largest <= 1 {
+            break;
+        }
+        *largest /= 2;
+    }
+    shape
 }
 
 /// `count` values drawn from `domain`.

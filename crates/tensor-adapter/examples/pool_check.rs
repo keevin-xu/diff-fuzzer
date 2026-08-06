@@ -1,25 +1,32 @@
 //! What can the search actually score against today?
-use tensor_adapter::negatives::{self, Pool, Provenance};
+use tensor_adapter::negatives::{self, Pool, SamplingContext};
 
 fn main() {
     let all = negatives::load("findings/negatives");
     println!("{} negatives on disk\n", all.len());
 
-    for p in [
-        Provenance::Fuzzer,
-        Provenance::SeededWide,
-        Provenance::Constructed,
-        Provenance::Unknown,
-    ] {
-        let n = all.iter().filter(|x| x.provenance == p).count();
-        println!("  {:<16} {n}", p.label());
-    }
-
-    println!("\nusable when scoring findings from each generator:");
-    for p in [Provenance::Fuzzer, Provenance::SeededWide] {
-        match Pool::matched(all.clone(), p) {
-            Ok(pool) => println!("  {:<16} {} negatives", p.label(), pool.len()),
-            Err(e) => println!("  {:<16} REFUSED — {e}", p.label()),
+    for (label, ctx) in contexts() {
+        match Pool::matched(all.clone(), &ctx) {
+            Ok(pool) => println!("  {label:<28} {} negatives", pool.len()),
+            Err(e) => println!("  {label:<28} REFUSED — {e}"),
         }
     }
+}
+
+/// The contexts a campaign might plausibly want to score against.
+fn contexts() -> Vec<(String, SamplingContext)> {
+    let pair = ["flex", "libtorch"];
+    vec![
+        (
+            "fuzzer (current bounds)".to_string(),
+            SamplingContext::new(negatives::FUZZER_GENERATOR, &pair),
+        ),
+        (
+            "seeded wide".to_string(),
+            SamplingContext::new(
+                "Bounds { max_rank: 3, max_dim: 64, magnitude: 1000.0 }",
+                &pair,
+            ),
+        ),
+    ]
 }

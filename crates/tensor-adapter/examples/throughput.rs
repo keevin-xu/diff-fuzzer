@@ -32,7 +32,15 @@ fn rate(count: u64, seconds: f64) -> String {
 }
 
 fn main() {
-    let generator = TensorOpGenerator::default();
+    // `wide` measures the cost of the shapes the fuzzer's decoder now reaches, so the
+    // throughput consequence of widening `max_dim` is a measurement rather than a guess.
+    let generator = match std::env::args().nth(1).as_deref() {
+        Some("wide") => TensorOpGenerator::new(tensor_adapter::Bounds {
+            max_dim: 64,
+            ..Default::default()
+        }),
+        _ => TensorOpGenerator::default(),
+    };
 
     // Generation alone.
     let start = Instant::now();

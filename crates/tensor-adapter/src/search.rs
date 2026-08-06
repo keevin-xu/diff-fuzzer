@@ -281,6 +281,8 @@ mod tests {
                     case,
                     source,
                     provenance: Provenance::Constructed,
+                    generator: "built by hand".to_string(),
+                    backends: vec!["flex".to_string(), "libtorch".to_string()],
                 })
                 .collect(),
         )

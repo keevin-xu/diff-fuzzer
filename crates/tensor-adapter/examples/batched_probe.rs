@@ -331,7 +331,7 @@ fn write_negatives(cases: &[(String, TensorOp)]) {
         &path,
         &only_cases,
         Source::Constructed,
-        negatives::Provenance::Constructed,
+        &negatives::SamplingContext::new("built by hand: batched_probe", &["flex", "libtorch"]),
     ) {
         Ok(()) => println!("\n{} non-diverging case(s) written to {path}", cases.len()),
         Err(error) => eprintln!("\ncould not write {path}: {error}"),

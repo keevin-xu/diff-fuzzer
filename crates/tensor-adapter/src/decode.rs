@@ -43,10 +43,40 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 /// Bounds used when decoding. Fixed rather than configurable, because the fuzzer's
 /// corpus is only meaningful for the layout that produced it: changing these would
 /// silently reinterpret every saved input.
-const DECODE_BOUNDS: Bounds = Bounds {
+///
+/// **`max_dim` widened at PHASE-8 from 8 to 64, and nothing else changed.** A sweep varying
+/// one axis at a time settled which one mattered:
+///
+/// | bounds | diverged / 2,000 | sec | diverg/sec |
+/// |---|---|---|---|
+/// | `max_dim: 8` (historical) | 0 | 0.0 | 0 |
+/// | `magnitude: 1000.0` | 0 | 0.0 | 0 |
+/// | `max_dim: 64`, budget 4k | 0 | 23.7 | 0 |
+/// | `max_dim: 64`, budget 64k | 3 | 22.7 | 0.132 |
+/// | **`max_dim: 64`, budget 1M** | **5** | 24.3 | **0.206** |
+///
+/// Dimension is the whole effect; magnitude contributes nothing. That fits the mechanism
+/// behind the one real finding — a tile-remainder effect governed by `(m mod 4) * (n mod 8)`
+/// — which is a property of **shape**, not of the values.
+///
+/// **The cost is real and large:** roughly 80 cases/second against tens of thousands at the
+/// old bounds, because matmul costs `m × k × n`. It is accepted because the alternative rate
+/// is zero, and 0.206/sec beats any multiple of nothing — but it is a campaign-shaping
+/// trade, not a free win.
+///
+/// **Changing these invalidates the corpus and every negative recorded under them.** The
+/// corpus must be started fresh, and old negatives stop matching because
+/// [`FUZZER_GENERATOR`](crate::negatives::FUZZER_GENERATOR) names the bounds — which is the
+/// point: they were drawn from a different distribution.
+pub const DECODE_BOUNDS: Bounds = Bounds {
     max_rank: crate::backends::MAX_RANK,
-    max_dim: 8,
+    max_dim: 64,
     magnitude: 10.0,
+    // **Measured, not guessed.** At `max_dim: 64`, budgets of 4k / 64k / 1M cost 23.7s /
+    // 22.7s / 24.3s per 2,000 cases and found 0 / 3 / 5 divergences. The budget is very
+    // nearly free — the time goes to matmul's `m × k × n`, which no element cap touches —
+    // so a tight budget is the worst of both worlds: full price, nothing found.
+    max_elements: 1_048_576,
     // Unused here — special values are selected by the byte layout below rather than by
     // a probability — but the struct requires them.
     special_value_rate: 0.0,
@@ -143,8 +173,31 @@ fn binary_right_domain(kind: BinaryOp) -> Domain {
 }
 
 /// A shape of `rank` dimensions.
+/// A shape whose dimensions come from the input, clamped to [`MAX_ELEMENTS`].
+///
+/// Clamping rather than rejecting: a rejected input teaches the fuzzer nothing, and the
+/// byte layout must keep meaning the same thing so that a mutation stays local.
 fn shape(u: &mut Unstructured<'_>, rank: usize) -> Vec<usize> {
-    (0..rank).map(|_| size(u, DECODE_BOUNDS.max_dim)).collect()
+    let raw: Vec<usize> = (0..rank).map(|_| size(u, DECODE_BOUNDS.max_dim)).collect();
+    crate::ops::clamp_to(raw, element_budget(u))
+}
+
+/// How many elements the remaining input can meaningfully describe.
+///
+/// **The layout is one byte per value.** Once the input is exhausted `byte` returns 0, so a
+/// 200-byte input describing a million-element tensor produces 999,800 zeros — a case far
+/// larger than anything the fuzzer said, costing time proportional to its size while
+/// carrying no more information than the 200 bytes did.
+///
+/// Tying the budget to the input length fixes that and hands size control to libFuzzer,
+/// where it belongs: `-max_len` now genuinely bounds the work per execution, and a mutation
+/// that lengthens an input is what reaches the larger shapes.
+///
+/// `DECODE_BOUNDS.max_elements` remains an absolute ceiling on top of this.
+fn element_budget(u: &Unstructured<'_>) -> usize {
+    // At least one, so an exhausted input still yields a valid (tiny) case rather than a
+    // degenerate one — a rejected input teaches the fuzzer nothing.
+    u.len().max(1).min(DECODE_BOUNDS.max_elements)
 }
 
 impl<'a> Arbitrary<'a> for TensorOp {
@@ -193,6 +246,11 @@ impl<'a> Arbitrary<'a> for TensorOp {
                 let m = size(u, DECODE_BOUNDS.max_dim);
                 let k = size(u, DECODE_BOUNDS.max_dim);
                 let n = size(u, DECODE_BOUNDS.max_dim);
+                // A matmul operand is `batch × m × k`, so the batch gets whatever the
+                // matrix dimensions have not already spent.
+                let budget = element_budget(u);
+                let per_matrix = (m * k).max(k * n).max(1);
+                let batch = crate::ops::clamp_to(batch, budget / per_matrix.max(1));
 
                 let mut lhs_shape = batch.clone();
                 lhs_shape.extend([m, k]);
@@ -210,6 +268,33 @@ impl<'a> Arbitrary<'a> for TensorOp {
 
 #[cfg(test)]
 mod tests {
+    /// **The tie between the decode bounds and the string that identifies them.**
+    ///
+    /// The pool matches negatives on the generator description verbatim. If the bounds are
+    /// widened and the description is not updated, negatives from two different
+    /// distributions become indistinguishable and the guard silently stops guarding.
+    #[test]
+    fn bounds_are_named_in_the_generator_description() {
+        let description = crate::negatives::FUZZER_GENERATOR;
+
+        assert!(
+            description.contains(&format!("max_dim {}", DECODE_BOUNDS.max_dim)),
+            "DECODE_BOUNDS.max_dim is {} but the generator description says {description:?}",
+            DECODE_BOUNDS.max_dim
+        );
+        assert!(
+            description.contains(&format!("magnitude {}", DECODE_BOUNDS.magnitude as u64)),
+            "DECODE_BOUNDS.magnitude is {} but the generator description says {description:?}",
+            DECODE_BOUNDS.magnitude
+        );
+        assert!(
+            description.contains(&format!("budget {}", DECODE_BOUNDS.max_elements)),
+            "DECODE_BOUNDS.max_elements is {} but the generator description says \
+             {description:?}",
+            DECODE_BOUNDS.max_elements
+        );
+    }
+
     use super::*;
     use std::collections::HashSet;
 

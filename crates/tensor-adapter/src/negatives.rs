@@ -110,6 +110,68 @@ pub struct Negative {
     /// them with suspicion rather than assume.
     #[serde(default)]
     pub provenance: Provenance,
+
+    /// **The generator description, verbatim.** [`Provenance`] is a readable *class*;
+    /// this is the exact identity, and matching is done on this rather than on the class.
+    ///
+    /// The distinction is not pedantry. Widening the fuzzer's decode bounds produces a
+    /// genuinely different distribution that still reports "decoded from fuzzer bytes" —
+    /// so both old and new negatives classify as [`Provenance::Fuzzer`] while being drawn
+    /// from different regions of the input space. Comparing the raw strings catches that;
+    /// comparing the class does not, and would silently reintroduce the very confound the
+    /// pool exists to prevent.
+    #[serde(default)]
+    pub generator: String,
+
+    /// **Which implementations the non-divergence was observed on**, sorted.
+    ///
+    /// A negative is the claim "these implementations agreed on this case". Change the
+    /// implementations and the claim is simply about something else — after the flex swap,
+    /// 810 of 814 recorded *findings* stopped reproducing, and negatives are no more
+    /// durable than findings. Empty means unrecorded, which is never comparable.
+    #[serde(default)]
+    pub backends: Vec<String>,
+}
+
+/// How the fuzz target describes its generator, **including the decode bounds**.
+///
+/// The bounds are named because the pool matches on this string verbatim. Widening
+/// `DECODE_BOUNDS` without changing this would let negatives from the old, narrower
+/// distribution be scored against findings from the new one — indistinguishable, since both
+/// would read simply as "decoded from fuzzer bytes".
+///
+/// `decode::bounds_are_named_in_the_generator_description` fails if the two drift apart.
+pub const FUZZER_GENERATOR: &str =
+    "decoded from fuzzer bytes at max_dim 64, magnitude 10, budget 1048576";
+
+/// The conditions a set of cases was observed under.
+///
+/// Carried alongside findings and negatives alike, because scoring one against the other is
+/// only meaningful when both were produced the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SamplingContext {
+    /// The generator description, verbatim — see [`Negative::generator`].
+    pub generator: String,
+    /// The implementations that were run, sorted.
+    pub backends: Vec<String>,
+}
+
+impl SamplingContext {
+    /// Build from a generator description and the implementation names, sorting the latter
+    /// so that ordering cannot make two identical contexts compare unequal.
+    pub fn new(generator: impl Into<String>, backends: &[&str]) -> Self {
+        let mut backends: Vec<String> = backends.iter().map(|b| (*b).to_string()).collect();
+        backends.sort();
+        Self {
+            generator: generator.into(),
+            backends,
+        }
+    }
+
+    /// The readable class this context belongs to.
+    pub fn provenance(&self) -> Provenance {
+        Provenance::from_generator(&self.generator)
+    }
 }
 
 /// Which generator a case came from.
@@ -152,6 +214,11 @@ impl Provenance {
     pub fn from_generator(description: &str) -> Self {
         if description.contains("fuzzer bytes") {
             Provenance::Fuzzer
+        } else if description.contains("by hand") {
+            // Without this the parser cannot return `Constructed` at all, and every
+            // hand-built negative silently classifies as `Unknown` — which the pool then
+            // discards, throwing away the strongest negatives available. Found by a test.
+            Provenance::Constructed
         } else if description.contains("magnitude: 1000") || description.contains("max_dim: 64") {
             Provenance::SeededWide
         } else if description.starts_with("Bounds") {
@@ -233,7 +300,7 @@ pub fn save_case(
     directory: impl AsRef<Path>,
     case: &TensorOp,
     source: Source,
-    provenance: Provenance,
+    context: &SamplingContext,
 ) -> io::Result<()> {
     let directory = directory.as_ref().join(source.label());
     std::fs::create_dir_all(&directory)?;
@@ -241,7 +308,9 @@ pub fn save_case(
     let record = Negative {
         case: case.clone(),
         source,
-        provenance,
+        provenance: context.provenance(),
+        generator: context.generator.clone(),
+        backends: context.backends.clone(),
     };
     let path = directory.join(format!("neg-{}-{:x}.json", case.name(), digest(case)));
     std::fs::write(path, serde_json::to_string(&record)?)
@@ -254,7 +323,7 @@ pub fn save_batch(
     path: impl AsRef<Path>,
     cases: &[TensorOp],
     source: Source,
-    provenance: Provenance,
+    context: &SamplingContext,
 ) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
@@ -265,7 +334,9 @@ pub fn save_batch(
         .map(|case| Negative {
             case: case.clone(),
             source,
-            provenance,
+            provenance: context.provenance(),
+            generator: context.generator.clone(),
+            backends: context.backends.clone(),
         })
         .collect();
     std::fs::write(path, serde_json::to_string_pretty(&records)?)
@@ -306,16 +377,22 @@ pub fn load(directory: impl AsRef<Path>) -> Vec<Negative> {
             } else if let Ok(one) = serde_json::from_str::<Negative>(&text) {
                 cases.push(one);
             } else if let Ok(batch) = serde_json::from_str::<Vec<TensorOp>>(&text) {
+                // A bare case records no backends, so it will fail the pool's backend
+                // check — correctly: nothing says which implementations agreed on it.
                 cases.extend(batch.into_iter().map(|case| Negative {
                     case,
                     source: Source::Constructed,
                     provenance: Provenance::Constructed,
+                    generator: String::new(),
+                    backends: Vec::new(),
                 }));
             } else if let Ok(case) = serde_json::from_str::<TensorOp>(&text) {
                 cases.push(Negative {
                     case,
                     source: Source::Constructed,
                     provenance: Provenance::Constructed,
+                    generator: String::new(),
+                    backends: Vec::new(),
                 });
             } else {
                 eprintln!("could not parse {} as a negative", path.display());
@@ -378,6 +455,17 @@ pub enum PoolError {
         positives: Provenance,
         negatives: Vec<Provenance>,
     },
+    /// The negatives were observed on different implementations than the findings.
+    ///
+    /// **A different axis from `DistributionMismatch`, and not covered by it.** A negative
+    /// is the claim "these implementations agreed on this case"; run a different set and
+    /// the claim is about something else entirely. `Constructed` is exempt from the
+    /// *distribution* check but never from this one, because being hand-built says nothing
+    /// about which backends were compared.
+    BackendMismatch {
+        positives: Vec<String>,
+        negatives: Vec<String>,
+    },
     /// Nothing to score against. A rule that survives an empty set has survived nothing.
     Empty,
 }
@@ -399,6 +487,17 @@ impl std::fmt::Display for PoolError {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            PoolError::BackendMismatch {
+                positives,
+                negatives,
+            } => write!(
+                f,
+                "findings were observed on [{}] but every negative was observed on \
+                 something else (e.g. [{}]) — a case that agreed on one set of backends \
+                 says nothing about another",
+                positives.join(", "),
+                negatives.join(", ")
+            ),
             PoolError::Empty => write!(
                 f,
                 "no negatives; a rule surviving none has survived nothing"
@@ -413,10 +512,37 @@ impl Pool {
     /// Keeps only negatives drawn from a comparable distribution, and **fails rather than
     /// silently narrowing to nothing** — a search that quietly ends up with an empty pool
     /// would report every candidate as surviving.
-    pub fn matched(all: Vec<Negative>, positives: Provenance) -> Result<Self, PoolError> {
-        let kept: Vec<Negative> = all
+    /// Two independent checks, in order, because they fail for different reasons and a
+    /// caller deserves to be told which:
+    ///
+    /// 1. **Same implementations.** No exemptions — not even for `Constructed`.
+    /// 2. **Same distribution**, matched on the verbatim generator string rather than on
+    ///    the provenance class, so two runs of the same *kind* of generator at different
+    ///    bounds do not pass as equivalent. `Constructed` is exempt here and only here.
+    pub fn matched(all: Vec<Negative>, positives: &SamplingContext) -> Result<Self, PoolError> {
+        let (same_backends, wrong_backends): (Vec<Negative>, Vec<Negative>) = all
             .into_iter()
-            .filter(|n| n.provenance.comparable_with(positives))
+            .partition(|n| !n.backends.is_empty() && n.backends == positives.backends);
+
+        if same_backends.is_empty() {
+            return Err(PoolError::BackendMismatch {
+                positives: positives.backends.clone(),
+                negatives: wrong_backends
+                    .first()
+                    .map(|n| n.backends.clone())
+                    .unwrap_or_default(),
+            });
+        }
+
+        let kept: Vec<Negative> = same_backends
+            .into_iter()
+            .filter(|n| match n.provenance {
+                // Hand-built cases belong to no distribution, so they cannot introduce a
+                // distributional confound — but they already passed the backend check above.
+                Provenance::Constructed => true,
+                Provenance::Unknown => false,
+                _ => n.generator == positives.generator,
+            })
             .collect();
 
         if kept.is_empty() {
@@ -501,7 +627,7 @@ mod tests {
     #[test]
     fn a_saved_case_loads_back_with_its_source() {
         let dir = temp_dir("roundtrip");
-        save_case(&dir, &case(1.5), Source::NearMiss, Provenance::Fuzzer).expect("writable");
+        save_case(&dir, &case(1.5), Source::NearMiss, &fuzzer()).expect("writable");
 
         let loaded = load(&dir);
         assert_eq!(loaded.len(), 1);
@@ -515,8 +641,8 @@ mod tests {
     #[test]
     fn saving_the_same_case_twice_leaves_one_file() {
         let dir = temp_dir("dedup");
-        save_case(&dir, &case(2.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
-        save_case(&dir, &case(2.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary, &fuzzer()).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary, &fuzzer()).expect("writable");
 
         assert_eq!(load(&dir).len(), 1);
     }
@@ -524,9 +650,9 @@ mod tests {
     #[test]
     fn sources_are_kept_apart_on_disk_and_counted_separately() {
         let dir = temp_dir("sources");
-        save_case(&dir, &case(1.0), Source::NearMiss, Provenance::Fuzzer).expect("writable");
-        save_case(&dir, &case(2.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
-        save_case(&dir, &case(3.0), Source::Ordinary, Provenance::Fuzzer).expect("writable");
+        save_case(&dir, &case(1.0), Source::NearMiss, &fuzzer()).expect("writable");
+        save_case(&dir, &case(2.0), Source::Ordinary, &fuzzer()).expect("writable");
+        save_case(&dir, &case(3.0), Source::Ordinary, &fuzzer()).expect("writable");
 
         let counts = by_source(&load(&dir));
         assert_eq!(counts, vec![(Source::NearMiss, 1), (Source::Ordinary, 2)]);
@@ -555,11 +681,39 @@ mod tests {
 
     // --- the pool: distribution matching and survival reporting ---------------------
 
-    fn negative(value: f32, source: Source, provenance: Provenance) -> Negative {
+    /// The two backends every test in this module pretends to have run.
+    fn pair() -> [&'static str; 2] {
+        ["flex", "libtorch"]
+    }
+
+    fn context(generator: &str) -> SamplingContext {
+        SamplingContext::new(generator, &pair())
+    }
+
+    fn fuzzer() -> SamplingContext {
+        context("decoded from fuzzer bytes")
+    }
+
+    fn constructed() -> SamplingContext {
+        context("built by hand")
+    }
+
+    /// A context whose generator string is unrecognised — `Provenance::Unknown`.
+    fn unknown() -> SamplingContext {
+        context("who knows")
+    }
+
+    fn wide() -> SamplingContext {
+        context("Bounds { max_rank: 3, max_dim: 64, magnitude: 1000.0 }")
+    }
+
+    fn negative(value: f32, source: Source, ctx: &SamplingContext) -> Negative {
         Negative {
             case: case(value),
             source,
-            provenance,
+            provenance: ctx.provenance(),
+            generator: ctx.generator.clone(),
+            backends: ctx.backends.clone(),
         }
     }
 
@@ -568,9 +722,9 @@ mod tests {
     /// separating those pools would score *perfectly* while describing which generator ran.
     #[test]
     fn a_pool_refuses_to_mix_distributions() {
-        let seeded = vec![negative(1.0, Source::Ordinary, Provenance::SeededWide)];
+        let seeded = vec![negative(1.0, Source::Ordinary, &wide())];
 
-        let result = Pool::matched(seeded, Provenance::Fuzzer);
+        let result = Pool::matched(seeded, &fuzzer());
         assert_eq!(result.unwrap_err(), PoolError::Empty);
     }
 
@@ -580,11 +734,11 @@ mod tests {
     #[test]
     fn mismatched_negatives_are_excluded_and_matching_ones_kept() {
         let mixed = vec![
-            negative(1.0, Source::Ordinary, Provenance::Fuzzer),
-            negative(2.0, Source::Ordinary, Provenance::SeededWide),
+            negative(1.0, Source::Ordinary, &fuzzer()),
+            negative(2.0, Source::Ordinary, &wide()),
         ];
 
-        let pool = Pool::matched(mixed, Provenance::Fuzzer).expect("one matches");
+        let pool = Pool::matched(mixed, &fuzzer()).expect("one matches");
         assert_eq!(pool.len(), 1);
     }
 
@@ -593,20 +747,78 @@ mod tests {
     /// strongest negatives available, which makes excluding them costly.
     #[test]
     fn constructed_negatives_are_comparable_with_anything() {
-        let built = vec![negative(1.0, Source::Constructed, Provenance::Constructed)];
+        let built = vec![negative(1.0, Source::Constructed, &constructed())];
 
-        assert!(Pool::matched(built.clone(), Provenance::Fuzzer).is_ok());
-        assert!(Pool::matched(built, Provenance::SeededWide).is_ok());
+        assert!(Pool::matched(built.clone(), &fuzzer()).is_ok());
+        assert!(Pool::matched(built, &wide()).is_ok());
+    }
+
+    /// **A negative is a claim about a backend pair, not about a case.** Run different
+    /// implementations and the claim is about something else — after the flex swap 810 of
+    /// 814 recorded findings stopped reproducing, and negatives are no more durable.
+    #[test]
+    fn negatives_observed_on_other_backends_are_refused() {
+        let elsewhere = vec![Negative {
+            case: case(1.0),
+            source: Source::NearMiss,
+            provenance: Provenance::Fuzzer,
+            generator: FUZZER_GENERATOR.to_string(),
+            backends: vec!["cuda".to_string(), "libtorch".to_string()],
+        }];
+
+        let error = Pool::matched(elsewhere, &fuzzer()).unwrap_err();
+        assert!(matches!(error, PoolError::BackendMismatch { .. }));
+    }
+
+    /// **Not even `Constructed` is exempt from the backend check.** Being hand-built means a
+    /// case belongs to no *distribution*; it says nothing about which backends agreed on it.
+    #[test]
+    fn hand_built_negatives_are_still_bound_to_the_backends_they_ran_on() {
+        let built = vec![Negative {
+            case: case(1.0),
+            source: Source::Constructed,
+            provenance: Provenance::Constructed,
+            generator: "built by hand".to_string(),
+            backends: vec!["wgpu".to_string()],
+        }];
+
+        assert!(matches!(
+            Pool::matched(built, &fuzzer()).unwrap_err(),
+            PoolError::BackendMismatch { .. }
+        ));
+    }
+
+    /// Backend order must not decide the outcome.
+    #[test]
+    fn backend_order_does_not_affect_matching() {
+        let reversed = SamplingContext::new(FUZZER_GENERATOR, &["libtorch", "flex"]);
+        assert_eq!(reversed.backends, fuzzer().backends);
+    }
+
+    /// **The collision the verbatim string exists to catch.** Both of these are
+    /// `Provenance::Fuzzer`, and they are drawn from different regions of the input space.
+    #[test]
+    fn two_fuzzer_runs_at_different_bounds_do_not_match() {
+        let old = context("decoded from fuzzer bytes at max_dim 8, magnitude 10");
+        assert_eq!(old.provenance(), Provenance::Fuzzer);
+        assert_eq!(fuzzer().provenance(), Provenance::Fuzzer);
+
+        let recorded = vec![negative(1.0, Source::Ordinary, &old)];
+        assert_eq!(
+            Pool::matched(recorded, &fuzzer()).unwrap_err(),
+            PoolError::Empty,
+            "matching on the provenance class alone would have let these through"
+        );
     }
 
     /// **An unrecorded origin cannot be shown to match**, and assuming it does is exactly
     /// the leak. Negatives written before provenance existed land here.
     #[test]
     fn negatives_of_unknown_origin_are_never_comparable() {
-        let unknown = vec![negative(1.0, Source::Ordinary, Provenance::Unknown)];
+        let unknown = vec![negative(1.0, Source::Ordinary, &unknown())];
 
         assert_eq!(
-            Pool::matched(unknown, Provenance::Fuzzer).unwrap_err(),
+            Pool::matched(unknown, &fuzzer()).unwrap_err(),
             PoolError::Empty
         );
         assert!(!Provenance::Unknown.comparable_with(Provenance::Unknown));
@@ -618,9 +830,9 @@ mod tests {
     #[test]
     fn survival_is_reported_by_source_rather_than_as_a_total() {
         let pool = Pool::unchecked(vec![
-            negative(1.0, Source::NearMiss, Provenance::Fuzzer),
-            negative(2.0, Source::Ordinary, Provenance::Fuzzer),
-            negative(3.0, Source::Ordinary, Provenance::Fuzzer),
+            negative(1.0, Source::NearMiss, &fuzzer()),
+            negative(2.0, Source::Ordinary, &fuzzer()),
+            negative(3.0, Source::Ordinary, &fuzzer()),
         ]);
 
         // A rule that fires on everything: the breakdown must show both sources separately.
@@ -636,7 +848,7 @@ mod tests {
     /// a rule having survived something it was never tested against.
     #[test]
     fn a_source_with_no_negatives_is_omitted_from_the_breakdown() {
-        let pool = Pool::unchecked(vec![negative(1.0, Source::NearMiss, Provenance::Fuzzer)]);
+        let pool = Pool::unchecked(vec![negative(1.0, Source::NearMiss, &fuzzer())]);
 
         let breakdown = pool.matched_by_source(|_| false);
         assert_eq!(breakdown, vec![(Source::NearMiss, 0, 1)]);
@@ -656,6 +868,11 @@ mod tests {
         assert_eq!(
             Provenance::from_generator("Bounds { max_rank: 4, max_dim: 8, magnitude: 10.0 }"),
             Provenance::SeededDefault
+        );
+        assert_eq!(
+            Provenance::from_generator("built by hand: batched_probe"),
+            Provenance::Constructed,
+            "the parser must be able to return every class it claims to"
         );
         // Anything unrecognised becomes Unknown rather than a guess.
         assert_eq!(Provenance::from_generator("who knows"), Provenance::Unknown);

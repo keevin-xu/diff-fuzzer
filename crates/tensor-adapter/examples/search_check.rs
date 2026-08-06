@@ -6,7 +6,7 @@
 use diff_fuzzer_core::report::{DivergenceReport, load_report};
 use std::path::Path;
 use tensor_adapter::input::TensorOp;
-use tensor_adapter::negatives::{self, Pool, Provenance};
+use tensor_adapter::negatives::{self, Pool, SamplingContext};
 use tensor_adapter::search;
 
 fn main() {
@@ -16,7 +16,8 @@ fn main() {
     println!("{} findings loaded from {dir}", findings.len());
 
     let all = negatives::load("findings/negatives");
-    let pool = match Pool::matched(all, Provenance::Fuzzer) {
+    let context = SamplingContext::new(negatives::FUZZER_GENERATOR, &["flex", "libtorch"]);
+    let pool = match Pool::matched(all, &context) {
         Ok(p) => p,
         Err(e) => {
             println!("no usable negatives: {e}");

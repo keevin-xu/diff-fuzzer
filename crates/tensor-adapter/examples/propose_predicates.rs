@@ -30,7 +30,7 @@ use diff_fuzzer_core::{
 };
 use std::fmt::Write as _;
 use std::path::Path;
-use tensor_adapter::negatives::{self, Pool, Provenance};
+use tensor_adapter::negatives::{self, Pool, SamplingContext};
 use tensor_adapter::validation::{self, Outcome};
 use tensor_adapter::{
     Bounds, CanonicalTensor, TensorNormalizer, TensorOp, TensorOpGenerator, TensorTolerancePolicy,
@@ -69,7 +69,10 @@ fn main() {
         return;
     }
 
-    let pool = match Pool::matched(negatives::load("findings/negatives"), Provenance::Fuzzer) {
+    // The context the findings themselves were produced under. Negatives are only usable
+    // if they were drawn the same way AND observed on the same backends.
+    let context = SamplingContext::new(negatives::FUZZER_GENERATOR, &["flex", "libtorch"]);
+    let pool = match Pool::matched(negatives::load("findings/negatives"), &context) {
         Ok(pool) => pool,
         Err(error) => {
             // Declining is the correct outcome, not a crash: scoring against a mismatched
@@ -96,8 +99,31 @@ fn main() {
     // only means something relative to the rate for cases drawn with no rule at all. If the
     // backend pair diverges on 0% of unfiltered cases, then 0% for a matched sample is not
     // evidence against the rule — it is evidence that nothing diverges.
-    let baseline = validate(EVERYTHING, &differential, Bounds::default());
-    let baseline_wide = validate(EVERYTHING, &differential, wide_bounds());
+    //
+    // **The diverging cases are kept, not just counted.** A count is a claim nobody can
+    // check; the cases are the evidence, and they are findings in their own right.
+    let mut discovered: Vec<TensorOp> = Vec::new();
+    let baseline = validate_collecting(
+        EVERYTHING,
+        &differential,
+        Bounds::default(),
+        &mut discovered,
+    );
+    let baseline_wide =
+        validate_collecting(EVERYTHING, &differential, wide_bounds(), &mut discovered);
+    if !discovered.is_empty() {
+        let path = Path::new(&dir).join("baseline-divergences.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&discovered).expect("serialise"),
+        )
+        .expect("write baseline divergences");
+        println!(
+            "  saved {} baseline divergence(s) to {}",
+            discovered.len(),
+            path.display()
+        );
+    }
     println!(
         "  baseline (no rule): default {}/{}, wide {}/{}",
         baseline.diverged, baseline.matched, baseline_wide.diverged, baseline_wide.matched
@@ -145,6 +171,28 @@ fn wide_bounds() -> Bounds {
         special_value_rate: 0.125,
         ..Bounds::default()
     }
+}
+
+/// Like [`validate`], but keeps every case that diverged rather than only counting them.
+fn validate_collecting(
+    predicate: tensor_adapter::Predicate,
+    differential: &Differential,
+    bounds: Bounds,
+    found: &mut Vec<TensorOp>,
+) -> validation::Validation {
+    validation::validate(
+        predicate,
+        &TensorOpGenerator::new(bounds),
+        VALIDATION_SEED,
+        VALIDATION_BUDGET,
+        |case| {
+            let diverged = differential.diverges(case);
+            if diverged {
+                found.push(case.clone());
+            }
+            diverged
+        },
+    )
 }
 
 fn validate(

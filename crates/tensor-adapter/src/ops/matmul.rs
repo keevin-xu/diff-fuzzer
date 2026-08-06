@@ -12,7 +12,7 @@
 //! is only one `k` in existence.
 
 use crate::input::{TensorOp, TensorValue};
-use crate::ops::{Bounds, Domain, element_count, shape_of_rank, values};
+use crate::ops::{Bounds, Domain, clamp_to, element_count, shape_of_rank, values};
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
@@ -28,6 +28,13 @@ pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
     let m = rng.random_range(1..=bounds.max_dim);
     let k = rng.random_range(1..=bounds.max_dim);
     let n = rng.random_range(1..=bounds.max_dim);
+
+    // **The batch is clamped against what the matrix dimensions have already spent.** An
+    // operand here is `batch × m × k`, so bounding the batch and `max_dim` separately does
+    // not bound the case: at `max_dim: 64` a rank-3 matmul would otherwise reach
+    // 4,096 × 4,096 elements, and its cost is a further factor of `n` on top.
+    let per_matrix = (m * k).max(k * n);
+    let batch = clamp_to(batch, bounds.max_elements / per_matrix.max(1));
 
     let mut lhs_shape = batch.clone();
     lhs_shape.extend([m, k]);
