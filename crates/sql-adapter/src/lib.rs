@@ -39,6 +39,8 @@
 
 /// What a test case is: schema, seed rows, and one query, carried together.
 pub mod ast;
+/// The two engines under comparison, each behind the shared `Implementation` seam.
+pub mod backends;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
 
