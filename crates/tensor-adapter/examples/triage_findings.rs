@@ -373,19 +373,48 @@ fn backends() -> Vec<Box<dyn Implementation<In = TensorOp, Out = burn::tensor::T
 }
 
 /// Does this report's case still diverge, under the tolerance it was judged against?
+///
+/// **Compares every pair, not one hardcoded pair.**
+///
+/// This checked `flex` against `libtorch` only, which was written when the harness ran two
+/// backends. A finding where the *GPU* disagrees with two CPU backends that agree with each
+/// other then replays as "does not reproduce" — and triage says so in its most alarming
+/// language: *"a finding that cannot be replayed is evidence about this tool, not the
+/// target."* Which was true, but about the replay rather than the finding.
+///
+/// That is the worst possible failure for this function: it does not lose a finding quietly,
+/// it actively argues the finding is spurious. Caught at PHASE-7E on the first `max`-versus-
+/// `NaN` result, which is the fifth place two-implementation blindness has been found in this
+/// project — assume there is a sixth.
 fn still_diverges(report: &DivergenceReport<TensorOp>) -> bool {
-    let (cpu, torch) = (flex(), libtorch());
-    let (Ok(left), Ok(right)) = (cpu.run(&report.input), torch.run(&report.input)) else {
+    let outputs: Vec<(String, CanonicalTensor)> = backends()
+        .iter()
+        .filter_map(|backend| {
+            backend
+                .run(&report.input)
+                .ok()
+                .map(|out| (backend.name().to_string(), TensorNormalizer.normalize(out)))
+        })
+        .collect();
+
+    if outputs.len() < 2 {
         return false;
-    };
+    }
 
-    let left = TensorNormalizer.normalize(left);
-    let right = TensorNormalizer.normalize(right);
-
-    !matches!(
-        left.approx_compare(&right, report.tolerance),
-        Agreement::Agree(_)
-    )
+    // Any pair disagreeing means the case still diverges. The recorded tolerance is used
+    // rather than the current one, so tightening a bound later cannot rewrite what an old
+    // finding meant.
+    for (i, (_, left)) in outputs.iter().enumerate() {
+        for (_, right) in outputs.iter().skip(i + 1) {
+            if !matches!(
+                left.approx_compare(right, report.tolerance),
+                Agreement::Agree(_)
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn element_count(case: &TensorOp) -> usize {
