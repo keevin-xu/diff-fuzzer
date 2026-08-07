@@ -143,12 +143,15 @@ impl TensorOp {
 
     /// # Panics
     ///
-    /// If the two shapes differ. Elementwise operations require identical shapes.
+    /// If the two shapes do not combine. Since PHASE-7C elementwise operations **broadcast**,
+    /// so the requirement is compatibility rather than identity: same rank, and each pair of
+    /// extents equal or one of them `1`. See [`crate::ops::broadcast`].
     pub fn binary(kind: BinaryOp, lhs: TensorValue, rhs: TensorValue) -> Self {
-        assert_eq!(
+        assert!(
+            crate::ops::broadcast::compatible(lhs.shape(), rhs.shape()),
+            "elementwise {kind:?} requires broadcast-compatible shapes, got {:?} and {:?}",
             lhs.shape(),
-            rhs.shape(),
-            "elementwise {kind:?} requires identical shapes"
+            rhs.shape()
         );
         TensorOp::Binary { kind, lhs, rhs }
     }
@@ -263,10 +266,26 @@ mod tests {
         );
     }
 
+    /// Incompatible extents — neither equal nor 1 — are still rejected. Broadcasting widened
+    /// what is legal; it did not remove the constraint.
     #[test]
-    #[should_panic(expected = "identical shapes")]
-    fn elementwise_rejects_mismatched_shapes() {
+    #[should_panic(expected = "broadcast-compatible")]
+    fn elementwise_rejects_incompatible_shapes() {
         TensorOp::binary(BinaryOp::Add, value(&[2, 2]), value(&[3, 3]));
+    }
+
+    /// Differing ranks are rejected too, for burn's reason rather than ours: `Tensor<B, D>`
+    /// fixes the rank at compile time, so there is no way to express the NumPy form.
+    #[test]
+    #[should_panic(expected = "broadcast-compatible")]
+    fn elementwise_rejects_differing_ranks() {
+        TensorOp::binary(BinaryOp::Add, value(&[4]), value(&[3, 4]));
+    }
+
+    /// A stretched axis is now accepted where it previously panicked.
+    #[test]
+    fn elementwise_accepts_a_stretched_axis() {
+        TensorOp::binary(BinaryOp::Add, value(&[3, 1]), value(&[3, 4]));
     }
 
     #[test]

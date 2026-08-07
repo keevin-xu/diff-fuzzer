@@ -17,6 +17,7 @@
 //! - [`matmul`] — inner dimensions must agree, batch dimensions must match
 
 pub mod binary;
+pub mod broadcast;
 pub mod matmul;
 pub mod reduce;
 pub mod unary;

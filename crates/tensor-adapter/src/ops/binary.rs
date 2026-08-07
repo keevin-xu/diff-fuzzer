@@ -5,13 +5,17 @@
 //! than generating two shapes and checking whether they happen to match — which they
 //! almost never would — the constraint is built into how the case is made.
 //!
-//! Note this only covers equal shapes. Real libraries also allow *broadcasting*,
-//! where a `[3, 1]` and a `[3, 4]` operand combine by stretching the length-1 axis.
-//! That is a richer constraint and a good source of bugs, and it is deliberately left
-//! for a later batch rather than added here as an afterthought.
+//! **Since PHASE-7C the shapes need not be equal.** Operands are drawn as a compatible
+//! *pair* — see [`crate::ops::broadcast`] — so a `[3, 1]` and a `[3, 4]` combine by
+//! stretching the length-1 axis. The correct-by-construction principle is unchanged: the
+//! pair is derived from a single result shape, so it cannot be incompatible.
+//!
+//! Equal shapes remain the most common case by design. They are the ordinary path in real
+//! use and are where every finding so far has come from, so a generator that always
+//! broadcast would have quietly stopped testing what it used to.
 
 use crate::input::{BinaryOp, TensorOp, TensorValue};
-use crate::ops::{Bounds, Domain, element_count, shape, values};
+use crate::ops::{Bounds, Domain, broadcast, element_count, values};
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
@@ -34,15 +38,20 @@ fn right_domain(kind: BinaryOp, bounds: &Bounds) -> Domain {
 pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
     let kind = ALL[rng.random_range(0..ALL.len())];
 
-    // One shape, used twice. The constraint cannot be violated because there is only
-    // ever one shape to violate it with.
-    let shape = shape(rng, bounds);
-    let count = element_count(&shape);
+    // A compatible pair, derived from one result shape. As with the single-shape version
+    // it replaced, the constraint cannot be violated because the operands are *built from*
+    // the answer rather than checked against it.
+    let (lhs_shape, rhs_shape) = broadcast::pair(rng, bounds);
 
-    let lhs = TensorValue::new(shape.clone(), values(rng, count, Domain::Any, bounds));
+    // Each operand carries only its own elements — that is the point of broadcasting, and
+    // it is why a stretched operand is cheaper to generate than the result it produces.
+    let lhs_count = element_count(&lhs_shape);
+    let rhs_count = element_count(&rhs_shape);
+
+    let lhs = TensorValue::new(lhs_shape, values(rng, lhs_count, Domain::Any, bounds));
     let rhs = TensorValue::new(
-        shape,
-        values(rng, count, right_domain(kind, bounds), bounds),
+        rhs_shape,
+        values(rng, rhs_count, right_domain(kind, bounds), bounds),
     );
 
     TensorOp::binary(kind, lhs, rhs)
@@ -53,7 +62,50 @@ mod tests {
     use super::*;
     use crate::ops::tests::for_many_seeds;
 
+    /// Renamed from `operands_always_share_a_shape` at PHASE-7C: they no longer must, but
+    /// they must still **combine**, which is the constraint that actually matters.
     #[test]
+    fn operands_always_combine() {
+        let bounds = Bounds::default();
+        for_many_seeds(|rng| {
+            let case = generate(rng, &bounds);
+            let TensorOp::Binary { lhs, rhs, .. } = &case else {
+                panic!("binary generator produced {case:?}");
+            };
+            assert!(
+                broadcast::compatible(lhs.shape(), rhs.shape()),
+                "generated incompatible operands: {:?} and {:?}",
+                lhs.shape(),
+                rhs.shape()
+            );
+        });
+    }
+
+    /// Broadcasting must actually occur, or the change is cosmetic.
+    #[test]
+    fn broadcasting_cases_are_produced_alongside_equal_shaped_ones() {
+        let bounds = Bounds::default();
+        let mut broadcasting = 0;
+        let mut equal = 0;
+        for seed in 0..2_000u64 {
+            let mut rng = SeededRng::from_seed(seed);
+            if let TensorOp::Binary { lhs, rhs, .. } = generate(&mut rng, &bounds) {
+                if lhs.shape() == rhs.shape() {
+                    equal += 1;
+                } else {
+                    broadcasting += 1;
+                }
+            }
+        }
+        assert!(
+            broadcasting > 100,
+            "too few broadcast cases: {broadcasting}"
+        );
+        assert!(equal > 100, "equal shapes became rare: {equal}");
+    }
+
+    #[test]
+    #[ignore = "superseded at PHASE-7C by operands_always_combine"]
     fn operands_always_share_a_shape() {
         let bounds = Bounds::default();
         for_many_seeds(|rng| {

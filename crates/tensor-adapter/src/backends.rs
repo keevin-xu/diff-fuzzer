@@ -206,6 +206,49 @@ mod tests {
         TensorValue::new(shape.to_vec(), data.to_vec())
     }
 
+    /// **The end-to-end check that broadcasting actually works**, as opposed to our model of
+    /// it being self-consistent. Everything else in PHASE-7C tests shapes we invented; this
+    /// runs one through the libraries.
+    ///
+    /// `[3,1] + [3,4]`: the left operand's single column is reused across all four columns.
+    /// The answer is checkable by hand, which is the point — a wrong result here is obvious
+    /// rather than a plausible-looking tensor.
+    #[test]
+    fn a_broadcast_case_runs_and_stretches_on_every_backend() {
+        let case = TensorOp::binary(
+            crate::input::BinaryOp::Add,
+            value(&[3, 1], &[10.0, 20.0, 30.0]),
+            value(&[3, 4], &[1.0; 12]),
+        );
+        let expected = vec![
+            11.0, 11.0, 11.0, 11.0, // row 0: 10 stretched across four columns
+            21.0, 21.0, 21.0, 21.0, //
+            31.0, 31.0, 31.0, 31.0, //
+        ];
+
+        for backend in [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ] {
+            let out = backend.run(&case).unwrap_or_else(|e| {
+                panic!("{} could not run a broadcast case: {e:?}", backend.name())
+            });
+            assert_eq!(
+                out.shape.to_vec(),
+                [3, 4],
+                "{} produced the wrong output shape",
+                backend.name()
+            );
+            assert_eq!(
+                values(out),
+                expected,
+                "{} broadcast incorrectly",
+                backend.name()
+            );
+        }
+    }
+
     fn values(out: TensorData) -> Vec<f32> {
         out.to_vec::<f32>().expect("f32 tensor")
     }
