@@ -48,3 +48,4 @@ skills/
 # accident because a directory happened to be tracked.
 findings/
 issues/README.md
+fuzz-sql/corpus/

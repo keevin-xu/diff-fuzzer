@@ -55,8 +55,18 @@ pub mod generator;
 pub mod known;
 /// Turning what an engine returned into a comparable canonical form.
 pub mod normalize;
+/// Properties of a case a trigger rule might key on — the domain-specific vocabulary.
+pub mod features;
+/// Copied from `tensor-adapter` — see `PENDING` 1.1 for the edit cost.
+pub mod negatives;
 /// Deciding whether the engines disagreed.
 pub mod oracle;
+/// Copied verbatim from `tensor-adapter`.
+pub mod predicate;
+/// Copied verbatim from `tensor-adapter`.
+pub mod search;
+/// Copied verbatim from `tensor-adapter`.
+pub mod validation;
 /// Whether a query's `ORDER BY` actually orders the rows of this case.
 pub mod ordering;
 /// What running a case produces: rows, or a refusal.
