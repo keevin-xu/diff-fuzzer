@@ -85,14 +85,22 @@ fn main() {
 
     // Spanning the 2048 boundary in both directions, so "did crossing it matter?" is answerable
     // rather than inferred from one side.
-    let settings = [8usize, 100, 1_000, 2_048, 4_096];
+    // Overridable, because the shape of the question changed after the first run. The
+    // five-point sweep answered "what does size cost?" well and answered "does size change the
+    // yield?" not at all — 200 cases per setting bounds the rate only at 3/200 = 1.5e-2, four
+    // orders weaker than the campaign's 1.9e-6. Answering the yield question needs many cases
+    // at *few* settings, not few cases at many.
+    let settings: Vec<usize> = match std::env::args().nth(2).as_deref() {
+        Some("ends") => vec![8, 4_096],
+        _ => vec![8, 100, 1_000, 2_048, 4_096],
+    };
 
     println!("chunk boundary: DuckDB STANDARD_VECTOR_SIZE = 2048 tuples (SPECS.md §3.9)");
     println!("base: {}", SqlGenerator::new(base).description());
     println!("cases per setting: {cases}\n");
 
     let mut table = Vec::new();
-    for rows in settings {
+    for rows in settings.iter().copied() {
         let bounds = Bounds {
             max_rows: rows,
             ..base

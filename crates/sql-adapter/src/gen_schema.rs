@@ -269,25 +269,24 @@ impl Bounds {
 /// and adding `not_in` required remembering to add `not-in={}` to it. Forgetting would have
 /// produced two configurations sharing one identity — exactly what the trait prevents.
 ///
-/// # Why the logic fingerprint goes through `scalars()`
+/// # The logic fingerprint goes through `logic_version()`
 ///
 /// The trait derives identity from **declared** axes and scalars. That catches a configuration
-/// changing without its description changing — but only when the *configuration* changed.
-/// It does not catch the generation **logic** changing while every axis stays put, and this
-/// domain has had three of those (see [`GENERATOR_FINGERPRINT`]).
+/// changing without its description changing — but only when the *configuration* changed. It
+/// does not catch the generation **logic** changing while every axis stays put, and this domain
+/// has had three of those (see [`GENERATOR_FINGERPRINT`]).
 ///
 /// The sharpest example is the trait's own: `axes.rs` cites this adapter's joins-versus-ordering
 /// finding, and the **fix** for it was making joins probabilistic at 60% rather than
-/// unconditional. That changed no axis and no scalar. Under a description derived from declared
-/// configuration alone, the corpus before that fix and the corpus after it are byte-identical in
-/// identity — the failure the trait exists to prevent, arriving through the door it does not
-/// watch.
+/// unconditional. That changed no axis and no scalar, so a description derived from declared
+/// configuration alone gives the corpus before that fix and the corpus after it byte-identical
+/// identities.
 ///
-/// So the fingerprint is reported as a scalar. It is a slight stretch of "bounds that are not
-/// on/off", and it is deliberate: it keeps the derived description honest with a one-line
-/// implementation instead of overriding `description()` and losing the cannot-drift guarantee.
-/// A `logic_version()` hook on the trait would be the cleaner home — raised as a finding rather
-/// than changed unilaterally, since the engine is not this domain's to edit.
+/// This was first worked around by reporting the fingerprint as a scalar, which put a source
+/// hash in the slot meant for bounds. The engine added `logic_version()` in response
+/// (2026-08-07), and the fingerprint now goes there. **The rendered description is unchanged** —
+/// `logic=<hex>` was already last — so this is a change of provenance, not of identity, and no
+/// corpus is invalidated by it.
 impl GenerationAxes for Bounds {
     /// Every axis, **including the disabled ones**, in a fixed order.
     fn axes(&self) -> Vec<(&'static str, bool)> {
@@ -302,15 +301,23 @@ impl GenerationAxes for Bounds {
         ]
     }
 
-    /// The size bounds, plus the generation-logic fingerprint — see the note above.
+    /// The size bounds. The logic fingerprint is **not** here — see `logic_version` below.
     fn scalars(&self) -> Vec<(&'static str, String)> {
         vec![
             ("tables", self.max_tables.to_string()),
             ("columns", self.max_columns.to_string()),
             ("rows", self.max_rows.to_string()),
             ("depth", self.max_expr_depth.to_string()),
-            ("logic", format!("{GENERATOR_FINGERPRINT:08x}")),
         ]
+    }
+
+    /// The generation-logic fingerprint — the half of drift the axes cannot see.
+    ///
+    /// Answering `Some` rather than taking the `None` default is deliberate: `None` claims that
+    /// generation logic never changes in ways that matter, and this domain has falsified that
+    /// three times.
+    fn logic_version(&self) -> Option<String> {
+        Some(format!("{GENERATOR_FINGERPRINT:08x}"))
     }
 }
 
@@ -547,6 +554,39 @@ mod tests {
         // The fingerprint is shared by all of them: it describes the *code*, not the config.
         assert!(
             Bounds::V1
+                .description()
+                .contains(&format!("logic={GENERATOR_FINGERPRINT:08x}"))
+        );
+    }
+
+    /// The fingerprint reaches the description through the engine's `logic_version()` hook,
+    /// **not** through `scalars()`.
+    ///
+    /// Worth pinning rather than trusting, because the two routes render identically — the move
+    /// from one to the other changed no output at all. A test that only checked the rendered
+    /// string would pass under either, and would not notice the fingerprint silently dropping
+    /// back into the bounds slot.
+    #[test]
+    fn the_logic_fingerprint_comes_from_the_hook_and_not_from_the_bounds() {
+        let bounds = Bounds::V1_ALL;
+
+        assert_eq!(
+            bounds.logic_version(),
+            Some(format!("{GENERATOR_FINGERPRINT:08x}")),
+            "the hook must report the fingerprint"
+        );
+
+        // `scalars()` is for bounds. A source hash there reads as a bound to whoever adopts
+        // this trait next, which is why the engine grew a separate slot for it.
+        assert!(
+            !bounds.scalars().iter().any(|(name, _)| *name == "logic"),
+            "the fingerprint must not also be a scalar: {:?}",
+            bounds.scalars()
+        );
+
+        // And it still lands in the description, which is what actually scopes a corpus.
+        assert!(
+            bounds
                 .description()
                 .contains(&format!("logic={GENERATOR_FINGERPRINT:08x}"))
         );
