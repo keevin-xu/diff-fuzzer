@@ -321,6 +321,34 @@ mod tests {
         }
     }
 
+    /// **Every broadcast shape must be reachable, including both operands stretching.**
+    ///
+    /// A campaign corpus showed 28 broadcast cases of which *all 28* stretched a whole
+    /// operand and **none** stretched both — which could mean the decoder cannot produce it,
+    /// or merely that a two-minute run did not. That distinction matters: an unreachable
+    /// feature can never be validated, and would sit in the vocabulary looking useful while
+    /// scoring `NeverSampled` forever. This settles it directly.
+    #[test]
+    fn both_operands_stretching_is_reachable_from_bytes() {
+        let mut both = 0;
+        for bytes in byte_strings(5_000) {
+            let mut u = Unstructured::new(&bytes);
+            let Ok(TensorOp::Binary { lhs, rhs, .. }) = TensorOp::arbitrary(&mut u) else {
+                continue;
+            };
+            let Some(result) = crate::ops::broadcast::result_shape(lhs.shape(), rhs.shape()) else {
+                continue;
+            };
+            if lhs.shape() != result.as_slice() && rhs.shape() != result.as_slice() {
+                both += 1;
+            }
+        }
+        assert!(
+            both > 0,
+            "the decoder cannot produce a case where both operands stretch"
+        );
+    }
+
     /// **Broadcasting must be reachable from bytes**, not merely from the seeded generator.
     /// The fuzzer is what runs for hours; if its decoder never stretches an axis, PHASE-7C
     /// added nothing to a campaign however good the generator is.

@@ -42,3 +42,8 @@ tracing-subscriber.workspace = true
 [[example]]
 name = "write_seed_corpus"
 required-features = ["fuzzing"]
+
+# Decodes a campaign's corpus, so it needs the same `Arbitrary` impl the fuzzer uses.
+[[example]]
+name = "corpus_shapes"
+required-features = ["fuzzing"]

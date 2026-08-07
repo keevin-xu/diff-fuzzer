@@ -255,6 +255,49 @@ nothing — an exclusion wearing the costume of agreement. Such cases are report
 
 ---
 
+## 5a. Broadcasting — a reasoned no-change
+
+**Added PHASE-7C, 2026-08-06.** Elementwise operands may now differ in shape, combining by
+stretching an axis of extent 1. **No tolerance changes, and this section exists so that a
+future reader can tell "we considered this" from "nobody looked".**
+
+### Why no bound moves
+
+**A stretched axis is re-read, not re-computed.** When `[3,1]` combines with `[3,4]`, the
+left operand's single column is *loaded four times*; the same stored `f32` enters four
+additions. No arithmetic occurs that would not have occurred with an explicitly materialised
+`[3,4]` operand holding four copies of that value, and copying a float introduces no rounding.
+
+So for every operation class in §4, the per-case bound is computed from the **result** shape
+and the operand values exactly as before, and broadcasting does not enter the derivation.
+
+This holds whichever way a backend implements it:
+
+- **Stride-0 iteration** (reading the same address repeatedly) performs the identical
+  multiply-adds in the identical order.
+- **Materialising a temporary** copies the value first, and a copy is exact.
+
+Either way the arithmetic is unchanged, so the bound derived for it is unchanged.
+
+### What broadcasting *can* change, and where that is handled
+
+A backend can disagree about the **output shape** — one stretching an axis where another
+does not. That is not a tolerance question at any width: it is a structural difference,
+handled by §6 and never absorbed. Confirmed by test rather than assumed
+(`a_disagreement_about_the_broadcast_output_shape_is_structural`), against the widest
+tolerance in the codebase.
+
+### The one thing to watch
+
+An operand of extent 1 is stretched across the whole result, so **a single extreme value now
+influences every output element** rather than one. That does not loosen any bound — the
+per-element derivation is unchanged — but it does mean a case containing one `1e30` can
+overflow the entire result rather than a corner of it. That is a change in *how often* the
+existing overflow classes fire, not in what they permit, and the `broadcast_whole_operand`
+feature exists so the search can say so if it turns out to matter.
+
+---
+
 ## 6. Structural differences
 
 Checked **before** any numeric comparison, and never absorbed by a tolerance however
