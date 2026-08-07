@@ -62,7 +62,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| format!("{}/runs", tensor_adapter::FINDINGS_ROOT));
 
-    let (findings, observed_on) = load_findings(Path::new(&dir));
+    let (findings, observed_on, produced_by) = load_findings(Path::new(&dir));
     println!("{} findings loaded from {dir}", findings.len());
     if findings.is_empty() {
         println!("nothing to explain — no report written");
@@ -78,7 +78,12 @@ fn main() {
     // actually happened.
     let backends: Vec<&str> = observed_on.iter().map(String::as_str).collect();
     println!("findings were observed on {backends:?}");
-    let context = SamplingContext::new(negatives::FUZZER_GENERATOR, &backends);
+    println!("produced by: {produced_by}");
+    // **Both halves of the context read from the findings.** The backend set was fixed at
+    // PHASE-7E; the generator description followed at PHASE-7F for the same reason. A
+    // campaign records how it was configured, and that record — not whatever this binary was
+    // compiled against — is what its negatives must be matched on.
+    let context = SamplingContext::new(&produced_by, &backends);
     let pool = match Pool::matched(negatives::load(tensor_adapter::NEGATIVES_ROOT), &context) {
         Ok(pool) => pool,
         Err(error) => {
@@ -276,11 +281,28 @@ impl Differential {
 ///
 /// The backend set comes from the reports themselves — every one records which
 /// implementations ran — so a stale constant cannot silently ask about the wrong campaign.
-fn load_findings(dir: &Path) -> (Vec<TensorOp>, Vec<String>) {
+fn load_findings(dir: &Path) -> (Vec<TensorOp>, Vec<String>, String) {
     let mut out = Vec::new();
     let mut observed: Vec<String> = Vec::new();
+    let mut generators: Vec<String> = Vec::new();
     let mut unreadable = 0usize;
-    collect(dir, &mut out, &mut observed, &mut unreadable);
+    collect(
+        dir,
+        &mut out,
+        &mut observed,
+        &mut generators,
+        &mut unreadable,
+    );
+    generators.sort();
+    generators.dedup();
+    if generators.len() > 1 {
+        eprintln!(
+            "⚠ these findings came from {} different generator configurations:\n  {}\n               Scoring them together would compare runs that explored different spaces.",
+            generators.len(),
+            generators.join("\n  ")
+        );
+    }
+    let produced_by = generators.first().cloned().unwrap_or_default();
     observed.sort();
     observed.dedup();
 
@@ -293,13 +315,14 @@ fn load_findings(dir: &Path) -> (Vec<TensorOp>, Vec<String>) {
              is computed from an incomplete set."
         );
     }
-    (out, observed)
+    (out, observed, produced_by)
 }
 
 fn collect(
     dir: &Path,
     out: &mut Vec<TensorOp>,
     observed: &mut Vec<String>,
+    generators: &mut Vec<String>,
     unreadable: &mut usize,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -308,12 +331,13 @@ fn collect(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, out, observed, unreadable);
+            collect(&path, out, observed, generators, unreadable);
         } else if path.extension().is_some_and(|e| e == "json") {
             match load_report::<TensorOp>(&path) {
                 Ok(report) => {
                     let report: DivergenceReport<TensorOp> = report;
                     observed.extend(report.outputs.iter().map(|(name, _)| name.clone()));
+                    generators.push(report.generator.clone());
                     out.push(report.input);
                 }
                 Err(error) => {

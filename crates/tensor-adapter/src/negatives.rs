@@ -141,7 +141,21 @@ pub struct Negative {
 /// would read simply as "decoded from fuzzer bytes".
 ///
 /// `decode::bounds_are_named_in_the_generator_description` fails if the two drift apart.
-pub const FUZZER_GENERATOR: &str = "decoded from fuzzer bytes at max_dim 64, magnitude 10, budget 1048576, layout 4 (broadcast+softmax+reductions+log)";
+/// How the fuzz target describes its generator.
+///
+/// **Derived from the decoder's own bounds** since PHASE-7F, rather than a hand-maintained
+/// string. The axes a campaign enabled are part of it, so a narrowed run's negatives are
+/// automatically incomparable with a wider run's — a distinction that previously depended on
+/// someone remembering to bump a literal.
+///
+/// Available only with the `fuzzing` feature, where the decoder lives. **Anything analysing a
+/// finished campaign should read the description off the findings instead** — they record it
+/// verbatim, and reading it is the only way to be sure of the configuration that actually
+/// ran rather than the one currently compiled.
+#[cfg(feature = "fuzzing")]
+pub fn fuzzer_generator() -> String {
+    crate::decode::fuzzer_generator()
+}
 
 /// The conditions a set of cases was observed under.
 ///
@@ -691,8 +705,15 @@ mod tests {
         SamplingContext::new(generator, &pair())
     }
 
+    /// A stand-in fuzzer description for tests. The real one is derived from the decoder's
+    /// bounds and needs the `fuzzing` feature; these tests are about the *matching* rules, not
+    /// about any particular description.
+    fn fuzzer_context_string() -> String {
+        "decoded from fuzzer bytes; unary=on binary=on".to_string()
+    }
+
     fn fuzzer() -> SamplingContext {
-        context("decoded from fuzzer bytes")
+        context(&fuzzer_context_string())
     }
 
     fn constructed() -> SamplingContext {
@@ -763,7 +784,7 @@ mod tests {
             case: case(1.0),
             source: Source::NearMiss,
             provenance: Provenance::Fuzzer,
-            generator: FUZZER_GENERATOR.to_string(),
+            generator: fuzzer_context_string(),
             backends: vec!["cuda".to_string(), "libtorch".to_string()],
         }];
 
@@ -792,7 +813,7 @@ mod tests {
     /// Backend order must not decide the outcome.
     #[test]
     fn backend_order_does_not_affect_matching() {
-        let reversed = SamplingContext::new(FUZZER_GENERATOR, &["libtorch", "flex"]);
+        let reversed = SamplingContext::new(fuzzer_context_string(), &["libtorch", "flex"]);
         assert_eq!(reversed.backends, fuzzer().backends);
     }
 

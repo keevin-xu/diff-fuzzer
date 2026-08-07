@@ -185,7 +185,7 @@ fuzz_target!(|case: TensorOp| {
         // and libFuzzer keeps the bytes in `fuzz/artifacts/` besides.
         seed: 0,
         label: case.name().to_string(),
-        generator: negatives::FUZZER_GENERATOR.to_string(),
+        generator: negatives::fuzzer_generator(),
         input: minimized.input.clone(),
         minimisation: MinimisationRecord::from(&minimized),
         outputs: divergence.outputs,
@@ -332,12 +332,12 @@ fn sampling_context() -> negatives::SamplingContext {
     };
     if harness.inject_fault {
         return negatives::SamplingContext::new(
-            negatives::FUZZER_GENERATOR,
+            negatives::fuzzer_generator(),
             &[harness.cpu.name(), second],
         );
     }
     negatives::SamplingContext::new(
-        negatives::FUZZER_GENERATOR,
+        negatives::fuzzer_generator(),
         &[harness.cpu.name(), second, harness.gpu.name()],
     )
 }

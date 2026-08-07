@@ -66,9 +66,9 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 ///
 /// **Changing these invalidates the corpus and every negative recorded under them.** The
 /// corpus must be started fresh, and old negatives stop matching because
-/// [`FUZZER_GENERATOR`](crate::negatives::FUZZER_GENERATOR) names the bounds — which is the
+/// [`fuzzer_generator`] derives its description from these bounds — which is the
 /// point: they were drawn from a different distribution.
-pub const DECODE_BOUNDS: Bounds = Bounds {
+pub const DEFAULT_DECODE_BOUNDS: Bounds = Bounds {
     max_rank: crate::backends::MAX_RANK,
     max_dim: 64,
     magnitude: 10.0,
@@ -77,6 +77,14 @@ pub const DECODE_BOUNDS: Bounds = Bounds {
     // nearly free — the time goes to matmul's `m × k × n`, which no element cap touches —
     // so a tight budget is the worst of both worlds: full price, nothing found.
     max_elements: 1_048_576,
+    // Every operation on by default; `DIFF_FUZZER_OPS` narrows at launch. See
+    // `decode_bounds`.
+    unary_ops: true,
+    binary_ops: true,
+    accumulating_reductions: true,
+    selecting_reductions: true,
+    matmul: true,
+    activations: true,
     // Unused here — special values are selected by the byte layout below rather than by
     // a probability — but the struct requires them.
     special_value_rate: 0.0,
@@ -87,6 +95,138 @@ pub const DECODE_BOUNDS: Bounds = Bounds {
     // which is where the one real finding so far came from.
     restrict_domains: false,
 };
+
+/// The bounds this decoder is running under.
+///
+/// **Read once from the environment, not fixed at compile time.** A campaign narrows its
+/// operation set to stop a known disagreement saturating the corpus — the six-hour run at
+/// PHASE-7F produced 1,834 findings of one class while three operations produced nothing —
+/// and needing a rebuild to do that means it does not get done.
+///
+/// `DIFF_FUZZER_OPS` is a comma-separated list of operation axes to **enable**; unset means
+/// all of them, so the default behaviour is unchanged. Unrecognised names are rejected loudly
+/// rather than ignored, because a silently-misspelled axis produces a campaign that quietly
+/// tests something other than what was asked for.
+///
+/// ```text
+/// DIFF_FUZZER_OPS=unary,activations,accumulating_reductions
+/// ```
+pub fn decode_bounds() -> &'static Bounds {
+    static BOUNDS: std::sync::OnceLock<Bounds> = std::sync::OnceLock::new();
+    BOUNDS.get_or_init(|| {
+        let Ok(requested) = std::env::var("DIFF_FUZZER_OPS") else {
+            return DEFAULT_DECODE_BOUNDS;
+        };
+
+        let mut bounds = Bounds {
+            unary_ops: false,
+            binary_ops: false,
+            accumulating_reductions: false,
+            selecting_reductions: false,
+            matmul: false,
+            activations: false,
+            ..DEFAULT_DECODE_BOUNDS
+        };
+
+        for name in requested
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match name {
+                "unary" => bounds.unary_ops = true,
+                "binary" => bounds.binary_ops = true,
+                "accumulating_reductions" => bounds.accumulating_reductions = true,
+                "selecting_reductions" => bounds.selecting_reductions = true,
+                "matmul" => bounds.matmul = true,
+                "activations" => bounds.activations = true,
+                other => panic!(
+                    "DIFF_FUZZER_OPS: unknown axis {other:?}. Known: unary, binary, \
+                     accumulating_reductions, selecting_reductions, matmul, activations"
+                ),
+            }
+        }
+        bounds
+    })
+}
+
+/// The operations this decoder may emit, in a fixed order.
+///
+/// **Built from the enabled axes, so a disabled operation is never decoded** — as opposed to
+/// decoded and discarded, which would spend the fuzzer's budget on cases nobody wants and
+/// make the effective weighting depend on how often a rejection happened.
+///
+/// Changing the enabled set changes what a byte decodes to, so it changes the layout — which
+/// is why [`fuzzer_generator`] derives its description from the same bounds.
+fn enabled_slots() -> Vec<Slot> {
+    let b = decode_bounds();
+    let mut slots = Vec::new();
+    if b.unary_ops {
+        slots.extend([Slot::Neg, Slot::Abs, Slot::Exp, Slot::Sqrt, Slot::Log]);
+    }
+    if b.binary_ops {
+        slots.extend([Slot::Add, Slot::Sub, Slot::Mul, Slot::Div]);
+    }
+    if b.accumulating_reductions {
+        slots.extend([Slot::Sum, Slot::Mean]);
+    }
+    if b.selecting_reductions {
+        slots.extend([Slot::Max, Slot::Min]);
+    }
+    if b.activations {
+        slots.push(Slot::Softmax);
+    }
+    if b.matmul {
+        slots.push(Slot::Matmul);
+    }
+    assert!(
+        !slots.is_empty(),
+        "DIFF_FUZZER_OPS enabled no operations; a fuzzer with nothing to generate is a \
+         configuration error, not an empty campaign"
+    );
+    slots
+}
+
+/// How this decoder describes itself, for scoping corpora and negatives.
+///
+/// **Derived from the bounds, not written by hand.** The previous version was a `const &str`
+/// naming the layout — `"...max_dim 64, magnitude 10, budget 1048576, layout 4"` — kept in
+/// step with the decoder by a test. That worked, and it is exactly the arrangement
+/// [`GenerationAxes`](diff_fuzzer_core::GenerationAxes) exists to replace: a description one
+/// edit away from describing a decoder that no longer exists, with nothing failing when it
+/// does.
+///
+/// Now the enabled axes *are* the description, so narrowing a campaign automatically makes
+/// its negatives incomparable with a wider one's — which is correct, and was previously
+/// something a person had to remember.
+pub fn fuzzer_generator() -> String {
+    use diff_fuzzer_core::GenerationAxes;
+    format!(
+        "decoded from fuzzer bytes; {}",
+        decode_bounds().description()
+    )
+}
+
+/// One decodable operation. Separate from the ops themselves so the enabled set can be built
+/// and indexed before any bytes are consumed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Slot {
+    Neg,
+    Abs,
+    Exp,
+    Sqrt,
+    Log,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sum,
+    Mean,
+    Max,
+    Min,
+    Softmax,
+    Matmul,
+}
 
 /// One byte, or zero if the input is exhausted.
 ///
@@ -132,7 +272,7 @@ fn value(u: &mut Unstructured<'_>, domain: Domain) -> f32 {
 
     // Map the remaining range onto the magnitude interval.
     let fraction = (selector as f32 - 32.0) / 224.0;
-    let magnitude = DECODE_BOUNDS.magnitude;
+    let magnitude = decode_bounds().magnitude;
 
     match domain {
         Domain::Any => -magnitude + fraction * 2.0 * magnitude,
@@ -159,7 +299,7 @@ fn tensor(u: &mut Unstructured<'_>, shape: Vec<usize>, domain: Domain) -> Tensor
 /// nothing.
 fn unary_domain(kind: UnaryOp) -> Domain {
     match kind {
-        UnaryOp::Sqrt if DECODE_BOUNDS.restrict_domains => Domain::NonNegative,
+        UnaryOp::Sqrt if decode_bounds().restrict_domains => Domain::NonNegative,
         _ => Domain::Any,
     }
 }
@@ -167,7 +307,7 @@ fn unary_domain(kind: UnaryOp) -> Domain {
 /// What a binary operation's right operand is allowed to be.
 fn binary_right_domain(kind: BinaryOp) -> Domain {
     match kind {
-        BinaryOp::Div if DECODE_BOUNDS.restrict_domains => Domain::NonZero,
+        BinaryOp::Div if decode_bounds().restrict_domains => Domain::NonZero,
         _ => Domain::Any,
     }
 }
@@ -178,7 +318,9 @@ fn binary_right_domain(kind: BinaryOp) -> Domain {
 /// Clamping rather than rejecting: a rejected input teaches the fuzzer nothing, and the
 /// byte layout must keep meaning the same thing so that a mutation stays local.
 fn shape(u: &mut Unstructured<'_>, rank: usize) -> Vec<usize> {
-    let raw: Vec<usize> = (0..rank).map(|_| size(u, DECODE_BOUNDS.max_dim)).collect();
+    let raw: Vec<usize> = (0..rank)
+        .map(|_| size(u, decode_bounds().max_dim))
+        .collect();
     crate::ops::clamp_to(raw, element_budget(u))
 }
 
@@ -219,42 +361,50 @@ fn broadcast_operands(u: &mut Unstructured<'_>, result: &[usize]) -> (Vec<usize>
 /// where it belongs: `-max_len` now genuinely bounds the work per execution, and a mutation
 /// that lengthens an input is what reaches the larger shapes.
 ///
-/// `DECODE_BOUNDS.max_elements` remains an absolute ceiling on top of this.
+/// `decode_bounds().max_elements` remains an absolute ceiling on top of this.
 fn element_budget(u: &Unstructured<'_>) -> usize {
     // At least one, so an exhausted input still yields a valid (tiny) case rather than a
     // degenerate one — a rejected input teaches the fuzzer nothing.
-    u.len().max(1).min(DECODE_BOUNDS.max_elements)
+    u.len().max(1).min(decode_bounds().max_elements)
 }
 
 impl<'a> Arbitrary<'a> for TensorOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
-        // Byte 0 chooses the operation. Weighted by class the same way the seeded
-        // generator is, so no operation is starved.
+        // Byte 0 chooses the operation, **from the enabled set rather than from a fixed
+        // list**. A campaign that narrows its axes therefore spends every execution on an
+        // operation it asked for, instead of decoding and discarding.
         //
-        // **11 rather than 10 since PHASE-7D**, making room for `softmax`. Changing this
-        // divisor re-interprets every byte string in a corpus, which is why
-        // `FUZZER_GENERATOR` names the layout version.
-        let choice = byte(u) as usize % 15;
+        // The cost is that the enabled set is part of the layout: the same byte decodes to a
+        // different operation under a different set, so a corpus does not carry across one.
+        // `fuzzer_generator()` derives its description from the same bounds, which is what
+        // keeps negatives from being scored across the boundary.
+        let slots = enabled_slots();
+        let slot = slots[byte(u) as usize % slots.len()];
 
-        Ok(match choice {
-            0..=4 => {
-                let kind = [
-                    UnaryOp::Neg,
-                    UnaryOp::Abs,
-                    UnaryOp::Exp,
-                    UnaryOp::Sqrt,
-                    UnaryOp::Log,
-                ][choice];
+        Ok(match slot {
+            Slot::Neg | Slot::Abs | Slot::Exp | Slot::Sqrt | Slot::Log => {
+                let kind = match slot {
+                    Slot::Neg => UnaryOp::Neg,
+                    Slot::Abs => UnaryOp::Abs,
+                    Slot::Exp => UnaryOp::Exp,
+                    Slot::Sqrt => UnaryOp::Sqrt,
+                    _ => UnaryOp::Log,
+                };
                 let domain = unary_domain(kind);
                 // Sequential bindings rather than nesting: the order bytes are consumed
                 // in *is* the layout, so making it explicit keeps it stable.
-                let rank = size(u, DECODE_BOUNDS.max_rank);
+                let rank = size(u, decode_bounds().max_rank);
                 let shape = shape(u, rank);
                 TensorOp::unary(kind, tensor(u, shape, domain))
             }
-            5..=8 => {
-                let kind = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div][choice - 5];
-                let rank = size(u, DECODE_BOUNDS.max_rank);
+            Slot::Add | Slot::Sub | Slot::Mul | Slot::Div => {
+                let kind = match slot {
+                    Slot::Add => BinaryOp::Add,
+                    Slot::Sub => BinaryOp::Sub,
+                    Slot::Mul => BinaryOp::Mul,
+                    _ => BinaryOp::Div,
+                };
+                let rank = size(u, decode_bounds().max_rank);
                 // The **result** shape, from which both operands are derived — the same
                 // correct-by-construction order the seeded generator uses. Deriving operands
                 // from the answer means the fuzzer cannot produce an incompatible pair, so no
@@ -271,34 +421,38 @@ impl<'a> Arbitrary<'a> for TensorOp {
                     tensor(u, rhs_shape, right_domain),
                 )
             }
-            13 => {
+            Slot::Softmax => {
                 // `softmax`, whose dimension is drawn *after* the shape so that the shape
                 // bytes keep their positions and a mutation of one does not shift the other.
-                let rank = size(u, DECODE_BOUNDS.max_rank);
+                let rank = size(u, decode_bounds().max_rank);
                 let shape = shape(u, rank);
                 // Folded into range, so no byte value can produce a case burn would panic on.
                 let dim = (byte(u) as usize) % shape.len();
                 TensorOp::activation(ActivationOp::Softmax, tensor(u, shape, Domain::Any), dim)
             }
-            9..=12 => {
-                let kind =
-                    [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min][choice - 9];
-                let rank = size(u, DECODE_BOUNDS.max_rank);
+            Slot::Sum | Slot::Mean | Slot::Max | Slot::Min => {
+                let kind = match slot {
+                    Slot::Sum => ReduceOp::Sum,
+                    Slot::Mean => ReduceOp::Mean,
+                    Slot::Max => ReduceOp::Max,
+                    _ => ReduceOp::Min,
+                };
+                let rank = size(u, decode_bounds().max_rank);
                 let shape = shape(u, rank);
                 // Drawn from the range the shape defines, so it cannot be out of range.
                 let axis = (byte(u) as usize) % shape.len();
                 TensorOp::reduce(kind, tensor(u, shape, Domain::Any), axis)
             }
-            _ => {
+            Slot::Matmul => {
                 // At least rank 2, since a matrix multiplication of vectors is undefined.
-                let rank = 2 + (byte(u) as usize) % (DECODE_BOUNDS.max_rank - 1);
+                let rank = 2 + (byte(u) as usize) % (decode_bounds().max_rank - 1);
                 let batch = shape(u, rank - 2);
 
                 // Drawn once each and placed into both operands, so the shared inner
                 // dimension cannot disagree.
-                let m = size(u, DECODE_BOUNDS.max_dim);
-                let k = size(u, DECODE_BOUNDS.max_dim);
-                let n = size(u, DECODE_BOUNDS.max_dim);
+                let m = size(u, decode_bounds().max_dim);
+                let k = size(u, decode_bounds().max_dim);
+                let n = size(u, decode_bounds().max_dim);
                 // A matmul operand is `batch × m × k`, so the batch gets whatever the
                 // matrix dimensions have not already spent.
                 let budget = element_budget(u);
@@ -397,31 +551,59 @@ mod tests {
         assert!(equal > 50, "equal shapes became rare: {equal}");
     }
 
-    /// **The tie between the decode bounds and the string that identifies them.**
+    /// **The tie between the decode bounds and the description that identifies them** — now
+    /// guaranteed by derivation rather than asserted.
     ///
-    /// The pool matches negatives on the generator description verbatim. If the bounds are
-    /// widened and the description is not updated, negatives from two different
-    /// distributions become indistinguishable and the guard silently stops guarding.
+    /// This used to compare a hand-written constant against the bounds, field by field, and
+    /// it was the right test for that arrangement: the description was one edit away from
+    /// naming a decoder that no longer existed. `GenerationAxes` derives it instead, so the
+    /// drift is impossible rather than detected.
+    ///
+    /// What remains worth asserting is that the derived description actually *carries* what
+    /// distinguishes one configuration from another — a derivation over the wrong fields
+    /// would be just as silent as a stale literal.
     #[test]
-    fn bounds_are_named_in_the_generator_description() {
-        let description = crate::negatives::FUZZER_GENERATOR;
+    fn the_generator_description_carries_every_bound_that_changes_what_is_generated() {
+        let described = fuzzer_generator();
 
-        assert!(
-            description.contains(&format!("max_dim {}", DECODE_BOUNDS.max_dim)),
-            "DECODE_BOUNDS.max_dim is {} but the generator description says {description:?}",
-            DECODE_BOUNDS.max_dim
-        );
-        assert!(
-            description.contains(&format!("magnitude {}", DECODE_BOUNDS.magnitude as u64)),
-            "DECODE_BOUNDS.magnitude is {} but the generator description says {description:?}",
-            DECODE_BOUNDS.magnitude
-        );
-        assert!(
-            description.contains(&format!("budget {}", DECODE_BOUNDS.max_elements)),
-            "DECODE_BOUNDS.max_elements is {} but the generator description says \
-             {description:?}",
-            DECODE_BOUNDS.max_elements
-        );
+        for expected in [
+            format!("max_dim={}", decode_bounds().max_dim),
+            format!("magnitude={}", decode_bounds().magnitude),
+            format!("max_elements={}", decode_bounds().max_elements),
+        ] {
+            assert!(
+                described.contains(&expected),
+                "{described:?} lacks {expected}"
+            );
+        }
+
+        // And the axes, including disabled ones — "off" and "did not exist" must be
+        // distinguishable.
+        for axis in ["unary", "binary", "matmul", "activations"] {
+            assert!(
+                described.contains(axis),
+                "{described:?} lacks the {axis} axis"
+            );
+        }
+    }
+
+    /// **Narrowing the operation set changes what a byte decodes to**, so it must change the
+    /// identity too — otherwise a narrowed campaign's negatives would be scored against a
+    /// wider one's.
+    #[test]
+    fn a_narrowed_operation_set_would_describe_itself_differently() {
+        use diff_fuzzer_core::GenerationAxes;
+
+        let wide = DEFAULT_DECODE_BOUNDS.description();
+        let narrow = Bounds {
+            selecting_reductions: false,
+            ..DEFAULT_DECODE_BOUNDS
+        }
+        .description();
+
+        assert_ne!(wide, narrow);
+        assert!(wide.contains("selecting_reductions=on"));
+        assert!(narrow.contains("selecting_reductions=off"));
     }
 
     use super::*;
@@ -570,7 +752,7 @@ mod tests {
     /// so.
     #[test]
     fn decoded_cases_respect_the_configured_domains() {
-        if !DECODE_BOUNDS.restrict_domains {
+        if !decode_bounds().restrict_domains {
             // Unrestricted: undefined results are the point, so there is nothing to
             // assert beyond validity, which other tests already cover.
             return;
@@ -599,7 +781,7 @@ mod tests {
     /// otherwise the setting would be nominal.
     #[test]
     fn unrestricted_decoding_reaches_the_undefined_region() {
-        if DECODE_BOUNDS.restrict_domains {
+        if decode_bounds().restrict_domains {
             return;
         }
 
