@@ -18,6 +18,7 @@
 //! runs a case end to end, the tolerance-based comparison that replaces exact
 //! equality, shrinking a failure to its smallest form, and writing findings to disk.
 
+pub mod axes;
 pub mod driver;
 pub mod minimize;
 pub mod oracle;
@@ -30,6 +31,7 @@ pub mod traits;
 // Re-exported at the crate root so users write `diff_fuzzer_core::Oracle` rather than
 // `diff_fuzzer_core::traits::Oracle`. Module structure is our business; the names are
 // what callers care about.
+pub use axes::GenerationAxes;
 pub use driver::{RunOutcome, run_once};
 pub use minimize::{Budget, Minimized, Shrink, StopReason, minimize, minimize_within};
 pub use oracle::DifferentialOracle;

@@ -15,7 +15,18 @@ pub const ALL: [ReduceOp; 4] = [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, Re
 
 /// Build a valid reduction case.
 pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
-    let kind = ALL[rng.random_range(0..ALL.len())];
+    // **Two axes inside one class.** `sum`/`mean` accumulate; `max`/`min` return an input
+    // unchanged. They fail for entirely different reasons, so a campaign may want one and
+    // not the other — and after PHASE-7F's campaign, switching `max`/`min` off is the
+    // obvious way to stop a known disagreement saturating a corpus.
+    let allowed: Vec<ReduceOp> = ALL
+        .into_iter()
+        .filter(|kind| match kind {
+            ReduceOp::Sum | ReduceOp::Mean => bounds.accumulating_reductions,
+            ReduceOp::Max | ReduceOp::Min => bounds.selecting_reductions,
+        })
+        .collect();
+    let kind = allowed[rng.random_range(0..allowed.len())];
 
     let shape = shape(rng, bounds);
     // Chosen *after* the shape, from the range the shape defines.

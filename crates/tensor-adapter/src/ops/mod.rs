@@ -69,6 +69,34 @@ pub struct Bounds {
     /// more per case; lower it to run more cases.
     pub max_elements: usize,
 
+    /// **Which operation classes the generator may emit.**
+    ///
+    /// Added at PHASE-7F, and the reason is measured rather than anticipated: a six-hour
+    /// campaign produced 1,834 findings, *every one* of them the same `max`/`min` ordering
+    /// disagreement, while `softmax`, `log` and `mean` produced nothing. The easily-reached
+    /// class saturated the corpus and crowded out the operations whose answers were unknown.
+    ///
+    /// **A campaign's configuration should exclude the axes whose answers are known.** The
+    /// SQL adapter reached that conclusion independently, which is why the mechanism now
+    /// lives in the engine as [`GenerationAxes`] rather than in either adapter.
+    ///
+    /// Every axis is on by default, so nothing changes unless a campaign deliberately
+    /// narrows — and **enabling an axis adds cases, it never removes them**.
+    pub unary_ops: bool,
+    /// Elementwise binary operations, including broadcasting.
+    pub binary_ops: bool,
+    /// `sum` and `mean` — reductions that accumulate.
+    pub accumulating_reductions: bool,
+    /// `max` and `min` — reductions that select an input unchanged.
+    ///
+    /// The axis most likely to be switched *off*: its disagreement is understood, and
+    /// generating more of it buys nothing.
+    pub selecting_reductions: bool,
+    /// `matmul`.
+    pub matmul: bool,
+    /// `softmax`.
+    pub activations: bool,
+
     /// Whether arguments are confined to each operation's defined domain.
     ///
     /// When `true` (the default), `sqrt` receives only non-negatives and `div` only
@@ -92,6 +120,13 @@ impl Default for Bounds {
             // 8⁴ — the worst case the historical `max_dim: 8` regime already allowed, so
             // this default changes nothing about how the old campaigns behaved.
             max_elements: 4_096,
+            // Every operation class on by default: narrowing is a deliberate act.
+            unary_ops: true,
+            binary_ops: true,
+            accumulating_reductions: true,
+            selecting_reductions: true,
+            matmul: true,
+            activations: true,
             restrict_domains: true,
         }
     }
@@ -278,6 +313,85 @@ fn special_value(rng: &mut SeededRng, domain: Domain, bounds: &Bounds) -> f32 {
     }
 
     allowed[rng.random_range(0..allowed.len())]
+}
+
+impl diff_fuzzer_core::GenerationAxes for Bounds {
+    fn axes(&self) -> Vec<(&'static str, bool)> {
+        vec![
+            ("unary", self.unary_ops),
+            ("binary", self.binary_ops),
+            ("accumulating_reductions", self.accumulating_reductions),
+            ("selecting_reductions", self.selecting_reductions),
+            ("matmul", self.matmul),
+            ("activations", self.activations),
+            ("unrestricted_domains", !self.restrict_domains),
+        ]
+    }
+
+    fn scalars(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("max_rank", self.max_rank.to_string()),
+            ("max_dim", self.max_dim.to_string()),
+            ("magnitude", self.magnitude.to_string()),
+            ("special_rate", self.special_value_rate.to_string()),
+            ("max_elements", self.max_elements.to_string()),
+        ]
+    }
+}
+
+impl Bounds {
+    /// Every operation class enabled — the default, and what every campaign before PHASE-7F
+    /// ran.
+    pub const ALL_OPERATIONS: Self = Self {
+        unary_ops: true,
+        binary_ops: true,
+        accumulating_reductions: true,
+        selecting_reductions: true,
+        matmul: true,
+        activations: true,
+        ..Self::DEFAULT
+    };
+
+    /// Everything except `max`/`min`.
+    ///
+    /// **The configuration the six-hour campaign should have used for its second half.**
+    /// Those two saturate a corpus with a disagreement already understood; excluding them is
+    /// what lets a run reach `softmax`, `log` and `mean`.
+    pub const WITHOUT_SELECTING_REDUCTIONS: Self = Self {
+        selecting_reductions: false,
+        ..Self::ALL_OPERATIONS
+    };
+
+    /// Only the operations whose backends run genuinely different algorithms.
+    ///
+    /// `softmax` (three implementations), and the unary transcendentals `exp` and `log`
+    /// (neither correctly rounded). The narrowest useful setting, for asking whether a
+    /// *numeric* disagreement exists at all.
+    pub const NUMERICALLY_INTERESTING: Self = Self {
+        unary_ops: true,
+        binary_ops: false,
+        accumulating_reductions: true,
+        selecting_reductions: false,
+        matmul: false,
+        activations: true,
+        ..Self::DEFAULT
+    };
+
+    /// The plain default, as a `const` so the presets above can build on it.
+    pub const DEFAULT: Self = Self {
+        max_rank: crate::backends::MAX_RANK,
+        max_dim: 8,
+        magnitude: 10.0,
+        special_value_rate: 0.125,
+        max_elements: 4_096,
+        unary_ops: true,
+        binary_ops: true,
+        accumulating_reductions: true,
+        selecting_reductions: true,
+        matmul: true,
+        activations: true,
+        restrict_domains: true,
+    };
 }
 
 /// Total number of elements in a shape.

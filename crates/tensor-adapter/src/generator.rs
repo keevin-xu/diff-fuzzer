@@ -36,6 +36,23 @@ enum Class {
     Activation,
 }
 
+impl Class {
+    /// Whether this class is enabled by a configuration.
+    ///
+    /// `Reduce` splits across two axes: `sum`/`mean` accumulate and are numerically
+    /// interesting, while `max`/`min` select an input unchanged and are the pair most worth
+    /// switching off once their disagreement is understood.
+    fn enabled_by(self, bounds: &Bounds) -> bool {
+        match self {
+            Class::Unary => bounds.unary_ops,
+            Class::Binary => bounds.binary_ops,
+            Class::Reduce => bounds.accumulating_reductions || bounds.selecting_reductions,
+            Class::Matmul => bounds.matmul,
+            Class::Activation => bounds.activations,
+        }
+    }
+}
+
 /// Builds a random valid tensor case from a seed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TensorOpGenerator {
@@ -51,11 +68,25 @@ impl TensorOpGenerator {
     ///
     /// Walks the weights subtracting as it goes: a number is drawn from the total, and
     /// whichever class's share that number falls inside is the one chosen.
-    fn choose_class(rng: &mut SeededRng) -> Class {
-        let total: usize = CLASS_WEIGHTS.iter().map(|(_, weight)| weight).sum();
+    fn choose_class(rng: &mut SeededRng, bounds: &Bounds) -> Class {
+        // **Disabled classes are removed before the draw, not filtered after it.**
+        // Rejecting afterwards would spend the budget generating cases nobody wants, and
+        // would make the weighting depend on how often a rejection happened.
+        let enabled: Vec<(Class, usize)> = CLASS_WEIGHTS
+            .into_iter()
+            .filter(|(class, _)| class.enabled_by(bounds))
+            .collect();
+
+        assert!(
+            !enabled.is_empty(),
+            "every operation class is disabled; a generator with nothing to generate is a \
+             configuration error, not an empty campaign"
+        );
+
+        let total: usize = enabled.iter().map(|(_, weight)| weight).sum();
         let mut pick = rng.random_range(0..total);
 
-        for (class, weight) in CLASS_WEIGHTS {
+        for (class, weight) in enabled {
             if pick < weight {
                 return class;
             }
@@ -71,7 +102,7 @@ impl Generator for TensorOpGenerator {
     type In = TensorOp;
 
     fn generate(&self, rng: &mut SeededRng) -> TensorOp {
-        match Self::choose_class(rng) {
+        match Self::choose_class(rng, &self.bounds) {
             Class::Unary => unary::generate(rng, &self.bounds),
             Class::Binary => binary::generate(rng, &self.bounds),
             Class::Reduce => reduce::generate(rng, &self.bounds),
@@ -118,6 +149,67 @@ mod tests {
         (0..count)
             .map(|seed| generator.generate(&mut SeededRng::from_seed(seed)))
             .collect()
+    }
+
+    /// **A disabled axis produces nothing at all**, which is the whole point — a campaign
+    /// narrows to stop a known disagreement crowding out the rest.
+    #[test]
+    fn a_disabled_operation_class_is_never_generated() {
+        let bounds = Bounds::WITHOUT_SELECTING_REDUCTIONS;
+        let generator = TensorOpGenerator::new(bounds);
+
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for seed in 0..3_000u64 {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            *seen.entry(case.name()).or_default() += 1;
+        }
+
+        assert!(!seen.contains_key("max"), "max was generated: {seen:?}");
+        assert!(!seen.contains_key("min"), "min was generated: {seen:?}");
+        // And the rest still are — narrowing must remove one thing, not everything.
+        for still_there in ["sum", "mean", "softmax", "add", "matmul", "exp"] {
+            assert!(
+                seen.contains_key(still_there),
+                "{still_there} vanished: {seen:?}"
+            );
+        }
+    }
+
+    /// **The narrowest preset still generates the operations it claims to.**
+    #[test]
+    fn the_numerically_interesting_preset_keeps_what_it_names() {
+        let generator = TensorOpGenerator::new(Bounds::NUMERICALLY_INTERESTING);
+
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for seed in 0..3_000u64 {
+            seen.entry(generator.generate(&mut SeededRng::from_seed(seed)).name())
+                .and_modify(|n| *n += 1)
+                .or_insert(1);
+        }
+
+        for kept in ["softmax", "exp", "log", "sum", "mean"] {
+            assert!(seen.contains_key(kept), "{kept} was excluded: {seen:?}");
+        }
+        for excluded in ["max", "min", "matmul", "add"] {
+            assert!(
+                !seen.contains_key(excluded),
+                "{excluded} leaked in: {seen:?}"
+            );
+        }
+    }
+
+    /// **A configuration is identified by its axes**, so a narrowed run cannot be confused
+    /// with a full one — which is what keeps their corpora and negatives apart.
+    #[test]
+    fn narrowing_the_operation_set_changes_the_configuration_identity() {
+        use diff_fuzzer_core::GenerationAxes;
+
+        let all = Bounds::ALL_OPERATIONS.description();
+        let narrowed = Bounds::WITHOUT_SELECTING_REDUCTIONS.description();
+
+        assert_ne!(all, narrowed);
+        assert!(all.contains("selecting_reductions=on"), "{all}");
+        assert!(narrowed.contains("selecting_reductions=off"), "{narrowed}");
     }
 
     /// Every operation must be reachable. One that is never generated is one that is
