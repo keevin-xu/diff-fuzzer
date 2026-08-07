@@ -139,6 +139,9 @@ pub fn generate_query(
     // and identical types — the two things a set operation requires — while a different
     // `WHERE` is what makes the two sides actually differ. That difference is the point:
     // `INTERSECT` and `EXCEPT` say nothing interesting about two identical row sets.
+    // Note what this permits: a set operation whose branches are joined queries, and a
+    // grouped query over a join. Those combinations are the point of the combined
+    // configuration — each axis alone came back clean.
     let set_op = if wants_set_op {
         let op = match rng.random_range(0..4) {
             0 => SetOp::Union,
@@ -685,6 +688,14 @@ mod tests {
             Expr::Cast { expr, to } => {
                 assert_types_agree(expr, table, seed);
                 Some(*to)
+            }
+            // A subquery has its own scope, so this walk — which checks types against one
+            // table — cannot say anything about its insides. It returns the *shape* of the
+            // subquery's result and stops, which is the honest boundary.
+            Expr::Exists { .. } => None,
+            Expr::ScalarSubquery { left, .. } => {
+                assert_types_agree(left, table, seed);
+                None
             }
             Expr::Aggregate { func, arg } => {
                 if let Some(inner) = arg {

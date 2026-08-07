@@ -200,7 +200,7 @@ impl SqlCase {
     /// have touched. A case that violates these is a defect in whichever of those produced
     /// it, and finding out at the boundary beats finding out from an engine's parser.
     pub fn validate(&self) -> Result<(), String> {
-        let table = self.queried_table().ok_or_else(|| {
+        let _table = self.queried_table().ok_or_else(|| {
             format!(
                 "query reads table {} which is not in the schema",
                 self.query.from
@@ -242,60 +242,26 @@ impl SqlCase {
             }
         }
 
-        // Name resolution: every column the query mentions must exist in the table it reads.
-        let mut referenced: Vec<&crate::schema::ColumnRef> = Vec::new();
-        for expression in &self.query.projection {
-            referenced.extend(expression.columns());
-        }
-        if let Some(filter) = &self.query.filter {
-            referenced.extend(filter.columns());
-        }
-        for key in &self.query.order_by {
-            referenced.push(&key.column);
-        }
-        // A join puts a second table in scope, so a reference resolves against either.
-        let joined = self.query.join.as_ref().and_then(|join| {
-            self.schema
-                .iter()
-                .find(|candidate| candidate.name == join.table)
-        });
-        for reference in referenced {
-            let resolves = if reference.table == table.name {
-                table.column(&reference.column).is_some()
-            } else if let Some(joined) = joined {
-                reference.table == joined.name && joined.column(&reference.column).is_some()
-            } else {
-                false
-            };
-            if !resolves {
-                return Err(format!(
-                    "query references {}.{}, which is not in scope",
-                    reference.table, reference.column
-                ));
-            }
-        }
+        // **Name resolution, scope by scope.**
+        //
+        // A correlated subquery may reference the outer row, so a reference is legal if it
+        // resolves in *its own* scope or in any enclosing one. Resolving everything against a
+        // single flattened scope would accept an outer query referencing an inner table, which
+        // is not legal SQL and which the engines would refuse — a case that tests the parser
+        // rather than the engine.
+        resolve_scopes(&self.query, &self.schema, &[])?;
 
-        // Grouping rules. SQLite permits a bare column alongside an aggregate without
-        // grouping by it (picking an arbitrary row); DuckDB refuses. Generating only the
-        // strict form is what both accept — so this is a validity rule here, not a legal
-        // difference to catalog.
+        // Grouping rules. SQLite permits a bare column alongside an aggregate without grouping
+        // by it (picking an arbitrary row); DuckDB refuses. Generating only the strict form is
+        // what both accept — so this is a validity rule here, not a legal difference to catalog.
         if !self.query.group_by.is_empty() {
-            for key in &self.query.group_by {
-                if key.table != table.name || table.column(&key.column).is_none() {
-                    return Err(format!(
-                        "GROUP BY names {}.{}, which is not a column of {}",
-                        key.table, key.column, table.name
-                    ));
-                }
-            }
             for expression in &self.query.projection {
-                let grouped_column = match expression {
-                    crate::schema::Expr::Column(reference) => {
-                        self.query.group_by.iter().any(|key| key == reference)
-                    }
-                    _ => false,
-                };
-                if !grouped_column && !expression.contains_aggregate() {
+                let is_grouping_column = matches!(
+                    expression,
+                    crate::schema::Expr::Column(reference)
+                        if self.query.group_by.iter().any(|key| key == reference)
+                );
+                if !is_grouping_column && !expression.contains_aggregate() {
                     return Err(
                         "a grouped query may project only its grouping columns and aggregates"
                             .to_string(),
@@ -303,7 +269,6 @@ impl SqlCase {
                 }
             }
         } else if self.aggregates() {
-            // Mixing an aggregate with a bare column and no `GROUP BY` is the same trap.
             for expression in &self.query.projection {
                 if !expression.contains_aggregate() {
                     return Err(
@@ -314,39 +279,12 @@ impl SqlCase {
             }
         }
 
-        // Join rules. The joined table must exist, must not be the query's own table (a self
-        // join needs aliases, which the v1 AST has no way to express), and its `ON` predicate
-        // may reference only the two tables in scope.
-        if let Some(join) = &self.query.join {
-            if join.table == self.query.from {
-                return Err("a self join needs aliases, which v1 cannot express".to_string());
-            }
-            let joined = self
-                .schema
-                .iter()
-                .find(|candidate| candidate.name == join.table)
-                .ok_or_else(|| {
-                    format!(
-                        "join names table {}, which is not in the schema",
-                        join.table
-                    )
-                })?;
-
-            for reference in join.on.columns() {
-                let resolves = if reference.table == table.name {
-                    table.column(&reference.column).is_some()
-                } else if reference.table == joined.name {
-                    joined.column(&reference.column).is_some()
-                } else {
-                    false
-                };
-                if !resolves {
-                    return Err(format!(
-                        "the ON predicate references {}.{}, which is not in scope",
-                        reference.table, reference.column
-                    ));
-                }
-            }
+        // Join rules. A self join needs aliases, which the v1 AST cannot express; the joined
+        // table's existence and its `ON` predicate's references are covered by `resolve_scopes`.
+        if let Some(join) = &self.query.join
+            && join.table == self.query.from
+        {
+            return Err("a self join needs aliases, which v1 cannot express".to_string());
         }
 
         // Set-operation rules. Both branches must project the same number of columns, and
@@ -397,6 +335,89 @@ impl SqlCase {
 
         Ok(())
     }
+}
+
+/// Check every column reference in `statement`, given the tables enclosing scopes provide.
+///
+/// Walks outward: a reference resolves against this statement's own tables first, then against
+/// anything an enclosing query had in scope. That outward search *is* correlation — remove it
+/// and a correlated subquery becomes unrepresentable; widen it to a flat set and an outer query
+/// could illegally reference an inner table.
+fn resolve_scopes(
+    statement: &SelectStmt,
+    schema: &[Table],
+    outer: &[&Table],
+) -> Result<(), String> {
+    let own = schema
+        .iter()
+        .find(|table| table.name == statement.from)
+        .ok_or_else(|| {
+            format!(
+                "query reads table {}, which is not in the schema",
+                statement.from
+            )
+        })?;
+
+    let mut scope: Vec<&Table> = vec![own];
+    if let Some(join) = &statement.join {
+        let joined = schema
+            .iter()
+            .find(|table| table.name == join.table)
+            .ok_or_else(|| {
+                format!(
+                    "join names table {}, which is not in the schema",
+                    join.table
+                )
+            })?;
+        scope.push(joined);
+    }
+    scope.extend_from_slice(outer);
+
+    let resolves = |reference: &crate::schema::ColumnRef| {
+        scope
+            .iter()
+            .any(|table| table.name == reference.table && table.column(&reference.column).is_some())
+    };
+
+    let mut here: Vec<&crate::schema::ColumnRef> = Vec::new();
+    for expression in statement
+        .projection
+        .iter()
+        .chain(statement.filter.iter())
+        .chain(statement.join.iter().map(|join| &join.on))
+    {
+        here.extend(expression.columns_here());
+    }
+    for key in &statement.order_by {
+        here.push(&key.column);
+    }
+    here.extend(statement.group_by.iter());
+
+    for reference in here {
+        if !resolves(reference) {
+            return Err(format!(
+                "{}.{} is not in scope for the query over {}",
+                reference.table, reference.column, statement.from
+            ));
+        }
+    }
+
+    // Recurse, handing this statement's scope down as the enclosing one.
+    for expression in statement
+        .projection
+        .iter()
+        .chain(statement.filter.iter())
+        .chain(statement.join.iter().map(|join| &join.on))
+    {
+        for subquery in expression.subqueries() {
+            resolve_scopes(subquery, schema, &scope)?;
+        }
+    }
+    if let Some(branch) = &statement.set_op {
+        resolve_scopes(&branch.right, schema, outer)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -501,6 +522,142 @@ mod tests {
         let mut case = simple_case();
         case.data[0].rows.push(vec![Literal::Text("x".to_string())]);
         assert!(case.validate().is_err());
+    }
+
+    /// The grouping rules, as negative tests.
+    ///
+    /// These exist because the rules were once **deleted by accident** during a refactor and
+    /// nothing failed: every generated case still validated, because the generator does not
+    /// produce the shapes the rules reject. A rule with only positive coverage can be removed
+    /// silently, which makes it no rule at all.
+    #[test]
+    fn validate_rejects_a_bare_column_beside_an_aggregate() {
+        use crate::schema::{AggregateFunc, ColumnRef, Expr};
+
+        let mut case = SqlCase::fixed_example();
+        let reference = ColumnRef {
+            table: "t0".to_string(),
+            column: "c0".to_string(),
+        };
+        // SQLite would accept this and pick an arbitrary row; DuckDB refuses it. Generating
+        // only the strict form is what both accept.
+        case.query.projection = vec![
+            Expr::Column(reference.clone()),
+            Expr::Aggregate {
+                func: AggregateFunc::CountRows,
+                arg: None,
+            },
+        ];
+        assert!(case.validate().is_err(), "aggregate beside a bare column");
+
+        // Grouping by that column makes it legal again.
+        case.query.group_by = vec![reference];
+        assert!(case.validate().is_ok(), "grouped, so the column is legal");
+    }
+
+    #[test]
+    fn validate_rejects_a_projection_that_is_not_grouped_or_aggregated() {
+        use crate::schema::{ColumnRef, Expr};
+
+        let mut case = SqlCase::fixed_example();
+        case.query.group_by = vec![ColumnRef {
+            table: "t0".to_string(),
+            column: "c0".to_string(),
+        }];
+        // Projects c1, which is neither the grouping column nor an aggregate.
+        case.query.projection = vec![Expr::Column(ColumnRef {
+            table: "t0".to_string(),
+            column: "c1".to_string(),
+        })];
+        assert!(case.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_self_join() {
+        use crate::schema::{BinaryOp, ColumnRef, Expr, Join, JoinKind};
+
+        let mut case = SqlCase::fixed_example();
+        let reference = ColumnRef {
+            table: "t0".to_string(),
+            column: "c0".to_string(),
+        };
+        case.query.join = Some(Join {
+            kind: JoinKind::Inner,
+            table: "t0".to_string(),
+            on: Expr::Binary {
+                op: BinaryOp::Equal,
+                left: Box::new(Expr::Column(reference.clone())),
+                right: Box::new(Expr::Column(reference)),
+            },
+        });
+        assert!(
+            case.validate().is_err(),
+            "a self join needs aliases the v1 AST cannot express"
+        );
+    }
+
+    /// Correlation is the whole point of a subquery here: an inner query referencing the
+    /// **outer** row must validate, and an outer query referencing an inner table must not.
+    #[test]
+    fn scopes_resolve_outward_but_never_inward() {
+        use crate::schema::{BinaryOp, Column, ColumnRef, Expr, SelectStmt, SqlType, Table};
+
+        let mut case = SqlCase::fixed_example();
+        case.schema.push(Table {
+            name: "t1".to_string(),
+            columns: vec![Column {
+                name: "d0".to_string(),
+                sql_type: SqlType::Integer,
+            }],
+        });
+        case.data.push(crate::schema::InsertRows {
+            table: "t1".to_string(),
+            rows: vec![vec![Literal::Integer(1)]],
+        });
+
+        let outer_column = ColumnRef {
+            table: "t0".to_string(),
+            column: "c0".to_string(),
+        };
+        let inner_column = ColumnRef {
+            table: "t1".to_string(),
+            column: "d0".to_string(),
+        };
+
+        // An inner query comparing the inner table to the OUTER row — correlated, and legal.
+        case.query.filter = Some(Expr::Exists {
+            not: false,
+            query: Box::new(SelectStmt {
+                projection: vec![Expr::Column(inner_column.clone())],
+                from: "t1".to_string(),
+                join: None,
+                set_op: None,
+                group_by: vec![],
+                filter: Some(Expr::Binary {
+                    op: BinaryOp::Equal,
+                    left: Box::new(Expr::Column(inner_column)),
+                    right: Box::new(Expr::Column(outer_column)),
+                }),
+                order_by: vec![],
+                limit: None,
+            }),
+        });
+        assert!(
+            case.validate().is_ok(),
+            "an inner query may reference the outer row: {:?}",
+            case.validate()
+        );
+
+        // The reverse must fail: the outer query cannot see inside the subquery.
+        let mut inverted = SqlCase::fixed_example();
+        inverted.query.projection = vec![Expr::Column(ColumnRef {
+            table: "t1".to_string(),
+            column: "d0".to_string(),
+        })];
+        assert!(
+            inverted.validate().is_err(),
+            "an outer query must not reference a table it does not read"
+        );
     }
 
     /// The invariant a shrinker is most likely to break, since it is about the *data* and

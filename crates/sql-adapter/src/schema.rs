@@ -270,6 +270,26 @@ pub enum Expr {
         /// `None` only for `COUNT(*)`.
         arg: Option<Box<Expr>>,
     },
+    /// `EXISTS (SELECT ...)` — a truth value.
+    ///
+    /// The inner query may reference the **outer** row, which is what makes it *correlated*:
+    /// it is re-evaluated per outer row rather than once. That is where the interesting bugs
+    /// live, and it is also what makes name resolution two-scoped and shrinking dangerous —
+    /// dropping an outer column can orphan a reference buried inside the subquery.
+    Exists {
+        not: bool,
+        query: Box<SelectStmt>,
+    },
+    /// `expr <op> (SELECT ...)` — a comparison against a **scalar** subquery.
+    ///
+    /// The inner query must return one column. It may return **no rows**, in which case SQL
+    /// says the scalar is `NULL` and the comparison is unknown — a case worth generating
+    /// deliberately, since it is where "no rows" and "a `NULL` value" become the same thing.
+    ScalarSubquery {
+        op: BinaryOp,
+        left: Box<Expr>,
+        query: Box<SelectStmt>,
+    },
 }
 
 impl Expr {
@@ -284,6 +304,10 @@ impl Expr {
             Expr::Binary { left, right, .. } => 1 + left.node_count() + right.node_count(),
             Expr::Cast { expr, .. } => 1 + expr.node_count(),
             Expr::Aggregate { arg, .. } => 1 + arg.as_ref().map_or(0, |inner| inner.node_count()),
+            // A subquery counts as its own size plus its query's, so minimization sees
+            // removing one as the large reduction it is.
+            Expr::Exists { query, .. } => 1 + query.node_count(),
+            Expr::ScalarSubquery { left, query, .. } => 1 + left.node_count() + query.node_count(),
         }
     }
 
@@ -313,6 +337,14 @@ impl Expr {
                     inner.collect_columns(found);
                 }
             }
+            // Deliberately **does** descend into subqueries: the whole point of a correlated
+            // one is that it references the outer scope, and a caller checking which columns a
+            // query needs must see those references or it will happily delete them.
+            Expr::Exists { query, .. } => query.collect_columns(found),
+            Expr::ScalarSubquery { left, query, .. } => {
+                left.collect_columns(found);
+                query.collect_columns(found);
+            }
         }
     }
 
@@ -329,6 +361,100 @@ impl Expr {
                 left.contains_aggregate() || right.contains_aggregate()
             }
             Expr::Cast { expr, .. } => expr.contains_aggregate(),
+            // An aggregate *inside* a subquery belongs to the subquery, not to this query —
+            // `SELECT c0 FROM t WHERE c0 = (SELECT MAX(c1) FROM u)` is not an aggregate query.
+            // Reporting otherwise would make the grouping rules reject a valid case.
+            Expr::Exists { .. } | Expr::ScalarSubquery { .. } => false,
+        }
+    }
+
+    /// Column references at **this level only**, not descending into subqueries.
+    ///
+    /// The counterpart to [`Expr::columns`], and the distinction is what makes correlated
+    /// subqueries checkable: a reference inside a subquery must be resolved against the
+    /// *subquery's* scope plus the outer one, not against the outer scope alone. A single walk
+    /// that flattened both would reject every valid inner reference.
+    pub fn columns_here(&self) -> Vec<&ColumnRef> {
+        let mut found = Vec::new();
+        self.collect_columns_here(&mut found);
+        found
+    }
+
+    fn collect_columns_here<'a>(&'a self, found: &mut Vec<&'a ColumnRef>) {
+        match self {
+            Expr::Column(reference) => found.push(reference),
+            Expr::Literal(_) => {}
+            Expr::Unary { operand, .. } => operand.collect_columns_here(found),
+            Expr::Binary { left, right, .. } => {
+                left.collect_columns_here(found);
+                right.collect_columns_here(found);
+            }
+            Expr::Cast { expr, .. } => expr.collect_columns_here(found),
+            Expr::Aggregate { arg, .. } => {
+                if let Some(inner) = arg {
+                    inner.collect_columns_here(found);
+                }
+            }
+            // Stops here, deliberately.
+            Expr::Exists { .. } => {}
+            Expr::ScalarSubquery { left, .. } => left.collect_columns_here(found),
+        }
+    }
+
+    /// The statements of any subqueries directly inside this expression.
+    pub fn subqueries(&self) -> Vec<&SelectStmt> {
+        let mut found = Vec::new();
+        self.collect_subqueries(&mut found);
+        found
+    }
+
+    fn collect_subqueries<'a>(&'a self, found: &mut Vec<&'a SelectStmt>) {
+        match self {
+            Expr::Exists { query, .. } => found.push(query),
+            Expr::ScalarSubquery { left, query, .. } => {
+                left.collect_subqueries(found);
+                found.push(query);
+            }
+            Expr::Column(_) | Expr::Literal(_) => {}
+            Expr::Unary { operand, .. } => operand.collect_subqueries(found),
+            Expr::Binary { left, right, .. } => {
+                left.collect_subqueries(found);
+                right.collect_subqueries(found);
+            }
+            Expr::Cast { expr, .. } => expr.collect_subqueries(found),
+            Expr::Aggregate { arg, .. } => {
+                if let Some(inner) = arg {
+                    inner.collect_subqueries(found);
+                }
+            }
+        }
+    }
+
+    /// Does this expression contain a subquery?
+    pub fn contains_subquery(&self) -> bool {
+        match self {
+            Expr::Exists { .. } | Expr::ScalarSubquery { .. } => true,
+            Expr::Column(_) | Expr::Literal(_) => false,
+            Expr::Unary { operand, .. } => operand.contains_subquery(),
+            Expr::Binary { left, right, .. } => {
+                left.contains_subquery() || right.contains_subquery()
+            }
+            Expr::Cast { expr, .. } => expr.contains_subquery(),
+            Expr::Aggregate { arg, .. } => {
+                arg.as_ref().is_some_and(|inner| inner.contains_subquery())
+            }
+        }
+    }
+
+    /// Does this expression produce a truth value rather than a stored value?
+    pub fn is_predicate_shaped(&self) -> bool {
+        match self {
+            Expr::Exists { .. } | Expr::ScalarSubquery { .. } => true,
+            Expr::Unary { op, .. } => {
+                matches!(op, UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull)
+            }
+            Expr::Binary { op, .. } => op.is_predicate(),
+            _ => false,
         }
     }
 
@@ -348,6 +474,10 @@ impl Expr {
             Expr::Aggregate { arg, .. } => arg
                 .as_ref()
                 .is_some_and(|inner| inner.contains_null_literal()),
+            Expr::Exists { query, .. } => query.contains_null_literal(),
+            Expr::ScalarSubquery { left, query, .. } => {
+                left.contains_null_literal() || query.contains_null_literal()
+            }
         }
     }
 }
@@ -505,6 +635,65 @@ pub struct SelectStmt {
     /// honestly excuse. The generator enforces the pairing; `SqlCase::validate` will check
     /// it, so a hand-built or shrunk case cannot slip past.
     pub limit: Option<u32>,
+}
+
+impl SelectStmt {
+    /// Every expression this statement contains, at its own level.
+    fn expressions(&self) -> impl Iterator<Item = &Expr> {
+        self.projection
+            .iter()
+            .chain(self.filter.iter())
+            .chain(self.join.iter().map(|join| &join.on))
+    }
+
+    /// How many expression nodes this statement contains, following subqueries and set
+    /// operations. Used by minimization to know a reduction reduced something.
+    pub fn node_count(&self) -> usize {
+        self.expressions().map(Expr::node_count).sum::<usize>()
+            + self.order_by.len()
+            + usize::from(self.limit.is_some())
+            + self.group_by.len()
+            + self
+                .set_op
+                .as_ref()
+                .map_or(0, |branch| branch.right.node_count())
+    }
+
+    /// Every column reference anywhere in this statement, **including inside subqueries**.
+    ///
+    /// The inclusion is the point: a correlated subquery's references to the outer scope are
+    /// exactly what a caller must not delete, and a walk that stopped at the subquery boundary
+    /// would report them as absent.
+    pub fn collect_columns<'a>(&'a self, found: &mut Vec<&'a ColumnRef>) {
+        for expression in self.expressions() {
+            found.extend(expression.columns());
+        }
+        for key in &self.order_by {
+            found.push(&key.column);
+        }
+        found.extend(self.group_by.iter());
+        if let Some(branch) = &self.set_op {
+            branch.right.collect_columns(found);
+        }
+    }
+
+    /// Does anything in this statement mention a `NULL` literal?
+    pub fn contains_null_literal(&self) -> bool {
+        self.expressions().any(Expr::contains_null_literal)
+            || self
+                .set_op
+                .as_ref()
+                .is_some_and(|branch| branch.right.contains_null_literal())
+    }
+
+    /// Does this statement contain a subquery anywhere?
+    pub fn contains_subquery(&self) -> bool {
+        self.expressions().any(Expr::contains_subquery)
+            || self
+                .set_op
+                .as_ref()
+                .is_some_and(|branch| branch.right.contains_subquery())
+    }
 }
 
 #[cfg(test)]

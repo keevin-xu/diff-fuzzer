@@ -83,6 +83,7 @@ fn main() {
         Some("setops") => sql_adapter::gen_schema::Bounds::V1_SET_OPS,
         Some("chained") => sql_adapter::gen_schema::Bounds::V1_CHAINED_SET_OPS,
         Some("joins") => sql_adapter::gen_schema::Bounds::V1_JOINS,
+        Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
         Some("wide") => sql_adapter::gen_schema::Bounds::V1_WIDE_ARITHMETIC,
         _ => sql_adapter::gen_schema::Bounds::V1,
     };

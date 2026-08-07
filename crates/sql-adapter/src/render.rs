@@ -208,6 +208,21 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
             render_expr(expr, dialect),
             type_name(*to, dialect)
         ),
+        // Always parenthesized, which SQL requires here anyway — and note that a subquery is
+        // rendered by the same `render_select` as a top-level query, so anything true of one
+        // is true of the other. That is what keeps a correlated reference spelled the same way
+        // inside as out.
+        Expr::Exists { not, query } => format!(
+            "({}EXISTS ({}))",
+            if *not { "NOT " } else { "" },
+            render_select(query, dialect)
+        ),
+        Expr::ScalarSubquery { op, left, query } => format!(
+            "({} {} ({}))",
+            render_expr(left, dialect),
+            binary_operator(*op),
+            render_select(query, dialect)
+        ),
         Expr::Aggregate { func, arg } => match (func, arg) {
             (AggregateFunc::CountRows, _) => "COUNT(*)".to_string(),
             (function, Some(inner)) => {

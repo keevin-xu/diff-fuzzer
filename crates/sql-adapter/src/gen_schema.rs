@@ -107,6 +107,39 @@ impl Bounds {
         ..Bounds::V1
     };
 
+    /// **Every axis at once** — the configuration a campaign runs.
+    ///
+    /// Each axis was measured alone, which is right for attributing a difference in yield to
+    /// one change. But a per-axis sweep tests no **interaction**, and interactions are where
+    /// engines classically part company: an aggregate over an outer-joined table, where the
+    /// `NULL`s being counted were manufactured by the join rather than stored; a set operation
+    /// over grouped queries. Nothing so far has generated any of those.
+    ///
+    /// **Two axes stay off, and for the same reason: their divergences are already understood.**
+    ///
+    /// - `wide_arithmetic` — integer overflow, catalogued in `known.rs` with citations.
+    /// - `chained_set_ops` — set-operation precedence (`SPECS.md` §4.11). *Not* catalogued,
+    ///   because DuckDB's side is measured rather than documented, so nothing filters it.
+    ///
+    /// Leaving either on floods a campaign with a difference nobody needs to see again.
+    /// Measured, not assumed: a first attempt at this configuration with `chained_set_ops`
+    /// enabled produced **494 findings in under two minutes, every one of them the precedence
+    /// mechanism** — while each one paid the cost of minimization. An unknown finding would
+    /// have been one line among hundreds of identical ones.
+    ///
+    /// The general rule, which cost two attempts to learn: **a campaign's configuration
+    /// excludes the axes whose answers are known.** Widening exists to find new mechanisms;
+    /// once a mechanism is understood, generating more of it buys nothing and hides the rest.
+    /// Both axes remain available for deliberate use.
+    pub const V1_ALL: Bounds = Bounds {
+        aggregates: true,
+        set_ops: true,
+        chained_set_ops: false,
+        joins: true,
+        wide_arithmetic: false,
+        ..Bounds::V1
+    };
+
     /// V1 plus set operations. One axis, as always.
     pub const V1_SET_OPS: Bounds = Bounds {
         set_ops: true,

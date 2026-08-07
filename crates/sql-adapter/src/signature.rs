@@ -169,6 +169,19 @@ pub fn clause_shape(case: &SqlCase) -> Vec<&'static str> {
     tags.into_iter().collect()
 }
 
+/// Tags from a nested statement — a subquery's own constructs are part of the query's shape.
+fn collect_stmt_tags(statement: &crate::schema::SelectStmt, tags: &mut BTreeSet<&'static str>) {
+    for expression in &statement.projection {
+        collect_expr_tags(expression, tags);
+    }
+    if let Some(filter) = &statement.filter {
+        collect_expr_tags(filter, tags);
+    }
+    if !statement.group_by.is_empty() {
+        tags.insert("group-by");
+    }
+}
+
 fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
     match expression {
         Expr::Column(_) => {}
@@ -188,6 +201,15 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
                 UnaryOp::IsNotNull => "is-not-null",
             });
             collect_expr_tags(operand, tags);
+        }
+        Expr::Exists { not, query } => {
+            tags.insert(if *not { "not-exists" } else { "exists" });
+            collect_stmt_tags(query, tags);
+        }
+        Expr::ScalarSubquery { left, query, .. } => {
+            tags.insert("scalar-subquery");
+            collect_expr_tags(left, tags);
+            collect_stmt_tags(query, tags);
         }
         Expr::Aggregate { func, arg } => {
             tags.insert(match func {
