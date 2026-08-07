@@ -86,7 +86,26 @@ impl SqlCase {
     /// case rather than to the query, because ties in the data are what break a total order
     /// — see [`crate::ordering`].
     pub fn is_totally_ordered(&self) -> bool {
-        // **A grouped or aggregated query is never treated as totally ordered.**
+        // **A grouped query ordered by its grouping columns IS totally ordered** — provably,
+        // not by inspection of the data. `GROUP BY c` emits exactly one row per distinct value
+        // of `c` (and exactly one row for `NULL`, since grouping treats `NULL`s as equal), so
+        // ordering by `c` puts those rows in one legal order however the data ties.
+        //
+        // This is the only case where ordering can be established for a query whose output
+        // rows are not the seeded rows, and it matters: grouped queries were 30% of the
+        // combined corpus and every one of them was being sorted away before comparison.
+        if !self.query.group_by.is_empty()
+            && !self.query.order_by.is_empty()
+            && self
+                .query
+                .group_by
+                .iter()
+                .all(|key| self.query.order_by.iter().any(|by| &by.column == key))
+        {
+            return true;
+        }
+
+        // **Otherwise a grouped or aggregated query is not treated as totally ordered.**
         //
         // `orders_rows_totally` asks whether the *seeded rows* tie on the ordering columns —
         // but a grouped query does not return seeded rows, it returns one row per group, and

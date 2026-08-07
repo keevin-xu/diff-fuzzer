@@ -138,7 +138,23 @@ pub fn generate_query(
         // not `bounds.set_ops` — a row query that did not get one still gets ordered.
         QueryShape::Rows if wants_set_op || joined => Vec::new(),
         QueryShape::Rows => generate_order_by(rng, table),
-        QueryShape::WholeTableAggregate | QueryShape::Grouped => Vec::new(),
+        QueryShape::WholeTableAggregate => Vec::new(),
+        // A grouped query may order by its grouping columns — legal on both engines, and
+        // provably total (one row per group). Generated often, because otherwise the whole
+        // grouped third of the corpus is compared with its row order sorted away.
+        QueryShape::Grouped if rng.random_range(0..100) < 70 => group_by
+            .iter()
+            .map(|column| OrderKey {
+                column: column.clone(),
+                direction: if rng.random_range(0..2) == 0 {
+                    Direction::Ascending
+                } else {
+                    Direction::Descending
+                },
+                nulls_first: rng.random_range(0..2) == 0,
+            })
+            .collect(),
+        QueryShape::Grouped => Vec::new(),
     };
 
     // **The rule that needs the data.** A `LIMIT` on a query whose order is not total lets

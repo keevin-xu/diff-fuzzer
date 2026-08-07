@@ -1,0 +1,43 @@
+# The SQL domain's cargo-fuzz crate.
+#
+# **Separate from `fuzz/`, deliberately** (decided at S0.6). That crate hard-depends on
+# `tensor-adapter`, so a shared crate would compile `libtorch` and `wgpu` into every SQL
+# fuzz build, and DuckDB into every tensor one. `cargo fuzz --fuzz-dir fuzz-sql` keeps the
+# two dependency sets apart.
+#
+# Like `fuzz/`, this is its own workspace — the empty `[workspace]` table below is what does
+# it — so an everyday `cargo build --workspace` never pulls in nightly or sanitizers.
+
+[package]
+name = "sql-adapter-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sql-adapter = { path = "../crates/sql-adapter" }
+diff-fuzzer-core = { path = "../crates/diff-fuzzer-core" }
+
+[profile.release]
+debug = 1
+
+# The control target for the coverage measurement — see its module docs.
+[[bin]]
+name = "generate_only"
+path = "fuzz_targets/generate_only.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_diff"
+path = "fuzz_targets/sql_diff.rs"
+test = false
+doc = false
+bench = false
