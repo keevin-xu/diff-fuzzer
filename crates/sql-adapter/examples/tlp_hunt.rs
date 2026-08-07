@@ -9,8 +9,28 @@
 //! the whole. Then it does the same for the other engine, separately. A violation names one
 //! engine; no comparison between them is involved at any point.
 //!
+//! # Which engine to point it at
+//!
+//! **DuckDB by default.** A metamorphic oracle spends every execution on one target, so the
+//! choice matters more than it does for a differential run. SQLite is the most-deployed
+//! database in the world with a correspondingly heavy test suite; DuckDB is younger and far
+//! less mined, which is the premise this whole pairing was chosen on (`planning/13` §0, from
+//! Rigger's DBMS bug ledger).
+//!
+//! **The reason is yield, not speed** — a correction, because the first version of this comment
+//! claimed dropping SQLite would "roughly double throughput". Measured: 76 → 83 cases/sec,
+//! about 9%. A SQLite run costs 0.049 ms against DuckDB's 4.6 ms, so removing it saves almost
+//! nothing. Running both is nearly free, which is a good argument for keeping the control.
+//!
+//! **SQLite stays available as a control, and that is not optional.** If TLP violates on
+//! DuckDB and holds on SQLite, that is a strong signal. If it violates on *both*, the far
+//! likelier explanation is that our transform is wrong — and without the ability to run the
+//! comparison, there is no way to tell those apart.
+//!
 //! Run with:
-//!   cargo run --release -p sql-adapter --example tlp_hunt -- [cases] [label] [setting]
+//!   cargo run --release -p sql-adapter --example tlp_hunt -- [cases] [label] [setting] [engine]
+//!
+//! `engine` is `duckdb` (default), `sqlite`, or `both`.
 
 use diff_fuzzer_core::SeededRng;
 use diff_fuzzer_core::traits::{Generator, Implementation};
@@ -63,11 +83,19 @@ fn main() {
         _ => Bounds::V1,
     };
 
+    // The target under test. DuckDB alone by default — see the module docs.
+    let engines: Vec<&str> = match arguments.next().as_deref() {
+        Some("sqlite") => vec!["sqlite"],
+        Some("both") => vec!["sqlite", "duckdb"],
+        _ => vec!["duckdb"],
+    };
+
     let generator = SqlGenerator::new(bounds);
     let directory = format!("{FINDINGS_ROOT}/runs/{label}");
 
     println!("generator: {}", generator.description());
     println!("cases:     {total}");
+    println!("engines:   {}", engines.join(", "));
     println!("oracle:    TLP, each engine against itself\n");
 
     let (mut checked, mut skipped, mut not_partitionable) = (0usize, 0usize, 0usize);
@@ -82,7 +110,7 @@ fn main() {
             continue;
         };
 
-        for engine in ["sqlite", "duckdb"] {
+        for engine in &engines {
             match judge(engine, &parts) {
                 Relation::Holds => checked += 1,
                 Relation::NotChecked(_) => skipped += 1,
