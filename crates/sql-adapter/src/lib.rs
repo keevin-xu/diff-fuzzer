@@ -57,6 +57,8 @@ pub mod known;
 pub mod normalize;
 /// Properties of a case a trigger rule might key on — the domain-specific vocabulary.
 pub mod features;
+/// Checking one engine against itself — the class a differential oracle cannot reach.
+pub mod metamorphic;
 /// Copied from `tensor-adapter` — see `PENDING` 1.1 for the edit cost.
 pub mod negatives;
 /// Deciding whether the engines disagreed.
