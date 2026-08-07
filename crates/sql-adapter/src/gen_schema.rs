@@ -27,6 +27,59 @@ use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
+/// FNV-1a over a byte slice, continuing from `hash`.
+///
+/// A **`const fn`**: it runs at *compile* time, so the value below costs nothing at runtime.
+/// `const fn` may use loops (since Rust 1.46) but not iterators, which is why this is a `while`
+/// over an index rather than a `for` over `.iter()`.
+///
+/// FNV-1a is chosen for being short enough to read in one sitting. It is **not** cryptographic
+/// and does not need to be: this detects *accidental* drift, not an adversary.
+const fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    hash
+}
+
+/// A fingerprint of the **generation logic itself**, computed at compile time from the source.
+///
+/// # The problem this solves
+///
+/// [`Bounds::description`] names every *bound*, which is what a reader would think identifies a
+/// corpus. It does not. A change to the generation *logic* that leaves every bound alone — the
+/// set-op ordering fix, the grouped-ordering change, making joins probabilistic — produces a
+/// completely different corpus under a **byte-identical description**. `Pool::matched` compares
+/// that string exactly, so it would accept two incomparable pools as the same one and quietly
+/// mix them. Three such logic changes have already happened in this project.
+///
+/// # Why this is derived rather than a number someone bumps
+///
+/// A hand-maintained `GENERATOR_VERSION` would work only if it were always remembered — and
+/// "someone will remember" is precisely the discipline that failed and created the problem.
+/// `include_bytes!` embeds the source of the generation modules at compile time, so the
+/// fingerprint changes **whenever they change**, with nothing to forget.
+///
+/// # The cost, stated honestly
+///
+/// It is **over-sensitive**: reformatting or editing a comment in these files changes the
+/// fingerprint and so invalidates pools that are in fact still comparable. That is the direction
+/// to err in. A spurious mismatch costs a re-run and is visible; a missed one silently corrupts
+/// a measurement and is not.
+pub const GENERATOR_FINGERPRINT: u32 = {
+    // Every module that decides what a case looks like. A module added here later must be
+    // added to this list too — the one thing this scheme still asks a human to remember.
+    let hash = fnv1a(include_bytes!("gen_schema.rs"), 0xcbf2_9ce4_8422_2325);
+    let hash = fnv1a(include_bytes!("gen_query.rs"), hash);
+    let hash = fnv1a(include_bytes!("generator.rs"), hash);
+    // Fold the 64-bit hash into 32 bits so the description stays short; collision risk is
+    // irrelevant for detecting accidental drift.
+    (hash ^ (hash >> 32)) as u32
+};
+
 /// How large a generated case may be.
 ///
 /// **One definition, named in the generator's description**, because a negative case
@@ -212,7 +265,7 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={}, subqueries={}, not-in={})",
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={}, subqueries={}, not-in={}, logic={:08x})",
             self.max_tables,
             self.max_columns,
             self.max_rows,
@@ -223,7 +276,10 @@ impl Bounds {
             self.chained_set_ops,
             self.joins,
             self.subqueries,
-            self.not_in
+            self.not_in,
+            // The bounds above say what was *configured*; this says what the generator *was*.
+            // Two corpora agreeing on every bound but differing here are not comparable.
+            GENERATOR_FINGERPRINT
         )
     }
 }
@@ -381,6 +437,87 @@ pub fn generate_literal(rng: &mut SeededRng, sql_type: SqlType) -> Literal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fingerprint must actually distinguish different logic. Tested on `fnv1a` directly,
+    /// because the constant itself cannot vary within one compilation — which is precisely why
+    /// the *function* is what needs pinning.
+    #[test]
+    fn the_fingerprint_function_separates_different_sources() {
+        let seed = 0xcbf2_9ce4_8422_2325;
+        let original = fnv1a(b"if rng.random_range(0..100) < 60 {", seed);
+        // The set-op ordering fix was a change of exactly this shape: one condition, no bound
+        // touched, an entirely different corpus.
+        let changed = fnv1a(b"if rng.random_range(0..100) < 70 {", seed);
+        assert_ne!(
+            original, changed,
+            "a one-character logic change must change the fingerprint"
+        );
+
+        // Order matters: hashing the same modules in a different order is a different value,
+        // so the chain cannot be silently reordered.
+        let forward = fnv1a(b"second", fnv1a(b"first", seed));
+        let backward = fnv1a(b"first", fnv1a(b"second", seed));
+        assert_ne!(forward, backward);
+
+        // And it is stable — the same bytes always give the same value, or a description would
+        // change between runs and nothing could ever be compared.
+        assert_eq!(fnv1a(b"stable", seed), fnv1a(b"stable", seed));
+    }
+
+    /// Every description must carry the fingerprint, and two *different* bound sets must still
+    /// be distinguishable from each other as well.
+    #[test]
+    fn the_description_carries_the_logic_fingerprint_and_every_axis() {
+        let description = Bounds::V1_ALL.description();
+
+        assert!(
+            description.contains(&format!("logic={GENERATOR_FINGERPRINT:08x}")),
+            "description must name the generation logic, got {description}"
+        );
+
+        // Every axis still named — the fingerprint supplements the bounds, it does not replace
+        // them. A reader must be able to see *what was configured* without recompiling.
+        for axis in [
+            "tables<=",
+            "columns<=",
+            "rows<=",
+            "depth<=",
+            "wide-arith=",
+            "aggregates=",
+            "set-ops=",
+            "chained=",
+            "joins=",
+            "subqueries=",
+            "not-in=",
+        ] {
+            assert!(
+                description.contains(axis),
+                "{axis} missing from {description}"
+            );
+        }
+
+        // Two configurations differing only in one bound remain distinguishable.
+        assert_ne!(Bounds::V1.description(), Bounds::V1_ALL.description());
+        assert_ne!(
+            Bounds::V1_NOT_IN.description(),
+            Bounds::V1_JOINS.description()
+        );
+
+        // The fingerprint is shared by all of them: it describes the *code*, not the config.
+        assert!(
+            Bounds::V1
+                .description()
+                .contains(&format!("logic={GENERATOR_FINGERPRINT:08x}"))
+        );
+    }
+
+    /// A non-zero, non-trivial fingerprint. A zero here would mean `include_bytes!` resolved to
+    /// nothing and every corpus would silently share one identity again.
+    #[test]
+    fn the_fingerprint_is_not_degenerate() {
+        assert_ne!(GENERATOR_FINGERPRINT, 0);
+        assert_ne!(GENERATOR_FINGERPRINT, u32::MAX);
+    }
 
     fn schema_and_data(seed: u64) -> (Vec<Table>, Vec<InsertRows>) {
         let mut rng = SeededRng::from_seed(seed);
