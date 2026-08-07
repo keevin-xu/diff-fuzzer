@@ -73,6 +73,13 @@ pub enum OpClass {
     Approximated,
     /// Sums many terms, so results depend on summation order.
     Accumulating,
+    /// A **composition** of the classes above, whose bound is derived from its parts.
+    ///
+    /// `softmax` is the first: an approximated `exp`, an accumulation over the normalised
+    /// axis, and a division. None of the three classes describes it, and picking the loosest
+    /// of them would be a guess rather than a derivation — the parts compose in a specific
+    /// way, and the composition is what has to be bounded.
+    Composed,
 }
 
 impl TensorOp {
@@ -94,6 +101,8 @@ impl TensorOp {
                 ReduceOp::Sum => OpClass::Accumulating,
             },
             TensorOp::Matmul { .. } => OpClass::Accumulating,
+            // See `composed_tolerance`: `exp` over a sum, then a division.
+            TensorOp::Activation { .. } => OpClass::Composed,
         }
     }
 }
@@ -143,7 +152,9 @@ const METAL_SUBNORMAL_FLOOR: f64 = f32::MIN_POSITIVE as f64;
 /// produce a perfectly normal-sized difference in the output.
 fn has_subnormal_input(case: &TensorOp) -> bool {
     let operands: [&crate::input::TensorValue; 2] = match case {
-        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => [arg, arg],
+        TensorOp::Unary { arg, .. }
+        | TensorOp::Reduce { arg, .. }
+        | TensorOp::Activation { arg, .. } => [arg, arg],
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => [lhs, rhs],
     };
 
@@ -257,6 +268,8 @@ impl TensorTolerancePolicy {
             OpClass::Approximated => approximated_tolerance(input),
 
             OpClass::Accumulating => accumulating_tolerance(input),
+
+            OpClass::Composed => composed_tolerance(input, implementations),
         }
     }
 }
@@ -323,6 +336,79 @@ fn bound(terms: usize, largest: f64) -> Tolerance {
     // of magnitudes.
     let atol = 2.0 * terms * EPSILON * (terms * largest);
     Tolerance::new(rtol, atol)
+}
+
+/// Tolerance for `softmax`, derived from the parts it is built out of.
+///
+/// # The composition
+///
+/// `softmax(x)_i = exp(x_i - m) / sum_j exp(x_j - m)`, where `m` is the maximum along the
+/// normalised axis. Four steps contribute error, and **relative errors add through a
+/// quotient**, so they sum:
+///
+/// | step | contribution, in units of `EPSILON` | why |
+/// |---|---|---|
+/// | `max` | 0 | returns one of its inputs unchanged; nothing is rounded |
+/// | `x_i - m` then `exp` | `1 + range` | the `Approximated` model, at argument `x_i - m`. `exp`'s condition number is the magnitude of its argument, and since `m` is the maximum, that magnitude is at most the **range** of values along the axis |
+/// | `sum_j` | `n` | the `Accumulating` model over `n` terms |
+/// | `/` | 1, or [`METAL_DIV_ULPS`] against a GPU | one correctly rounded division; Metal permits 2.5 ULP (`SPECS.md` §4.1) |
+///
+/// Doubled, as everywhere else here, because two implementations may sit on opposite sides
+/// of the true value.
+///
+/// # Two deliberate conservatisms, stated rather than hidden
+///
+/// **The range is taken over the whole tensor, not per slice.** Each output element depends
+/// only on its own slice along `dim`, so the exact bound would use that slice's range. The
+/// whole-tensor range is an upper bound on every slice's, which errs toward a looser
+/// tolerance — the direction that costs sensitivity rather than the one that hides defects.
+/// Computing it per slice is a refinement worth making only if this proves too loose.
+///
+/// **No absolute term.** The `Accumulating` class carries one because cancellation can
+/// destroy the scale a relative tolerance needs. Here it cannot: every `exp(x_i - m)` is
+/// positive and no term cancels another, so the sum keeps its scale and a relative bound is
+/// well founded. Against a GPU an absolute floor is still added upstream, for denormal
+/// flushing rather than for cancellation.
+///
+/// # What this does *not* assume
+///
+/// It does not assume how a backend organises the work. `burn-wgpu` composes five separate
+/// operations and `burn-flex` fuses three passes into one kernel; both perform the same
+/// mathematical steps, and the bound above covers either. A fused implementation should land
+/// *inside* it with margin, which is the point — a bound that only the composed version
+/// satisfied would be fitted to one implementation.
+fn composed_tolerance(input: &TensorOp, implementations: (&str, &str)) -> Tolerance {
+    let TensorOp::Activation { arg, dim, .. } = input else {
+        unreachable!("{} is not a composed operation", input.name());
+    };
+
+    let terms = arg.shape()[*dim] as f64;
+    let range = value_range(arg.data());
+    let division = if involves_gpu(implementations) {
+        METAL_DIV_ULPS
+    } else {
+        1.0
+    };
+
+    Tolerance::new(2.0 * ((1.0 + range) + terms + division) * EPSILON, 0.0)
+}
+
+/// The spread of finite values, which bounds `exp`'s condition number after the max-shift.
+///
+/// Non-finite values are skipped: they are handled by the special-value policy (§5), not by
+/// a tolerance, and letting an infinity into this arithmetic would produce a `NaN` bound.
+fn value_range(data: &[f32]) -> f64 {
+    let finite = data.iter().copied().filter(|v| v.is_finite());
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for value in finite {
+        low = low.min(value);
+        high = high.max(value);
+    }
+    if low > high {
+        return 0.0; // nothing finite; the bound is irrelevant to such a case
+    }
+    (high - low) as f64
 }
 
 fn accumulating_tolerance(input: &TensorOp) -> Tolerance {

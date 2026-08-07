@@ -357,7 +357,9 @@ fn still_diverges(report: &DivergenceReport<TensorOp>) -> bool {
 
 fn element_count(case: &TensorOp) -> usize {
     match case {
-        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => arg.len(),
+        TensorOp::Unary { arg, .. }
+        | TensorOp::Reduce { arg, .. }
+        | TensorOp::Activation { arg, .. } => arg.len(),
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
     }
 }

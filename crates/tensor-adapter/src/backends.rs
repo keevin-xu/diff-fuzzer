@@ -14,7 +14,7 @@
 //! in [`BurnBackend::run`] is where those meet, and confining it here is what lets
 //! everything else treat rank as an ordinary value.
 
-use crate::input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 use burn::backend::{Flex, LibTorch, Wgpu};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
@@ -85,6 +85,16 @@ impl<B: Backend> BurnBackend<B> {
                     BinaryOp::Sub => a.sub(b),
                     BinaryOp::Mul => a.mul(b),
                     BinaryOp::Div => a.div(b),
+                }
+            }
+            TensorOp::Activation { kind, arg, dim } => {
+                let t = self.tensor::<D>(arg);
+                match kind {
+                    // **Not a method on `Tensor`** — it lives in `burn::tensor::activation`
+                    // and dispatches to `B::softmax`, a backend trait method. That indirection
+                    // is the whole reason this operation is worth testing: each backend may
+                    // answer it with entirely different code, where `neg` or `add` cannot.
+                    ActivationOp::Softmax => burn::tensor::activation::softmax(t, *dim),
                 }
             }
             TensorOp::Reduce { kind, arg, axis } => {
@@ -204,6 +214,72 @@ mod tests {
 
     fn value(shape: &[usize], data: &[f32]) -> TensorValue {
         TensorValue::new(shape.to_vec(), data.to_vec())
+    }
+
+    /// **`softmax` runs on every backend, and they agree on a case with an exact answer.**
+    ///
+    /// A row of identical values has a mathematically exact softmax — `1/n` for every
+    /// element, with no rounding required by any correct implementation. It is therefore the
+    /// one case where disagreement would be unambiguous, which makes it the right smoke test
+    /// for three implementations that share no code.
+    #[test]
+    fn softmax_runs_on_every_backend_and_agrees_on_an_exact_case() {
+        use crate::input::ActivationOp;
+
+        // Four equal values: softmax is exactly 0.25 each, whatever the value is.
+        let case = TensorOp::activation(
+            ActivationOp::Softmax,
+            value(&[1, 4], &[3.0, 3.0, 3.0, 3.0]),
+            1,
+        );
+
+        for backend in [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ] {
+            let out = backend
+                .run(&case)
+                .unwrap_or_else(|e| panic!("{} could not run softmax: {e:?}", backend.name()));
+            assert_eq!(out.shape.to_vec(), vec![1, 4], "{}", backend.name());
+            for v in values(out) {
+                assert!(
+                    (v - 0.25).abs() < 1e-6,
+                    "{} returned {v} where 0.25 is exact",
+                    backend.name()
+                );
+            }
+        }
+    }
+
+    /// The normalised dimension is honoured rather than assumed to be the last one — the
+    /// case that sends `burn-flex` down its transposing path.
+    #[test]
+    fn softmax_normalises_the_dimension_it_is_given() {
+        use crate::input::ActivationOp;
+
+        // Down columns (dim 0) of a 2x2, the pairs are (1,1) and (2,2): every result is 0.5.
+        // Across rows (dim 1) they are (1,2) and (1,2): the results are not 0.5.
+        let case = TensorOp::activation(
+            ActivationOp::Softmax,
+            value(&[2, 2], &[1.0, 2.0, 1.0, 2.0]),
+            0,
+        );
+
+        for backend in [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ] {
+            let out = values(backend.run(&case).expect("runs"));
+            for v in out {
+                assert!(
+                    (v - 0.5).abs() < 1e-6,
+                    "{} normalised the wrong dimension: got {v}, expected 0.5",
+                    backend.name()
+                );
+            }
+        }
     }
 
     /// **The end-to-end check that broadcasting actually works**, as opposed to our model of

@@ -141,8 +141,7 @@ pub struct Negative {
 /// would read simply as "decoded from fuzzer bytes".
 ///
 /// `decode::bounds_are_named_in_the_generator_description` fails if the two drift apart.
-pub const FUZZER_GENERATOR: &str =
-    "decoded from fuzzer bytes at max_dim 64, magnitude 10, budget 1048576, layout 2 (broadcast)";
+pub const FUZZER_GENERATOR: &str = "decoded from fuzzer bytes at max_dim 64, magnitude 10, budget 1048576, layout 3 (broadcast+softmax)";
 
 /// The conditions a set of cases was observed under.
 ///
@@ -259,7 +258,9 @@ pub fn is_interesting(case: &TensorOp) -> bool {
     /// Every value a case carries, across however many operands it has.
     fn operand_values(case: &TensorOp) -> Vec<&f32> {
         let operands: Vec<&crate::input::TensorValue> = match case {
-            TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => vec![arg],
+            TensorOp::Unary { arg, .. }
+            | TensorOp::Reduce { arg, .. }
+            | TensorOp::Activation { arg, .. } => vec![arg],
             TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => vec![lhs, rhs],
         };
         operands.into_iter().flat_map(|o| o.data().iter()).collect()

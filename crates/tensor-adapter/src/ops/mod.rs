@@ -16,6 +16,7 @@
 //! - [`reduce`] — one argument plus an axis that must be within its rank
 //! - [`matmul`] — inner dimensions must agree, batch dimensions must match
 
+pub mod activation;
 pub mod binary;
 pub mod broadcast;
 pub mod matmul;

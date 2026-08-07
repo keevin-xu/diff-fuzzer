@@ -18,7 +18,7 @@
 //! may put its axis out of range. Generic shrinkers produce invalid cases and waste the
 //! search on them.
 
-use crate::input::{BinaryOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, TensorOp, TensorValue, UnaryOp};
 use diff_fuzzer_core::Shrink;
 
 impl Shrink for TensorOp {
@@ -28,6 +28,7 @@ impl Shrink for TensorOp {
             TensorOp::Binary { kind, lhs, rhs } => binary_candidates(*kind, lhs, rhs),
             TensorOp::Reduce { kind, arg, axis } => reduce_candidates(*kind, arg, *axis),
             TensorOp::Matmul { lhs, rhs } => matmul_candidates(lhs, rhs),
+            TensorOp::Activation { kind, arg, dim } => activation_candidates(*kind, arg, *dim),
         }
     }
 }
@@ -104,6 +105,41 @@ fn binary_candidates(kind: BinaryOp, lhs: &TensorValue, rhs: &TensorValue) -> Ve
             kind,
             lhs.clone(),
             TensorValue::new(rhs.shape().to_vec(), data),
+        ));
+    }
+
+    out
+}
+
+/// Candidates for a normalisation along one axis.
+///
+/// Mirrors `reduce_candidates`, with one addition that matters for `softmax` specifically:
+/// **moving the normalised dimension to the last position is offered as a simplification.**
+/// `burn-flex` takes a different code path when `dim != rank - 1` — it transposes, normalises
+/// the last axis, and transposes back — so a case that only diverges off the last axis is a
+/// case about that transpose. Offering the move lets minimisation *discover* that: if the
+/// divergence survives, the transpose was irrelevant; if it vanishes, the transpose is the
+/// story, and the minimised case says so by still pointing at the original dimension.
+fn activation_candidates(kind: ActivationOp, arg: &TensorValue, dim: usize) -> Vec<TensorOp> {
+    let mut out = Vec::new();
+
+    for shape in smaller_shapes(arg.shape()) {
+        // Dropping a dimension can leave `dim` past the end; clamping keeps the candidate
+        // runnable, since burn panics rather than erroring on an out-of-range dimension.
+        let clamped = dim.min(shape.len() - 1);
+        out.push(TensorOp::activation(kind, arg.resized(&shape), clamped));
+    }
+
+    // The last axis is the simplest form to read *and* the one that avoids flex's transpose.
+    if dim != arg.rank() - 1 {
+        out.push(TensorOp::activation(kind, arg.clone(), arg.rank() - 1));
+    }
+
+    for data in simpler_values(arg.data(), ValueRules::unrestricted()) {
+        out.push(TensorOp::activation(
+            kind,
+            TensorValue::new(arg.shape().to_vec(), data),
+            dim,
         ));
     }
 
@@ -510,7 +546,9 @@ mod tests {
 
     fn element_count(op: &TensorOp) -> usize {
         match op {
-            TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => arg.len(),
+            TensorOp::Unary { arg, .. }
+            | TensorOp::Reduce { arg, .. }
+            | TensorOp::Activation { arg, .. } => arg.len(),
             TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => {
                 lhs.len() + rhs.len()
             }

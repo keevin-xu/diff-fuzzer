@@ -36,7 +36,7 @@
 //! Running out of bytes is handled the same way: exhausted data reads as zero rather than
 //! failing, so a short input still yields a valid, if minimal, case.
 
-use crate::input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 use crate::ops::{Bounds, DIVISOR_FLOOR, Domain, SPECIAL_VALUES};
 use arbitrary::{Arbitrary, Result, Unstructured};
 
@@ -230,7 +230,11 @@ impl<'a> Arbitrary<'a> for TensorOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         // Byte 0 chooses the operation. Weighted by class the same way the seeded
         // generator is, so no operation is starved.
-        let choice = byte(u) as usize % 10;
+        //
+        // **11 rather than 10 since PHASE-7D**, making room for `softmax`. Changing this
+        // divisor re-interprets every byte string in a corpus, which is why
+        // `FUZZER_GENERATOR` names the layout version.
+        let choice = byte(u) as usize % 11;
 
         Ok(match choice {
             0..=3 => {
@@ -260,6 +264,15 @@ impl<'a> Arbitrary<'a> for TensorOp {
                     tensor(u, lhs_shape, Domain::Any),
                     tensor(u, rhs_shape, right_domain),
                 )
+            }
+            10 => {
+                // `softmax`, whose dimension is drawn *after* the shape so that the shape
+                // bytes keep their positions and a mutation of one does not shift the other.
+                let rank = size(u, DECODE_BOUNDS.max_rank);
+                let shape = shape(u, rank);
+                // Folded into range, so no byte value can produce a case burn would panic on.
+                let dim = (byte(u) as usize) % shape.len();
+                TensorOp::activation(ActivationOp::Softmax, tensor(u, shape, Domain::Any), dim)
             }
             8 => {
                 let rank = size(u, DECODE_BOUNDS.max_rank);
@@ -500,11 +513,22 @@ mod tests {
             seen.insert(decode(&bytes).name());
         }
 
-        for expected in [
-            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "sum", "matmul",
-        ] {
-            assert!(seen.contains(expected), "{expected} was never decoded");
+        // **Asserted exhaustively, not just inclusively.** This test previously listed the
+        // operations it wanted and checked each was present, so adding `softmax` to the
+        // decoder left it passing while saying nothing about the new operation. The
+        // generator's equivalent asserts the *count* matches and caught the same omission
+        // immediately — so this one now does the same.
+        let expected = [
+            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "sum", "matmul", "softmax",
+        ];
+        for name in expected {
+            assert!(seen.contains(name), "{name} was never decoded");
         }
+        assert_eq!(
+            seen.len(),
+            expected.len(),
+            "an operation is decodable but unlisted: {seen:?}"
+        );
     }
 
     /// Every supported rank too, since rank-specific paths are where shape-handling bugs

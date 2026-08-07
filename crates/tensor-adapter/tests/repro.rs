@@ -71,7 +71,9 @@ fn worst_absolute_error(case: &TensorOp) -> Option<f64> {
 
 fn element_count(case: &TensorOp) -> usize {
     match case {
-        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => arg.len(),
+        TensorOp::Unary { arg, .. }
+        | TensorOp::Reduce { arg, .. }
+        | TensorOp::Activation { arg, .. } => arg.len(),
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
     }
 }

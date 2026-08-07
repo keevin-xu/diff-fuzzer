@@ -411,7 +411,9 @@ fn describe(
 /// How many values a case holds, for reporting what shrinking achieved.
 fn element_count(case: &TensorOp) -> usize {
     match case {
-        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => arg.len(),
+        TensorOp::Unary { arg, .. }
+        | TensorOp::Reduce { arg, .. }
+        | TensorOp::Activation { arg, .. } => arg.len(),
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
     }
 }
@@ -424,6 +426,7 @@ fn shapes_of(case: &TensorOp) -> String {
             format!("{:?} x {:?}", lhs.shape(), rhs.shape())
         }
         TensorOp::Reduce { arg, axis, .. } => format!("{:?} axis {axis}", arg.shape()),
+        TensorOp::Activation { arg, dim, .. } => format!("{:?} dim {dim}", arg.shape()),
     }
 }
 

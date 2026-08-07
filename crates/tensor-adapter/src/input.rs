@@ -107,6 +107,29 @@ pub enum ReduceOp {
     Sum,
 }
 
+/// Operations normalising a tensor along one axis.
+///
+/// **Separate from [`UnaryOp`] even though the arity is the same**, because these carry a
+/// dimension and unary operations do not. An optional `dim` on `Unary` would be meaningless
+/// for `neg` and would invite exactly the bug where it is silently ignored; a separate
+/// variant makes the compiler name every place that must handle it.
+///
+/// **This is where the interesting divergences are expected**, and the reason is that the
+/// three backends implement it three different ways rather than sharing one kernel:
+/// `burn-flex` hand-writes it, `burn-tch` delegates to libtorch, and `burn-wgpu` does not
+/// override the default at all — composing five separate operations
+/// (`max_dim`, `sub`, `exp`, `sum_dim`, `div`). Every operation tested before this one had
+/// all three backends performing essentially the same arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ActivationOp {
+    /// `exp(x_i - max) / sum_j exp(x_j - max)`, along one dimension.
+    ///
+    /// The max-subtraction is a stability measure, not part of the definition — which is
+    /// itself a source of disagreement, since implementations may apply it differently or
+    /// (in a fused kernel) at a different point in the computation.
+    Softmax,
+}
+
 /// One tensor test case.
 ///
 /// An enum rather than a struct with optional fields, so that each operation carries
@@ -134,6 +157,13 @@ pub enum TensorOp {
         lhs: TensorValue,
         rhs: TensorValue,
     },
+    /// A normalisation along one axis. See [`ActivationOp`].
+    Activation {
+        kind: ActivationOp,
+        arg: TensorValue,
+        /// Which axis is normalised over. Always less than the argument's rank.
+        dim: usize,
+    },
 }
 
 impl TensorOp {
@@ -154,6 +184,21 @@ impl TensorOp {
             rhs.shape()
         );
         TensorOp::Binary { kind, lhs, rhs }
+    }
+
+    /// # Panics
+    ///
+    /// If `dim` is not a dimension of `arg`.
+    ///
+    /// burn's `softmax` panics on an out-of-range dimension rather than returning an error,
+    /// so the constraint is enforced here where a case is built, not discovered at run time.
+    pub fn activation(kind: ActivationOp, arg: TensorValue, dim: usize) -> Self {
+        assert!(
+            dim < arg.rank(),
+            "dim {dim} is out of range for a rank-{} tensor",
+            arg.rank()
+        );
+        TensorOp::Activation { kind, arg, dim }
     }
 
     /// # Panics
@@ -218,13 +263,18 @@ impl TensorOp {
                 ReduceOp::Sum => "sum",
             },
             TensorOp::Matmul { .. } => "matmul",
+            TensorOp::Activation { kind, .. } => match kind {
+                ActivationOp::Softmax => "softmax",
+            },
         }
     }
 
     /// The rank of this case's arguments, which decides how it gets executed.
     pub fn rank(&self) -> usize {
         match self {
-            TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => arg.rank(),
+            TensorOp::Unary { arg, .. }
+            | TensorOp::Reduce { arg, .. }
+            | TensorOp::Activation { arg, .. } => arg.rank(),
             TensorOp::Binary { lhs, .. } | TensorOp::Matmul { lhs, .. } => lhs.rank(),
         }
     }
