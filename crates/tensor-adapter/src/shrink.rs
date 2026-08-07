@@ -396,6 +396,13 @@ fn value_rules(kind: UnaryOp) -> ValueRules {
             allow_zero: true,
             allow_negative: false,
         },
+        // `log` rejects negatives for the same reason, and **also excludes zero**: shrinking
+        // a value to 0.0 would turn the result into `-inf`, which is a different failure
+        // from the one being minimised rather than a simpler version of it.
+        UnaryOp::Log => ValueRules {
+            allow_zero: false,
+            allow_negative: false,
+        },
         UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Exp => ValueRules::unrestricted(),
     }
 }

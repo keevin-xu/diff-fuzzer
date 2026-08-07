@@ -150,7 +150,32 @@ fn report(label: &str, case: &TensorOp) {
 }
 
 fn main() {
-    println!("A — same numbers, different axis (any difference IS the transpose path)\n");
+    println!("E — NaN and signed zero in max/min reductions\n");
+    {
+        use tensor_adapter::input::ReduceOp;
+        for (label, kind, data) in [
+            ("max with NaN", ReduceOp::Max, vec![1.0f32, f32::NAN, 3.0]),
+            ("min with NaN", ReduceOp::Min, vec![1.0f32, f32::NAN, 3.0]),
+            ("max all NaN", ReduceOp::Max, vec![f32::NAN, f32::NAN]),
+            ("max signed zeros", ReduceOp::Max, vec![-0.0f32, 0.0]),
+            ("min signed zeros", ReduceOp::Min, vec![-0.0f32, 0.0]),
+            ("max with inf", ReduceOp::Max, vec![1.0f32, f32::INFINITY]),
+        ] {
+            let n = data.len();
+            let case = TensorOp::reduce(kind, TensorValue::new(vec![1, n], data), 1);
+            let answers: Vec<String> = run_all(&case)
+                .iter()
+                .map(|(name, v)| format!("{name}={:?}", v[0]))
+                .collect();
+            println!(
+                "  {label:<20} {}   -> {}",
+                answers.join("  "),
+                verdict(&case)
+            );
+        }
+    }
+
+    println!("\nA — same numbers, different axis (any difference IS the transpose path)\n");
     // A 4x4 whose transpose holds the same values: softmax along 0 and along 1 must agree
     // up to transposition, so comparing each backend against the others on each axis
     // isolates the path rather than the data.

@@ -86,6 +86,14 @@ pub enum UnaryOp {
     /// that restriction is its own experiment, once there is a policy for what two
     /// backends both returning NaN should mean.
     Sqrt,
+    /// Undefined below zero, `-inf` at zero — and, unlike `exp`, **its error is worst near
+    /// `x = 1`**, not at large arguments.
+    ///
+    /// The condition number of `log` is `1 / |ln x|`, which diverges as `x` approaches 1
+    /// because `log(1) = 0` and a relative error against zero is unbounded. That is the
+    /// opposite shape of bound from everything else in `POLICY.md`, and it is why `log`
+    /// needed its own derivation rather than `exp`'s.
+    Log,
 }
 
 /// Operations taking two tensors of the same shape.
@@ -105,6 +113,24 @@ pub enum ReduceOp {
     /// shows up: two backends adding in a different order get different last bits.
     /// Expect this operation to need a looser comparison than the others.
     Sum,
+    /// A sum followed by a division. **Not the same bound as `Sum`**: the division adds a
+    /// rounding of its own, and on Metal it is licensed 2.5 ULP rather than one.
+    ///
+    /// Also worth testing because backends may divide at different points — before summing,
+    /// after, or fused into the accumulation — which changes both overflow behaviour and
+    /// rounding.
+    Mean,
+    /// **No arithmetic at all**: the result is one of the inputs, returned unchanged.
+    ///
+    /// Which makes any disagreement a *semantic* one rather than a numeric one, and
+    /// therefore impossible to excuse as precision. The interesting question is `NaN`:
+    /// IEEE-754's `maxNum` ignores it and returns the other operand, and implementations
+    /// genuinely differ — a hand-written SIMD kernel, libtorch, and a GPU reduction have no
+    /// reason to agree on it. Signed zero is the other tie case.
+    Max,
+    /// The mirror of [`ReduceOp::Max`], and it can differ independently: an implementation
+    /// may handle `NaN` one way in one and another way in the other.
+    Min,
 }
 
 /// Operations normalising a tensor along one axis.
@@ -252,6 +278,7 @@ impl TensorOp {
                 UnaryOp::Abs => "abs",
                 UnaryOp::Exp => "exp",
                 UnaryOp::Sqrt => "sqrt",
+                UnaryOp::Log => "log",
             },
             TensorOp::Binary { kind, .. } => match kind {
                 BinaryOp::Add => "add",
@@ -261,6 +288,9 @@ impl TensorOp {
             },
             TensorOp::Reduce { kind, .. } => match kind {
                 ReduceOp::Sum => "sum",
+                ReduceOp::Mean => "mean",
+                ReduceOp::Max => "max",
+                ReduceOp::Min => "min",
             },
             TensorOp::Matmul { .. } => "matmul",
             TensorOp::Activation { kind, .. } => match kind {

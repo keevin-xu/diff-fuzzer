@@ -255,6 +255,66 @@ nothing — an exclusion wearing the costume of agreement. Such cases are report
 
 ---
 
+## 4b. The operations added at PHASE-7E
+
+Each gets its own entry, **including the two whose answer is "exact"** — inheriting a
+neighbour's bound is how a wrong tolerance spreads silently.
+
+### `mean` — `Accumulating`, plus one division
+
+A sum and then a division by the number of terms. The sum's bound is unchanged from §4.3.
+The division contributes **one more rounding**, so one `EPSILON` is added to the relative
+term (relative errors add through a quotient), and the absolute term is divided by the same
+count the values are.
+
+Reusing `sum`'s entry unchanged would understate the bound by that rounding. Small — and
+exactly the kind of omission that spreads once a class is shared.
+
+### `max` / `min` — exact, and for a stronger reason than `sqrt`
+
+`sqrt` is in the exact class because IEEE-754 requires it to be *correctly rounded*.
+`max` and `min` are there because **they do no arithmetic at all**: the result is one of the
+inputs, returned unchanged. Nothing can round differently because nothing is rounded.
+
+So any disagreement is **semantic, not numeric**, and no tolerance may absorb it.
+
+**Measured 2026-08-06, and they do disagree:**
+
+| case | `burn-flex` | `burn-tch` | `burn-wgpu` |
+|---|---|---|---|
+| `max([1, NaN, 3])` | `NaN` | `NaN` | **`3.0`** |
+| `min([1, NaN, 3])` | `NaN` | `NaN` | **`1.0`** |
+
+Both CPU backends propagate `NaN`; the GPU ignores it. IEEE-754 defines *both* conventions —
+`maxNum` ignores `NaN`, `maximum` propagates it — so this is most likely two defensible
+choices meeting rather than a defect in either. **It is recorded as an observation, not
+adjudicated**: deciding which burn intends requires reading burn's own contract, and no
+tolerance change can or should hide it. Signed zeros agree on all three.
+
+### `log` — `Approximated`, with the opposite condition number to `exp`
+
+Not required to be correctly rounded, like `exp`, so it needs a condition-number bound — but
+**a different one, and using `exp`'s would be wrong in the worst possible direction.**
+
+`log`'s condition number is `1 / |ln x|`: the relative error is worst as `x` approaches 1,
+because `log(1)` is exactly zero and relative error against zero is unbounded. `exp`'s is
+`|x|`, worst at large arguments. Applying `exp`'s model to `log` would be *tightest* exactly
+where `log` is loosest.
+
+The bound is capped at 64 (`x` within ~1.6% of 1), because the literal bound is infinite at
+`x = 1` and would excuse anything. `log(1)` is a special case every library gets exactly
+right, so the cap costs nothing real — and near-1 arguments are still covered, by an
+absolute term rather than by a looser relative one.
+
+### `mean` of an empty axis — **unreachable, therefore no policy**
+
+`0/0` would be a genuine "asked something with no answer" case. It cannot occur: the
+generator draws extents from `1..=max_dim` and the decoder computes `1 + byte % max`, so
+every dimension has at least one element. Recorded here so a future reader can see the
+question was asked and answered, rather than assume it was missed.
+
+---
+
 ## 5a. Broadcasting — a reasoned no-change
 
 **Added PHASE-7C, 2026-08-06.** Elementwise operands may now differ in shape, combining by

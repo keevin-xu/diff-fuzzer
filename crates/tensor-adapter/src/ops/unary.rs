@@ -10,7 +10,13 @@ use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
 /// Every unary operation the generator may pick.
-pub const ALL: [UnaryOp; 4] = [UnaryOp::Neg, UnaryOp::Abs, UnaryOp::Exp, UnaryOp::Sqrt];
+pub const ALL: [UnaryOp; 5] = [
+    UnaryOp::Neg,
+    UnaryOp::Abs,
+    UnaryOp::Exp,
+    UnaryOp::Sqrt,
+    UnaryOp::Log,
+];
 
 /// The values an operation is defined on.
 ///
@@ -21,6 +27,10 @@ fn domain(kind: UnaryOp, bounds: &Bounds) -> Domain {
     match kind {
         UnaryOp::Sqrt if bounds.restrict_domains => Domain::NonNegative,
         UnaryOp::Sqrt => Domain::Any,
+        // `log` has the same domain as `sqrt` — undefined below zero, and `-inf` at zero,
+        // which the unrestricted setting deliberately reaches.
+        UnaryOp::Log if bounds.restrict_domains => Domain::NonNegative,
+        UnaryOp::Log => Domain::Any,
         // `exp` is defined everywhere; it overflows to infinity for large arguments,
         // but the magnitude bound keeps generated inputs well short of that. Removing
         // the bound is one of the interesting things to try later.

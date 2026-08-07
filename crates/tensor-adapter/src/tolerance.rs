@@ -89,7 +89,9 @@ impl TensorOp {
 
         match self {
             TensorOp::Unary { kind, .. } => match kind {
-                UnaryOp::Exp => OpClass::Approximated,
+                // Neither is required to be correctly rounded, and their error grows in
+                // opposite directions — see `approximated_tolerance`.
+                UnaryOp::Exp | UnaryOp::Log => OpClass::Approximated,
                 // `sqrt` is correctly rounded by IEEE-754; `neg` and `abs` only touch
                 // the sign bit.
                 UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Sqrt => OpClass::CorrectlyRounded,
@@ -99,6 +101,19 @@ impl TensorOp {
             TensorOp::Binary { .. } => OpClass::CorrectlyRounded,
             TensorOp::Reduce { kind, .. } => match kind {
                 ReduceOp::Sum => OpClass::Accumulating,
+                // A sum plus a division: the accumulation dominates, and the extra rounding
+                // is added inside `accumulating_tolerance` rather than by changing class.
+                ReduceOp::Mean => OpClass::Accumulating,
+                // **Exact, and for a stronger reason than the other members of this class.**
+                // `sqrt` is correctly *rounded*; `max` and `min` do no arithmetic whatever —
+                // they select one of their inputs and return it untouched. Nothing can round
+                // differently because nothing is rounded.
+                //
+                // A disagreement is therefore never precision. It would be a semantic
+                // difference — most plausibly over `NaN`, which IEEE-754's `maxNum` ignores
+                // and which implementations genuinely handle differently — and that is a
+                // finding, not noise.
+                ReduceOp::Max | ReduceOp::Min => OpClass::CorrectlyRounded,
             },
             TensorOp::Matmul { .. } => OpClass::Accumulating,
             // See `composed_tolerance`: `exp` over a sum, then a division.
@@ -312,14 +327,71 @@ fn ulps(n: f64) -> Tolerance {
 /// while measurement shows what these two particular libraries *happen* to do today. A
 /// threshold tightened to the latter would be fitted to an implementation detail.
 fn approximated_tolerance(input: &TensorOp) -> Tolerance {
-    let largest = match input {
-        TensorOp::Unary { arg, .. } => largest_magnitude(arg.data()),
+    let (kind, arg) = match input {
+        TensorOp::Unary { kind, arg } => (*kind, arg),
         // Every approximated operation is unary; anything else is misclassified.
         other => unreachable!("{} is not an approximated unary operation", other.name()),
     };
 
-    Tolerance::new(2.0 * (1.0 + largest) * EPSILON, 0.0)
+    // **The two approximated functions need different condition numbers, and using one for
+    // both would be wrong in opposite directions.** `exp` is hardest at large arguments;
+    // `log` is hardest near 1. Applying `exp`'s model to `log` would be tightest exactly
+    // where `log` is loosest.
+    let amplification = match kind {
+        UnaryOp::Exp => largest_magnitude(arg.data()),
+        UnaryOp::Log => log_amplification(arg.data()),
+        other => unreachable!("{other:?} is not approximated"),
+    };
+
+    Tolerance::new(2.0 * (1.0 + amplification) * EPSILON, 0.0)
 }
+
+/// How much `log` magnifies a relative perturbation of its argument, over a whole tensor.
+///
+/// # The derivation
+///
+/// `log(x(1 + d)) = log(x) + log(1 + d) ≈ log(x) + d`. The *absolute* error in the result is
+/// therefore about `d`, and the **relative** error is `d / |log(x)|` — so the condition
+/// number is `1 / |ln x|`.
+///
+/// **This diverges as `x` approaches 1**, because `log(1)` is exactly zero and a relative
+/// error measured against zero is unbounded. That is the opposite shape from `exp`, whose
+/// condition number is `|x|` and which is therefore benign near its own zero.
+///
+/// # Why it is capped
+///
+/// Taken literally the bound is infinite at `x = 1`, which would make every case containing
+/// a 1 unjudgeable — the tolerance would excuse anything. But `log(1)` is a value every
+/// implementation gets *exactly* right: it is a special case in every library, and the
+/// result is exactly `0.0` with no rounding at all.
+///
+/// So the relative bound is capped, and near-1 arguments are instead covered by an absolute
+/// term of one `EPSILON` — the largest absolute error a correctly-behaved implementation can
+/// have when the true answer is near zero. Capping without that absolute term would be the
+/// unsafe direction; capping *with* it bounds the same cases by a different measure rather
+/// than by a looser one.
+///
+/// `LOG_MAX_AMPLIFICATION` is a judgment about where "near 1" starts, not a fitted value:
+/// at `|ln x| = 1/64`, `x` is within about 1.6% of 1.
+fn log_amplification(data: &[f32]) -> f64 {
+    data.iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| {
+            let ln = (v as f64).ln().abs();
+            if ln == 0.0 {
+                LOG_MAX_AMPLIFICATION
+            } else {
+                (1.0 / ln).min(LOG_MAX_AMPLIFICATION)
+            }
+        })
+        .fold(0.0f64, f64::max)
+}
+
+/// The ceiling on `log`'s condition number, reached when the argument is within ~1.6% of 1.
+///
+/// See [`log_amplification`] for why a cap is needed and what covers the cases it excludes.
+const LOG_MAX_AMPLIFICATION: f64 = 64.0;
 
 /// Tolerance for an operation that sums `terms` values of magnitude up to `largest`.
 ///
@@ -412,11 +484,30 @@ fn value_range(data: &[f32]) -> f64 {
 }
 
 fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
+    use crate::input::ReduceOp;
+
     match input {
-        TensorOp::Reduce { arg, axis, .. } => {
+        TensorOp::Reduce { kind, arg, axis } => {
             // Each output element sums exactly the values along the collapsed axis.
             let terms = arg.shape()[*axis];
-            bound(terms, largest_magnitude(arg.data()))
+            let summed = bound(terms, largest_magnitude(arg.data()));
+
+            match kind {
+                ReduceOp::Sum => summed,
+                // **`mean` is a sum and then a division, and the division is not free.**
+                // Reusing `sum`'s entry unchanged would understate the bound by one rounding
+                // — small, but the kind of omission that spreads silently once a class is
+                // shared. Relative errors add through a quotient, so one `EPSILON` is added
+                // to the relative term. The absolute term is scaled down by the same divisor
+                // the values are.
+                ReduceOp::Mean => {
+                    Tolerance::new(summed.rtol + 2.0 * EPSILON, summed.atol / terms as f64)
+                }
+                // Classified `CorrectlyRounded`; never routed here.
+                ReduceOp::Max | ReduceOp::Min => {
+                    unreachable!("{} does not accumulate", input.name())
+                }
+            }
         }
         TensorOp::Matmul { lhs, rhs } => {
             // Each output element sums `k` products, where `k` is the shared inner

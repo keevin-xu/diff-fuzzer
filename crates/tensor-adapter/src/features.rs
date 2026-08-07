@@ -28,7 +28,7 @@ use crate::input::{TensorOp, TensorValue};
 /// Seventeen features: eight describing *values*, nine describing *shape*. The split
 /// matters because they answer different questions — what the numbers are, versus which
 /// kernel the shape will select.
-pub const FEATURES: [&str; 25] = [
+pub const FEATURES: [&str; 28] = [
     // --- value features: standard floating-point failure modes ---
     "overflow_product",
     "mixed_sign_overflow",
@@ -61,6 +61,10 @@ pub const FEATURES: [&str; 25] = [
     "norm_values_identical",
     "norm_range_wide",
     "norm_underflows_exp",
+    // --- PHASE-7E: properties of the operations added with the second batch.
+    "nan_in_reduced_axis",
+    "log_input_near_one",
+    "log_input_nonpositive",
 ];
 
 /// A compile-time guard on the vocabulary size.
@@ -312,6 +316,51 @@ const WIDE_RANGE: f32 = 20.0;
 /// normalised dimension is not the last, normalises, and transposes back; when it is the
 /// last it computes directly. Two paths chosen by a property of the input — the same shape
 /// as the one real bug this project has found.
+/// How close to 1 an argument must be for `log`'s condition number to be at its ceiling.
+///
+/// `|ln x| < 1/64` is roughly `x` within 1.6% of 1 — the region where `log`'s relative error
+/// is worst, which is the opposite end of the range from `exp`'s.
+const LOG_NEAR_ONE: f32 = 0.016;
+
+/// Properties of the operations added at PHASE-7E.
+///
+/// **`nan_in_reduced_axis` is the one with a named mechanism.** `max` and `min` do no
+/// arithmetic, so the only way they can disagree is over `NaN` ordering — and the backends
+/// *do*: measured 2026-08-06, both CPU backends propagate `NaN` while `burn-wgpu` ignores it
+/// and returns the real extreme.
+fn second_batch_features(case: &TensorOp, features: &mut FeatureVec) {
+    use crate::input::{ReduceOp, UnaryOp};
+
+    match case {
+        TensorOp::Reduce { kind, arg, .. } => {
+            if matches!(kind, ReduceOp::Max | ReduceOp::Min)
+                && arg.data().iter().any(|v| v.is_nan())
+            {
+                features.set("nan_in_reduced_axis");
+            }
+        }
+        TensorOp::Unary {
+            kind: UnaryOp::Log,
+            arg,
+        } => {
+            if arg
+                .data()
+                .iter()
+                .any(|v| *v > 0.0 && (v.ln()).abs() < LOG_NEAR_ONE)
+            {
+                features.set("log_input_near_one");
+            }
+            // Outside the domain: `log` of a negative is `NaN` and of zero is `-inf`, and
+            // whether three backends agree on which is a real question once domains are
+            // unrestricted — which is the fuzzer's setting.
+            if arg.data().iter().any(|v| *v <= 0.0) {
+                features.set("log_input_nonpositive");
+            }
+        }
+        _ => {}
+    }
+}
+
 fn normalisation_features(case: &TensorOp, features: &mut FeatureVec) {
     let TensorOp::Activation { arg, dim, .. } = case else {
         return;
@@ -382,6 +431,7 @@ fn shape_features(case: &TensorOp, features: &mut FeatureVec) {
 
     broadcast_features(case, features);
     normalisation_features(case, features);
+    second_batch_features(case, features);
 
     let TensorOp::Matmul { lhs, rhs } = case else {
         return;

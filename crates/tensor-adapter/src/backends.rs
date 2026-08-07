@@ -76,6 +76,7 @@ impl<B: Backend> BurnBackend<B> {
                     UnaryOp::Abs => t.abs(),
                     UnaryOp::Exp => t.exp(),
                     UnaryOp::Sqrt => t.sqrt(),
+                    UnaryOp::Log => t.log(),
                 }
             }
             TensorOp::Binary { kind, lhs, rhs } => {
@@ -100,9 +101,12 @@ impl<B: Backend> BurnBackend<B> {
             TensorOp::Reduce { kind, arg, axis } => {
                 let t = self.tensor::<D>(arg);
                 match kind {
-                    // Collapses the axis to length one rather than removing it, so the
+                    // Each collapses the axis to length one rather than removing it, so the
                     // result keeps rank `D` and this function has a single return type.
                     ReduceOp::Sum => t.sum_dim(*axis),
+                    ReduceOp::Mean => t.mean_dim(*axis),
+                    ReduceOp::Max => t.max_dim(*axis),
+                    ReduceOp::Min => t.min_dim(*axis),
                 }
             }
             TensorOp::Matmul { lhs, rhs } => {
@@ -214,6 +218,74 @@ mod tests {
 
     fn value(shape: &[usize], data: &[f32]) -> TensorValue {
         TensorValue::new(shape.to_vec(), data.to_vec())
+    }
+
+    /// The new reductions run everywhere and give the exact answer they must.
+    ///
+    /// `mean`, `max` and `min` over `[1, 2, 3, 4]` are 2.5, 4 and 1 — all exactly
+    /// representable, so any backend disagreeing here is simply wrong.
+    #[test]
+    fn the_reductions_run_on_every_backend_and_give_exact_answers() {
+        use crate::input::ReduceOp;
+
+        for (kind, expected) in [
+            (ReduceOp::Sum, 10.0f32),
+            (ReduceOp::Mean, 2.5),
+            (ReduceOp::Max, 4.0),
+            (ReduceOp::Min, 1.0),
+        ] {
+            let case = TensorOp::reduce(kind, value(&[1, 4], &[1.0, 2.0, 3.0, 4.0]), 1);
+            for backend in [
+                &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+                &libtorch(),
+                &wgpu(),
+            ] {
+                let out = values(
+                    backend
+                        .run(&case)
+                        .unwrap_or_else(|e| panic!("{} on {kind:?}: {e:?}", backend.name())),
+                );
+                assert_eq!(
+                    out,
+                    vec![expected],
+                    "{} got {out:?} for {kind:?}, expected {expected}",
+                    backend.name()
+                );
+            }
+        }
+    }
+
+    /// **`max` with a `NaN` present is the case worth having.**
+    ///
+    /// IEEE-754's `maxNum` ignores `NaN` and returns the other operand; a naive `a > b`
+    /// comparison propagates it instead. Three implementations sharing no code have no
+    /// reason to agree, and no tolerance can absorb the difference — so this records what
+    /// they actually do rather than asserting what they should.
+    #[test]
+    fn what_the_backends_do_with_nan_in_a_max_reduction() {
+        use crate::input::ReduceOp;
+
+        let case = TensorOp::reduce(ReduceOp::Max, value(&[1, 3], &[1.0, f32::NAN, 3.0]), 1);
+
+        let answers: Vec<(String, Vec<f32>)> = [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ]
+        .iter()
+        .map(|b| (b.name().to_string(), values(b.run(&case).expect("runs"))))
+        .collect();
+
+        // Not asserted to be equal — that is the differential's job, and if they disagree it
+        // is a finding rather than a broken test. Asserted only to be *some* defensible
+        // answer, so a backend returning 1.0 or 0.0 would fail loudly.
+        for (name, out) in &answers {
+            let v = out[0];
+            assert!(
+                v.is_nan() || v == 3.0,
+                "{name} returned {v} for max([1, NaN, 3]); expected NaN or 3"
+            );
+        }
     }
 
     /// **`softmax` runs on every backend, and they agree on a case with an exact answer.**

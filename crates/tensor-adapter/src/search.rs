@@ -8,7 +8,7 @@
 //!
 //! # Why brute force
 //!
-//! Twenty-five features give 2,625 feature combinations and 19,650 signed predicates. That is
+//! Twenty-eight features give 3682 feature combinations and 27776 signed predicates. That is
 //! nothing — the search runs in milliseconds. Anything cleverer (greedy feature selection,
 //! a decision tree, an SAT encoding) would buy no speed that matters and would cost the one
 //! property that does: **the developer must be able to describe the algorithm without
@@ -288,21 +288,21 @@ mod tests {
         )
     }
 
-    /// Every combination of ≤3 of the 25 features, with every sign assignment.
+    /// Every combination of ≤3 of the 28 features, with every sign assignment.
     ///
-    /// C(25,1)·2 + C(25,2)·4 + C(25,3)·8 = 50 + 1200 + 18400 = 19650. Pinning the number keeps
+    /// C(28,1)·2 + C(28,2)·4 + C(28,3)·8 = 56 + 1512 + 26208 = 27776. Pinning the number keeps
     /// the enumeration honest: silently dropping the three-feature tier would still produce
     /// plausible-looking output.
     ///
-    /// **6,018 at 17 features, 9,920 at 20, 19,650 at 25.** The count grows as the cube of
-    /// the vocabulary, so this is the number to watch when adding features — not the feature
-    /// count. Still milliseconds, which is why brute force remains the right choice, but the
-    /// margin is no longer enormous.
+    /// **6,018 at 17 features, 9,920 at 20, 19,650 at 25, 27776 at 28.** The count grows as
+    /// the cube of the vocabulary, so this is the number to watch when adding features — not
+    /// the feature count. Still milliseconds, and **28 of the 32 bits in `FeatureVec` are now
+    /// spent**: the next four features are the last that fit without widening it to `u64`.
     #[test]
     fn the_enumeration_covers_every_signed_combination_of_at_most_three_features() {
         let all = enumerate();
 
-        assert_eq!(all.len(), 19650);
+        assert_eq!(all.len(), 27776);
         assert!(all.iter().all(|p| p.size() <= MAX_FEATURES as u32));
         assert!(
             all.iter().all(|p| !p.is_vacuous()),
@@ -385,7 +385,7 @@ mod tests {
         // Every finding is either covered exactly once or listed as unexplained.
         let covered: usize = result.classes.iter().map(|c| c.covered.len()).sum();
         assert_eq!(covered + result.unexplained.len(), findings.len());
-        assert_eq!(result.considered, 19650);
+        assert_eq!(result.considered, 27776);
     }
 
     /// Rules are committed in order of how much they explain, and no finding is claimed

@@ -141,7 +141,7 @@ pub struct Negative {
 /// would read simply as "decoded from fuzzer bytes".
 ///
 /// `decode::bounds_are_named_in_the_generator_description` fails if the two drift apart.
-pub const FUZZER_GENERATOR: &str = "decoded from fuzzer bytes at max_dim 64, magnitude 10, budget 1048576, layout 3 (broadcast+softmax)";
+pub const FUZZER_GENERATOR: &str = "decoded from fuzzer bytes at max_dim 64, magnitude 10, budget 1048576, layout 4 (broadcast+softmax+reductions+log)";
 
 /// The conditions a set of cases was observed under.
 ///

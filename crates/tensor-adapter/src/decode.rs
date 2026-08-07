@@ -234,11 +234,17 @@ impl<'a> Arbitrary<'a> for TensorOp {
         // **11 rather than 10 since PHASE-7D**, making room for `softmax`. Changing this
         // divisor re-interprets every byte string in a corpus, which is why
         // `FUZZER_GENERATOR` names the layout version.
-        let choice = byte(u) as usize % 11;
+        let choice = byte(u) as usize % 15;
 
         Ok(match choice {
-            0..=3 => {
-                let kind = [UnaryOp::Neg, UnaryOp::Abs, UnaryOp::Exp, UnaryOp::Sqrt][choice];
+            0..=4 => {
+                let kind = [
+                    UnaryOp::Neg,
+                    UnaryOp::Abs,
+                    UnaryOp::Exp,
+                    UnaryOp::Sqrt,
+                    UnaryOp::Log,
+                ][choice];
                 let domain = unary_domain(kind);
                 // Sequential bindings rather than nesting: the order bytes are consumed
                 // in *is* the layout, so making it explicit keeps it stable.
@@ -246,8 +252,8 @@ impl<'a> Arbitrary<'a> for TensorOp {
                 let shape = shape(u, rank);
                 TensorOp::unary(kind, tensor(u, shape, domain))
             }
-            4..=7 => {
-                let kind = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div][choice - 4];
+            5..=8 => {
+                let kind = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div][choice - 5];
                 let rank = size(u, DECODE_BOUNDS.max_rank);
                 // The **result** shape, from which both operands are derived — the same
                 // correct-by-construction order the seeded generator uses. Deriving operands
@@ -265,7 +271,7 @@ impl<'a> Arbitrary<'a> for TensorOp {
                     tensor(u, rhs_shape, right_domain),
                 )
             }
-            10 => {
+            13 => {
                 // `softmax`, whose dimension is drawn *after* the shape so that the shape
                 // bytes keep their positions and a mutation of one does not shift the other.
                 let rank = size(u, DECODE_BOUNDS.max_rank);
@@ -274,12 +280,14 @@ impl<'a> Arbitrary<'a> for TensorOp {
                 let dim = (byte(u) as usize) % shape.len();
                 TensorOp::activation(ActivationOp::Softmax, tensor(u, shape, Domain::Any), dim)
             }
-            8 => {
+            9..=12 => {
+                let kind =
+                    [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min][choice - 9];
                 let rank = size(u, DECODE_BOUNDS.max_rank);
                 let shape = shape(u, rank);
                 // Drawn from the range the shape defines, so it cannot be out of range.
                 let axis = (byte(u) as usize) % shape.len();
-                TensorOp::reduce(ReduceOp::Sum, tensor(u, shape, Domain::Any), axis)
+                TensorOp::reduce(kind, tensor(u, shape, Domain::Any), axis)
             }
             _ => {
                 // At least rank 2, since a matrix multiplication of vectors is undefined.
@@ -519,7 +527,8 @@ mod tests {
         // generator's equivalent asserts the *count* matches and caught the same omission
         // immediately — so this one now does the same.
         let expected = [
-            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "sum", "matmul", "softmax",
+            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "sum", "mean", "max",
+            "min", "matmul", "softmax",
         ];
         for name in expected {
             assert!(seen.contains(name), "{name} was never decoded");
