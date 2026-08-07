@@ -9,7 +9,7 @@
 //! the search for real divergences uses the varied one.
 
 use crate::input::{BinaryOp, TensorOp, TensorValue};
-use crate::ops::{Bounds, binary, matmul, reduce, unary};
+use crate::ops::{Bounds, activation, binary, matmul, reduce, unary};
 use diff_fuzzer_core::{Generator, SeededRng};
 use rand::RngExt;
 
@@ -19,11 +19,12 @@ use rand::RngExt;
 /// Choosing uniformly between the four classes would hand `matmul` — one operation —
 /// as many cases as all four elementwise binary operations put together, so a quarter
 /// of the entire budget would go to one kernel while `sub` got a sixteenth.
-const CLASS_WEIGHTS: [(Class, usize); 4] = [
+const CLASS_WEIGHTS: [(Class, usize); 5] = [
     (Class::Unary, unary::ALL.len()),
     (Class::Binary, binary::ALL.len()),
     (Class::Reduce, reduce::ALL.len()),
     (Class::Matmul, 1),
+    (Class::Activation, activation::ALL.len()),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,7 @@ enum Class {
     Binary,
     Reduce,
     Matmul,
+    Activation,
 }
 
 /// Builds a random valid tensor case from a seed.
@@ -74,6 +76,7 @@ impl Generator for TensorOpGenerator {
             Class::Binary => binary::generate(rng, &self.bounds),
             Class::Reduce => reduce::generate(rng, &self.bounds),
             Class::Matmul => matmul::generate(rng, &self.bounds),
+            Class::Activation => activation::generate(rng, &self.bounds),
         }
     }
 }
@@ -127,7 +130,8 @@ mod tests {
         }
 
         let expected = [
-            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "sum", "matmul",
+            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "sum", "mean", "max",
+            "min", "matmul", "softmax",
         ];
         for name in expected {
             assert!(counts.contains_key(name), "{name} was never generated");

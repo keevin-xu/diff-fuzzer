@@ -11,7 +11,7 @@ use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
 /// Every reduction the generator may pick.
-pub const ALL: [ReduceOp; 1] = [ReduceOp::Sum];
+pub const ALL: [ReduceOp; 4] = [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min];
 
 /// Build a valid reduction case.
 pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {

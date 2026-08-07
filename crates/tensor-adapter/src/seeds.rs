@@ -20,18 +20,27 @@
 
 use crate::backends::MAX_RANK;
 
-/// Byte selecting an operation, by the decoder's `choice % 10`.
+/// Byte selecting an operation, by the decoder's `choice % 15`.
+///
+/// **These must track `decode.rs`'s match arms exactly.** They did not when the operation
+/// set grew at PHASE-7E, and the tests below caught it immediately — which is the whole
+/// reason the corpus is built from named helpers rather than from literal bytes.
 mod op {
     pub const NEG: u8 = 0;
     pub const ABS: u8 = 1;
     pub const EXP: u8 = 2;
     pub const SQRT: u8 = 3;
-    pub const ADD: u8 = 4;
-    pub const SUB: u8 = 5;
-    pub const MUL: u8 = 6;
-    pub const DIV: u8 = 7;
-    pub const SUM: u8 = 8;
-    pub const MATMUL: u8 = 9;
+    pub const LOG: u8 = 4;
+    pub const ADD: u8 = 5;
+    pub const SUB: u8 = 6;
+    pub const MUL: u8 = 7;
+    pub const DIV: u8 = 8;
+    pub const SUM: u8 = 9;
+    pub const MEAN: u8 = 10;
+    pub const MAX: u8 = 11;
+    pub const MIN: u8 = 12;
+    pub const SOFTMAX: u8 = 13;
+    pub const MATMUL: u8 = 14;
 }
 
 /// The byte that decodes to a dimension or rank of `n`.
@@ -78,15 +87,25 @@ fn binary(operation: u8, shape: &[usize]) -> Vec<u8> {
     bytes
 }
 
-/// Bytes for a reduction over `axis`.
-fn reduce(shape: &[usize], axis: usize) -> Vec<u8> {
-    let mut bytes = vec![op::SUM, size(shape.len())];
+/// Bytes for a reduction of the given kind over `axis`.
+fn reduce_of(operation: u8, shape: &[usize], axis: usize) -> Vec<u8> {
+    let mut bytes = vec![operation, size(shape.len())];
     bytes.extend(shape.iter().map(|d| size(*d)));
     bytes.push(axis as u8);
 
     let count: usize = shape.iter().product();
     bytes.extend((0..count).map(special));
     bytes
+}
+
+/// Bytes for a `sum` reduction, the common case.
+fn reduce(shape: &[usize], axis: usize) -> Vec<u8> {
+    reduce_of(op::SUM, shape, axis)
+}
+
+/// Bytes for a `softmax` normalising `dim`. Same layout as a reduction.
+fn softmax(shape: &[usize], dim: usize) -> Vec<u8> {
+    reduce_of(op::SOFTMAX, shape, dim)
 }
 
 /// Bytes for `[batch.., m, k] x [batch.., k, n]`.
@@ -116,7 +135,7 @@ fn matmul(batch: &[usize], m: usize, k: usize, n: usize) -> Vec<u8> {
 pub fn seed_corpus() -> Vec<Vec<u8>> {
     let mut seeds = Vec::new();
 
-    let unary_ops = [op::NEG, op::ABS, op::EXP, op::SQRT];
+    let unary_ops = [op::NEG, op::ABS, op::EXP, op::SQRT, op::LOG];
     let binary_ops = [op::ADD, op::SUB, op::MUL, op::DIV];
 
     // The smallest form of every operation. A minimal case is both the fastest to
@@ -127,8 +146,21 @@ pub fn seed_corpus() -> Vec<Vec<u8>> {
     for operation in binary_ops {
         seeds.push(binary(operation, &[1]));
     }
-    seeds.push(reduce(&[1], 0));
+    for operation in [op::SUM, op::MEAN, op::MAX, op::MIN] {
+        seeds.push(reduce_of(operation, &[1], 0));
+    }
+    seeds.push(softmax(&[1], 0));
     seeds.push(matmul(&[], 1, 1, 1));
+
+    // `softmax` off the last axis: the path where `burn-flex` transposes rather than
+    // normalising directly, which random bytes reach only by chance.
+    seeds.push(softmax(&[3, 4], 0));
+    seeds.push(softmax(&[2, 3, 4], 1));
+
+    // `max` and `min` over a longer axis, where a backend is most likely to switch to a
+    // vectorised reduction and so to a different NaN convention.
+    seeds.push(reduce_of(op::MAX, &[8], 0));
+    seeds.push(reduce_of(op::MIN, &[8], 0));
 
     // Every rank, since rank-specific paths are where shape-handling bugs live.
     for rank in 1..=MAX_RANK {
@@ -185,11 +217,16 @@ mod tests {
             ("abs", vec![1]),
             ("exp", vec![1]),
             ("sqrt", vec![1]),
+            ("log", vec![1]),
             ("add", vec![1]),
             ("sub", vec![1]),
             ("mul", vec![1]),
             ("div", vec![1]),
             ("sum", vec![1]),
+            ("mean", vec![1]),
+            ("max", vec![1]),
+            ("min", vec![1]),
+            ("softmax", vec![1]),
             ("matmul", vec![1, 1]),
         ];
 
@@ -204,11 +241,20 @@ mod tests {
     fn every_operation_appears_in_the_corpus() {
         let names: HashSet<&str> = seed_corpus().iter().map(|s| decode(s).name()).collect();
 
-        for expected in [
-            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "sum", "matmul",
-        ] {
-            assert!(names.contains(expected), "{expected} is not seeded");
+        let expected = [
+            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "sum", "mean", "max",
+            "min", "matmul", "softmax",
+        ];
+        for name in expected {
+            assert!(names.contains(name), "{name} is not seeded");
         }
+        // Exhaustive, like the generator's and the decoder's equivalents: a new operation
+        // must be seeded deliberately rather than left for random bytes to stumble on.
+        assert_eq!(
+            names.len(),
+            expected.len(),
+            "an operation is seeded but unlisted: {names:?}"
+        );
     }
 
     #[test]

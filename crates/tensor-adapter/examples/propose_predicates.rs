@@ -62,19 +62,23 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| format!("{}/runs", tensor_adapter::FINDINGS_ROOT));
 
-    let findings = load_findings(Path::new(&dir));
+    let (findings, observed_on) = load_findings(Path::new(&dir));
     println!("{} findings loaded from {dir}", findings.len());
     if findings.is_empty() {
         println!("nothing to explain — no report written");
         return;
     }
 
-    // The context the findings themselves were produced under. Negatives are only usable
-    // if they were drawn the same way AND observed on the same backends.
-    let context = SamplingContext::new(
-        negatives::FUZZER_GENERATOR,
-        &[tensor_adapter::FLEX_NAME, tensor_adapter::LIBTORCH_NAME],
-    );
+    // **The backend set is read from the findings, not assumed.**
+    //
+    // This hardcoded `[flex, libtorch]`, written when the harness ran two backends. Pointed
+    // at a three-backend campaign it asked for a pool that could not exist, and the guard
+    // refused — correctly, and for a reason that looked like a data problem rather than a
+    // stale constant. Deriving it means the question can only be asked about the run that
+    // actually happened.
+    let backends: Vec<&str> = observed_on.iter().map(String::as_str).collect();
+    println!("findings were observed on {backends:?}");
+    let context = SamplingContext::new(negatives::FUZZER_GENERATOR, &backends);
     let pool = match Pool::matched(negatives::load(tensor_adapter::NEGATIVES_ROOT), &context) {
         Ok(pool) => pool,
         Err(error) => {
@@ -166,12 +170,23 @@ fn main() {
     println!("\nwrote {}", path.display());
 }
 
+/// The wide generator used for validation.
+///
+/// **`restrict_domains: false` is not optional here.** Without it the generator cannot
+/// produce a non-finite input, so any candidate mentioning `NaN` comes back "not reachable"
+/// — which reads as a statement about the rule and is really a statement about this
+/// function. That happened on the first `max`-versus-`NaN` finding, and the same omission
+/// was found in `examples/reach.rs` the same day.
+///
+/// The rule of thumb it cost: **a validation generator must be configured like the campaign
+/// it is validating**, not like a tidy default.
 fn wide_bounds() -> Bounds {
     Bounds {
         max_rank: 3,
         max_dim: 64,
         magnitude: 1000.0,
         special_value_rate: 0.125,
+        restrict_domains: false,
         ..Bounds::default()
     }
 }
@@ -257,25 +272,55 @@ impl Differential {
 
 // --- loading ---------------------------------------------------------------------------
 
-fn load_findings(dir: &Path) -> Vec<TensorOp> {
+/// The findings, and **the implementations they were observed on**.
+///
+/// The backend set comes from the reports themselves — every one records which
+/// implementations ran — so a stale constant cannot silently ask about the wrong campaign.
+fn load_findings(dir: &Path) -> (Vec<TensorOp>, Vec<String>) {
     let mut out = Vec::new();
-    collect(dir, &mut out);
-    out
+    let mut observed: Vec<String> = Vec::new();
+    let mut unreadable = 0usize;
+    collect(dir, &mut out, &mut observed, &mut unreadable);
+    observed.sort();
+    observed.dedup();
+
+    // **A finding that cannot be parsed is not a finding that does not exist.** Reporting
+    // "nothing to explain" for reports that failed to load is the same data-loss-as-success
+    // failure that `triage_findings` had; both are fixed, and both are loud.
+    if unreadable > 0 {
+        eprintln!(
+            "⚠ {unreadable} report(s) could not be read and are excluded. Every number below \
+             is computed from an incomplete set."
+        );
+    }
+    (out, observed)
 }
 
-fn collect(dir: &Path, out: &mut Vec<TensorOp>) {
+fn collect(
+    dir: &Path,
+    out: &mut Vec<TensorOp>,
+    observed: &mut Vec<String>,
+    unreadable: &mut usize,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, out);
-        } else if path.extension().is_some_and(|e| e == "json")
-            && let Ok(report) = load_report::<TensorOp>(&path)
-        {
-            let report: DivergenceReport<TensorOp> = report;
-            out.push(report.input);
+            collect(&path, out, observed, unreadable);
+        } else if path.extension().is_some_and(|e| e == "json") {
+            match load_report::<TensorOp>(&path) {
+                Ok(report) => {
+                    let report: DivergenceReport<TensorOp> = report;
+                    observed.extend(report.outputs.iter().map(|(name, _)| name.clone()));
+                    out.push(report.input);
+                }
+                Err(error) => {
+                    eprintln!("could not read {}: {error}", path.display());
+                    *unreadable += 1;
+                }
+            }
         }
     }
 }

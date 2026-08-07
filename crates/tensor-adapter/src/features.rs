@@ -28,7 +28,7 @@ use crate::input::{TensorOp, TensorValue};
 /// Seventeen features: eight describing *values*, nine describing *shape*. The split
 /// matters because they answer different questions — what the numbers are, versus which
 /// kernel the shape will select.
-pub const FEATURES: [&str; 17] = [
+pub const FEATURES: [&str; 28] = [
     // --- value features: standard floating-point failure modes ---
     "overflow_product",
     "mixed_sign_overflow",
@@ -48,7 +48,35 @@ pub const FEATURES: [&str; 17] = [
     "all_same_sign",
     "m_not_multiple_of_tile",
     "n_not_multiple_of_tile",
+    // --- broadcast features (PHASE-7C): which shape-inference path an elementwise case
+    //     takes. Added *before* any broadcast findings exist, so they cannot be fitted to
+    //     what they will be scored on — the condition every previous search here has failed.
+    "broadcast_present",
+    "broadcast_whole_operand",
+    "broadcast_both_operands",
+    // --- normalisation features (PHASE-7D): aimed at specific mechanisms, not at coverage.
+    //     Added before any softmax finding exists, so they cannot be fitted to one.
+    "norm_dim_is_last",
+    "norm_dim_large",
+    "norm_values_identical",
+    "norm_range_wide",
+    "norm_underflows_exp",
+    // --- PHASE-7E: properties of the operations added with the second batch.
+    "nan_in_reduced_axis",
+    "log_input_near_one",
+    "log_input_nonpositive",
 ];
+
+/// A compile-time guard on the vocabulary size.
+///
+/// `FeatureVec` is a `u32`, so bit 32 would silently shift out and every predicate mentioning
+/// it would match nothing while looking perfectly reasonable. Widening to `u64` is a
+/// deliberate decision — the search space doubles per bit — and must be made on purpose
+/// rather than discovered from a rule that mysteriously never fires.
+const _: () = assert!(
+    FEATURES.len() <= 32,
+    "FEATURES exceeds the bits in FeatureVec; widen it to u64 deliberately"
+);
 
 /// One case's features, one bit each.
 ///
@@ -260,6 +288,138 @@ fn accumulation_features(values: &[f32], features: &mut FeatureVec) {
 }
 
 /// Properties of the shape — proxies for which kernel the backend will select.
+/// Which broadcasting an elementwise case does, if any.
+///
+/// Separate from `degenerate_dim`, which fires whenever *any* operand has an extent of 1 —
+/// including when both do and nothing stretches. These say something narrower and more
+/// useful: that a backend had to **reuse** an operand's elements, which is a different code
+/// path from an ordinary elementwise loop.
+/// How far below the maximum a value must sit for `exp` of the shifted argument to
+/// underflow `f32` to zero.
+///
+/// `exp(-104)` is below `f32::MIN_POSITIVE * f32::EPSILON`, so the shifted term rounds to
+/// zero. **Where one backend underflows and another returns a subnormal, they disagree about
+/// a term of the sum** — a disagreement in the numerator *and* the denominator at once.
+const EXP_UNDERFLOW_SHIFT: f32 = 104.0;
+
+/// A normalised dimension long enough that the accumulating part of the bound dominates the
+/// approximated part. Not a tuning constant: below this the `exp` term is the larger.
+const LARGE_NORM_DIM: usize = 16;
+
+/// A value range wide enough to matter to `exp`'s condition number, which is the argument's
+/// magnitude after the max-shift.
+const WIDE_RANGE: f32 = 20.0;
+
+/// Which properties of a normalisation case might select a different code path.
+///
+/// **`norm_dim_is_last` is the one with a named mechanism.** `burn-flex` transposes when the
+/// normalised dimension is not the last, normalises, and transposes back; when it is the
+/// last it computes directly. Two paths chosen by a property of the input — the same shape
+/// as the one real bug this project has found.
+/// How close to 1 an argument must be for `log`'s condition number to be at its ceiling.
+///
+/// `|ln x| < 1/64` is roughly `x` within 1.6% of 1 — the region where `log`'s relative error
+/// is worst, which is the opposite end of the range from `exp`'s.
+const LOG_NEAR_ONE: f32 = 0.016;
+
+/// Properties of the operations added at PHASE-7E.
+///
+/// **`nan_in_reduced_axis` is the one with a named mechanism.** `max` and `min` do no
+/// arithmetic, so the only way they can disagree is over `NaN` ordering — and the backends
+/// *do*: measured 2026-08-06, both CPU backends propagate `NaN` while `burn-wgpu` ignores it
+/// and returns the real extreme.
+fn second_batch_features(case: &TensorOp, features: &mut FeatureVec) {
+    use crate::input::{ReduceOp, UnaryOp};
+
+    match case {
+        TensorOp::Reduce { kind, arg, .. } => {
+            if matches!(kind, ReduceOp::Max | ReduceOp::Min)
+                && arg.data().iter().any(|v| v.is_nan())
+            {
+                features.set("nan_in_reduced_axis");
+            }
+        }
+        TensorOp::Unary {
+            kind: UnaryOp::Log,
+            arg,
+        } => {
+            if arg
+                .data()
+                .iter()
+                .any(|v| *v > 0.0 && (v.ln()).abs() < LOG_NEAR_ONE)
+            {
+                features.set("log_input_near_one");
+            }
+            // Outside the domain: `log` of a negative is `NaN` and of zero is `-inf`, and
+            // whether three backends agree on which is a real question once domains are
+            // unrestricted — which is the fuzzer's setting.
+            if arg.data().iter().any(|v| *v <= 0.0) {
+                features.set("log_input_nonpositive");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalisation_features(case: &TensorOp, features: &mut FeatureVec) {
+    let TensorOp::Activation { arg, dim, .. } = case else {
+        return;
+    };
+
+    if *dim == arg.rank() - 1 {
+        features.set("norm_dim_is_last");
+    }
+    if arg.shape()[*dim] >= LARGE_NORM_DIM {
+        features.set("norm_dim_large");
+    }
+
+    let data = arg.data();
+    if data.len() > 1 && data.iter().all(|v| v == &data[0]) {
+        // An exactly known answer: `1/n` for every element, which no correct implementation
+        // may round. A disagreement here needs no tolerance argument.
+        features.set("norm_values_identical");
+    }
+
+    let finite: Vec<f32> = data.iter().copied().filter(|v| v.is_finite()).collect();
+    if let (Some(low), Some(high)) = (
+        finite.iter().copied().reduce(f32::min),
+        finite.iter().copied().reduce(f32::max),
+    ) {
+        if high - low > WIDE_RANGE {
+            features.set("norm_range_wide");
+        }
+        if high - low > EXP_UNDERFLOW_SHIFT {
+            features.set("norm_underflows_exp");
+        }
+    }
+}
+
+fn broadcast_features(case: &TensorOp, features: &mut FeatureVec) {
+    let TensorOp::Binary { lhs, rhs, .. } = case else {
+        return;
+    };
+    let Some(result) = crate::ops::broadcast::result_shape(lhs.shape(), rhs.shape()) else {
+        return;
+    };
+
+    let lhs_stretches = lhs.shape() != result.as_slice();
+    let rhs_stretches = rhs.shape() != result.as_slice();
+
+    if lhs_stretches || rhs_stretches {
+        features.set("broadcast_present");
+    }
+    // One operand is a single element stretched across the whole result — the extreme case,
+    // and the one most likely to take a scalar fast path rather than a general one.
+    if (lhs_stretches && lhs.data().len() == 1) || (rhs_stretches && rhs.data().len() == 1) {
+        features.set("broadcast_whole_operand");
+    }
+    // Both sides stretch, on different axes — neither operand has the result's shape, so no
+    // backend can simply loop over one of them.
+    if lhs_stretches && rhs_stretches {
+        features.set("broadcast_both_operands");
+    }
+}
+
 fn shape_features(case: &TensorOp, features: &mut FeatureVec) {
     let operands = operands(case);
     if operands.iter().any(|o| o.rank() >= 3) {
@@ -268,6 +428,10 @@ fn shape_features(case: &TensorOp, features: &mut FeatureVec) {
     if operands.iter().any(|o| o.shape().contains(&1)) {
         features.set("degenerate_dim");
     }
+
+    broadcast_features(case, features);
+    normalisation_features(case, features);
+    second_batch_features(case, features);
 
     let TensorOp::Matmul { lhs, rhs } = case else {
         return;
@@ -305,13 +469,97 @@ fn shape_features(case: &TensorOp, features: &mut FeatureVec) {
 
 fn operands(case: &TensorOp) -> Vec<&TensorValue> {
     match case {
-        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => vec![arg],
+        TensorOp::Unary { arg, .. }
+        | TensorOp::Reduce { arg, .. }
+        | TensorOp::Activation { arg, .. } => vec![arg],
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => vec![lhs, rhs],
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The normalisation features, each on a case built to isolate it.
+    #[test]
+    fn normalisation_features_name_the_paths_they_target() {
+        use crate::input::ActivationOp;
+
+        let build = |shape: &[usize], data: Vec<f32>, dim: usize| {
+            extract(&TensorOp::activation(
+                ActivationOp::Softmax,
+                TensorValue::new(shape.to_vec(), data),
+                dim,
+            ))
+        };
+
+        // The last dimension: the path where `burn-flex` does not transpose.
+        let last = build(&[2, 3], vec![1.0; 6], 1);
+        assert!(last.has("norm_dim_is_last"));
+        assert!(last.has("norm_values_identical"));
+
+        // Not the last: the transposing path.
+        let off_last = build(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 0);
+        assert!(!off_last.has("norm_dim_is_last"));
+        assert!(!off_last.has("norm_values_identical"));
+
+        // A long normalised dimension drives the accumulating part of the bound.
+        let long = build(&[20], vec![0.0; 20], 0);
+        assert!(long.has("norm_dim_large"));
+
+        // A wide range drives `exp`'s condition number after the max-shift.
+        let wide = build(&[2], vec![0.0, 50.0], 0);
+        assert!(wide.has("norm_range_wide"));
+        assert!(!wide.has("norm_underflows_exp"));
+
+        // Wide enough that the shifted argument underflows `exp` to zero on one side.
+        let underflow = build(&[2], vec![0.0, 200.0], 0);
+        assert!(underflow.has("norm_underflows_exp"));
+    }
+
+    /// The three broadcast features, on cases built to isolate each.
+    #[test]
+    fn broadcast_features_distinguish_the_shape_of_the_stretch() {
+        use crate::input::BinaryOp;
+
+        let build = |ls: &[usize], rs: &[usize]| {
+            let l = TensorValue::new(ls.to_vec(), vec![1.0; ls.iter().product()]);
+            let r = TensorValue::new(rs.to_vec(), vec![1.0; rs.iter().product()]);
+            extract(&TensorOp::binary(BinaryOp::Add, l, r))
+        };
+
+        // No stretch: equal shapes.
+        let equal = build(&[3, 4], &[3, 4]);
+        assert!(!equal.has("broadcast_present"));
+
+        // One axis stretched on one side.
+        let one_axis = build(&[3, 1], &[3, 4]);
+        assert!(one_axis.has("broadcast_present"));
+        assert!(!one_axis.has("broadcast_whole_operand"));
+        assert!(!one_axis.has("broadcast_both_operands"));
+
+        // A single element stretched across the whole result.
+        let scalar = build(&[1, 1], &[3, 4]);
+        assert!(scalar.has("broadcast_present"));
+        assert!(scalar.has("broadcast_whole_operand"));
+
+        // Both sides stretch, on different axes — neither operand has the result's shape.
+        let both = build(&[3, 1], &[1, 4]);
+        assert!(both.has("broadcast_present"));
+        assert!(both.has("broadcast_both_operands"));
+        assert!(!both.has("broadcast_whole_operand"));
+    }
+
+    /// **`degenerate_dim` is not a broadcast test**, and conflating them would make the new
+    /// features redundant. A `[3,1] + [3,1]` case has an extent of 1 and stretches nothing.
+    #[test]
+    fn an_extent_of_one_on_both_sides_is_not_broadcasting() {
+        use crate::input::BinaryOp;
+        let v = |s: &[usize]| TensorValue::new(s.to_vec(), vec![1.0; s.iter().product()]);
+        let features = extract(&TensorOp::binary(BinaryOp::Add, v(&[3, 1]), v(&[3, 1])));
+
+        assert!(features.has("degenerate_dim"));
+        assert!(!features.has("broadcast_present"));
+    }
+
     use super::*;
     use crate::input::UnaryOp;
 

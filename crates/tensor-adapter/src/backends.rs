@@ -14,7 +14,7 @@
 //! in [`BurnBackend::run`] is where those meet, and confining it here is what lets
 //! everything else treat rank as an ordinary value.
 
-use crate::input::{BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
 use burn::backend::{Flex, LibTorch, Wgpu};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
@@ -76,6 +76,7 @@ impl<B: Backend> BurnBackend<B> {
                     UnaryOp::Abs => t.abs(),
                     UnaryOp::Exp => t.exp(),
                     UnaryOp::Sqrt => t.sqrt(),
+                    UnaryOp::Log => t.log(),
                 }
             }
             TensorOp::Binary { kind, lhs, rhs } => {
@@ -87,12 +88,25 @@ impl<B: Backend> BurnBackend<B> {
                     BinaryOp::Div => a.div(b),
                 }
             }
+            TensorOp::Activation { kind, arg, dim } => {
+                let t = self.tensor::<D>(arg);
+                match kind {
+                    // **Not a method on `Tensor`** — it lives in `burn::tensor::activation`
+                    // and dispatches to `B::softmax`, a backend trait method. That indirection
+                    // is the whole reason this operation is worth testing: each backend may
+                    // answer it with entirely different code, where `neg` or `add` cannot.
+                    ActivationOp::Softmax => burn::tensor::activation::softmax(t, *dim),
+                }
+            }
             TensorOp::Reduce { kind, arg, axis } => {
                 let t = self.tensor::<D>(arg);
                 match kind {
-                    // Collapses the axis to length one rather than removing it, so the
+                    // Each collapses the axis to length one rather than removing it, so the
                     // result keeps rank `D` and this function has a single return type.
                     ReduceOp::Sum => t.sum_dim(*axis),
+                    ReduceOp::Mean => t.mean_dim(*axis),
+                    ReduceOp::Max => t.max_dim(*axis),
+                    ReduceOp::Min => t.min_dim(*axis),
                 }
             }
             TensorOp::Matmul { lhs, rhs } => {
@@ -204,6 +218,183 @@ mod tests {
 
     fn value(shape: &[usize], data: &[f32]) -> TensorValue {
         TensorValue::new(shape.to_vec(), data.to_vec())
+    }
+
+    /// The new reductions run everywhere and give the exact answer they must.
+    ///
+    /// `mean`, `max` and `min` over `[1, 2, 3, 4]` are 2.5, 4 and 1 — all exactly
+    /// representable, so any backend disagreeing here is simply wrong.
+    #[test]
+    fn the_reductions_run_on_every_backend_and_give_exact_answers() {
+        use crate::input::ReduceOp;
+
+        for (kind, expected) in [
+            (ReduceOp::Sum, 10.0f32),
+            (ReduceOp::Mean, 2.5),
+            (ReduceOp::Max, 4.0),
+            (ReduceOp::Min, 1.0),
+        ] {
+            let case = TensorOp::reduce(kind, value(&[1, 4], &[1.0, 2.0, 3.0, 4.0]), 1);
+            for backend in [
+                &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+                &libtorch(),
+                &wgpu(),
+            ] {
+                let out = values(
+                    backend
+                        .run(&case)
+                        .unwrap_or_else(|e| panic!("{} on {kind:?}: {e:?}", backend.name())),
+                );
+                assert_eq!(
+                    out,
+                    vec![expected],
+                    "{} got {out:?} for {kind:?}, expected {expected}",
+                    backend.name()
+                );
+            }
+        }
+    }
+
+    /// **`max` with a `NaN` present is the case worth having.**
+    ///
+    /// IEEE-754's `maxNum` ignores `NaN` and returns the other operand; a naive `a > b`
+    /// comparison propagates it instead. Three implementations sharing no code have no
+    /// reason to agree, and no tolerance can absorb the difference — so this records what
+    /// they actually do rather than asserting what they should.
+    #[test]
+    fn what_the_backends_do_with_nan_in_a_max_reduction() {
+        use crate::input::ReduceOp;
+
+        let case = TensorOp::reduce(ReduceOp::Max, value(&[1, 3], &[1.0, f32::NAN, 3.0]), 1);
+
+        let answers: Vec<(String, Vec<f32>)> = [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ]
+        .iter()
+        .map(|b| (b.name().to_string(), values(b.run(&case).expect("runs"))))
+        .collect();
+
+        // Not asserted to be equal — that is the differential's job, and if they disagree it
+        // is a finding rather than a broken test. Asserted only to be *some* defensible
+        // answer, so a backend returning 1.0 or 0.0 would fail loudly.
+        for (name, out) in &answers {
+            let v = out[0];
+            assert!(
+                v.is_nan() || v == 3.0,
+                "{name} returned {v} for max([1, NaN, 3]); expected NaN or 3"
+            );
+        }
+    }
+
+    /// **`softmax` runs on every backend, and they agree on a case with an exact answer.**
+    ///
+    /// A row of identical values has a mathematically exact softmax — `1/n` for every
+    /// element, with no rounding required by any correct implementation. It is therefore the
+    /// one case where disagreement would be unambiguous, which makes it the right smoke test
+    /// for three implementations that share no code.
+    #[test]
+    fn softmax_runs_on_every_backend_and_agrees_on_an_exact_case() {
+        use crate::input::ActivationOp;
+
+        // Four equal values: softmax is exactly 0.25 each, whatever the value is.
+        let case = TensorOp::activation(
+            ActivationOp::Softmax,
+            value(&[1, 4], &[3.0, 3.0, 3.0, 3.0]),
+            1,
+        );
+
+        for backend in [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ] {
+            let out = backend
+                .run(&case)
+                .unwrap_or_else(|e| panic!("{} could not run softmax: {e:?}", backend.name()));
+            assert_eq!(out.shape.to_vec(), vec![1, 4], "{}", backend.name());
+            for v in values(out) {
+                assert!(
+                    (v - 0.25).abs() < 1e-6,
+                    "{} returned {v} where 0.25 is exact",
+                    backend.name()
+                );
+            }
+        }
+    }
+
+    /// The normalised dimension is honoured rather than assumed to be the last one — the
+    /// case that sends `burn-flex` down its transposing path.
+    #[test]
+    fn softmax_normalises_the_dimension_it_is_given() {
+        use crate::input::ActivationOp;
+
+        // Down columns (dim 0) of a 2x2, the pairs are (1,1) and (2,2): every result is 0.5.
+        // Across rows (dim 1) they are (1,2) and (1,2): the results are not 0.5.
+        let case = TensorOp::activation(
+            ActivationOp::Softmax,
+            value(&[2, 2], &[1.0, 2.0, 1.0, 2.0]),
+            0,
+        );
+
+        for backend in [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ] {
+            let out = values(backend.run(&case).expect("runs"));
+            for v in out {
+                assert!(
+                    (v - 0.5).abs() < 1e-6,
+                    "{} normalised the wrong dimension: got {v}, expected 0.5",
+                    backend.name()
+                );
+            }
+        }
+    }
+
+    /// **The end-to-end check that broadcasting actually works**, as opposed to our model of
+    /// it being self-consistent. Everything else in PHASE-7C tests shapes we invented; this
+    /// runs one through the libraries.
+    ///
+    /// `[3,1] + [3,4]`: the left operand's single column is reused across all four columns.
+    /// The answer is checkable by hand, which is the point — a wrong result here is obvious
+    /// rather than a plausible-looking tensor.
+    #[test]
+    fn a_broadcast_case_runs_and_stretches_on_every_backend() {
+        let case = TensorOp::binary(
+            crate::input::BinaryOp::Add,
+            value(&[3, 1], &[10.0, 20.0, 30.0]),
+            value(&[3, 4], &[1.0; 12]),
+        );
+        let expected = vec![
+            11.0, 11.0, 11.0, 11.0, // row 0: 10 stretched across four columns
+            21.0, 21.0, 21.0, 21.0, //
+            31.0, 31.0, 31.0, 31.0, //
+        ];
+
+        for backend in [
+            &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+            &libtorch(),
+            &wgpu(),
+        ] {
+            let out = backend.run(&case).unwrap_or_else(|e| {
+                panic!("{} could not run a broadcast case: {e:?}", backend.name())
+            });
+            assert_eq!(
+                out.shape.to_vec(),
+                [3, 4],
+                "{} produced the wrong output shape",
+                backend.name()
+            );
+            assert_eq!(
+                values(out),
+                expected,
+                "{} broadcast incorrectly",
+                backend.name()
+            );
+        }
     }
 
     fn values(out: TensorData) -> Vec<f32> {

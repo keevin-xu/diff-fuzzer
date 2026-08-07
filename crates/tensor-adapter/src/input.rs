@@ -25,7 +25,70 @@ use diff_fuzzer_core::Input;
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TensorValue {
     shape: Vec<usize>,
+    #[serde(with = "non_finite_safe")]
     data: Vec<f32>,
+}
+
+/// Serialising `f32` values that JSON cannot represent.
+///
+/// **JSON has no `NaN` or infinity.** `serde_json` writes them as `null`, and reading a
+/// `null` back into an `f32` fails — so a finding containing one is written to disk and is
+/// then *unreadable*.
+///
+/// That is not hypothetical. It happened the first time a campaign generated non-finite
+/// inputs (PHASE-7E): three findings were saved, none could be parsed, and triage reported
+/// **"a campaign that found nothing"** — the reassuring message, for findings it had failed
+/// to read. A long campaign would have produced hundreds of unreadable files and said
+/// nothing was wrong.
+///
+/// So non-finite values are written as strings and read back from either form. Strings
+/// rather than bit patterns because **a finding is read by people**: `"NaN"` in the JSON says
+/// what it is, where `2143289344` does not.
+mod non_finite_safe {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// A value on the wire: an ordinary number, or a name JSON can carry.
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Number(f32),
+        Named(String),
+    }
+
+    pub fn serialize<S: Serializer>(data: &[f32], serializer: S) -> Result<S::Ok, S::Error> {
+        let wire: Vec<Value> = data
+            .iter()
+            .map(|v| {
+                if v.is_finite() {
+                    Value::Number(*v)
+                } else if v.is_nan() {
+                    Value::Named("NaN".to_string())
+                } else if *v > 0.0 {
+                    Value::Named("inf".to_string())
+                } else {
+                    Value::Named("-inf".to_string())
+                }
+            })
+            .collect();
+        wire.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<f32>, D::Error> {
+        let wire = Vec::<Value>::deserialize(deserializer)?;
+        wire.into_iter()
+            .map(|value| match value {
+                Value::Number(v) => Ok(v),
+                Value::Named(name) => match name.as_str() {
+                    "NaN" => Ok(f32::NAN),
+                    "inf" => Ok(f32::INFINITY),
+                    "-inf" => Ok(f32::NEG_INFINITY),
+                    other => Err(serde::de::Error::custom(format!(
+                        "unrecognised value {other:?}"
+                    ))),
+                },
+            })
+            .collect()
+    }
 }
 
 impl TensorValue {
@@ -86,6 +149,14 @@ pub enum UnaryOp {
     /// that restriction is its own experiment, once there is a policy for what two
     /// backends both returning NaN should mean.
     Sqrt,
+    /// Undefined below zero, `-inf` at zero — and, unlike `exp`, **its error is worst near
+    /// `x = 1`**, not at large arguments.
+    ///
+    /// The condition number of `log` is `1 / |ln x|`, which diverges as `x` approaches 1
+    /// because `log(1) = 0` and a relative error against zero is unbounded. That is the
+    /// opposite shape of bound from everything else in `POLICY.md`, and it is why `log`
+    /// needed its own derivation rather than `exp`'s.
+    Log,
 }
 
 /// Operations taking two tensors of the same shape.
@@ -105,6 +176,47 @@ pub enum ReduceOp {
     /// shows up: two backends adding in a different order get different last bits.
     /// Expect this operation to need a looser comparison than the others.
     Sum,
+    /// A sum followed by a division. **Not the same bound as `Sum`**: the division adds a
+    /// rounding of its own, and on Metal it is licensed 2.5 ULP rather than one.
+    ///
+    /// Also worth testing because backends may divide at different points — before summing,
+    /// after, or fused into the accumulation — which changes both overflow behaviour and
+    /// rounding.
+    Mean,
+    /// **No arithmetic at all**: the result is one of the inputs, returned unchanged.
+    ///
+    /// Which makes any disagreement a *semantic* one rather than a numeric one, and
+    /// therefore impossible to excuse as precision. The interesting question is `NaN`:
+    /// IEEE-754's `maxNum` ignores it and returns the other operand, and implementations
+    /// genuinely differ — a hand-written SIMD kernel, libtorch, and a GPU reduction have no
+    /// reason to agree on it. Signed zero is the other tie case.
+    Max,
+    /// The mirror of [`ReduceOp::Max`], and it can differ independently: an implementation
+    /// may handle `NaN` one way in one and another way in the other.
+    Min,
+}
+
+/// Operations normalising a tensor along one axis.
+///
+/// **Separate from [`UnaryOp`] even though the arity is the same**, because these carry a
+/// dimension and unary operations do not. An optional `dim` on `Unary` would be meaningless
+/// for `neg` and would invite exactly the bug where it is silently ignored; a separate
+/// variant makes the compiler name every place that must handle it.
+///
+/// **This is where the interesting divergences are expected**, and the reason is that the
+/// three backends implement it three different ways rather than sharing one kernel:
+/// `burn-flex` hand-writes it, `burn-tch` delegates to libtorch, and `burn-wgpu` does not
+/// override the default at all — composing five separate operations
+/// (`max_dim`, `sub`, `exp`, `sum_dim`, `div`). Every operation tested before this one had
+/// all three backends performing essentially the same arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ActivationOp {
+    /// `exp(x_i - max) / sum_j exp(x_j - max)`, along one dimension.
+    ///
+    /// The max-subtraction is a stability measure, not part of the definition — which is
+    /// itself a source of disagreement, since implementations may apply it differently or
+    /// (in a fused kernel) at a different point in the computation.
+    Softmax,
 }
 
 /// One tensor test case.
@@ -134,6 +246,13 @@ pub enum TensorOp {
         lhs: TensorValue,
         rhs: TensorValue,
     },
+    /// A normalisation along one axis. See [`ActivationOp`].
+    Activation {
+        kind: ActivationOp,
+        arg: TensorValue,
+        /// Which axis is normalised over. Always less than the argument's rank.
+        dim: usize,
+    },
 }
 
 impl TensorOp {
@@ -143,14 +262,32 @@ impl TensorOp {
 
     /// # Panics
     ///
-    /// If the two shapes differ. Elementwise operations require identical shapes.
+    /// If the two shapes do not combine. Since PHASE-7C elementwise operations **broadcast**,
+    /// so the requirement is compatibility rather than identity: same rank, and each pair of
+    /// extents equal or one of them `1`. See [`crate::ops::broadcast`].
     pub fn binary(kind: BinaryOp, lhs: TensorValue, rhs: TensorValue) -> Self {
-        assert_eq!(
+        assert!(
+            crate::ops::broadcast::compatible(lhs.shape(), rhs.shape()),
+            "elementwise {kind:?} requires broadcast-compatible shapes, got {:?} and {:?}",
             lhs.shape(),
-            rhs.shape(),
-            "elementwise {kind:?} requires identical shapes"
+            rhs.shape()
         );
         TensorOp::Binary { kind, lhs, rhs }
+    }
+
+    /// # Panics
+    ///
+    /// If `dim` is not a dimension of `arg`.
+    ///
+    /// burn's `softmax` panics on an out-of-range dimension rather than returning an error,
+    /// so the constraint is enforced here where a case is built, not discovered at run time.
+    pub fn activation(kind: ActivationOp, arg: TensorValue, dim: usize) -> Self {
+        assert!(
+            dim < arg.rank(),
+            "dim {dim} is out of range for a rank-{} tensor",
+            arg.rank()
+        );
+        TensorOp::Activation { kind, arg, dim }
     }
 
     /// # Panics
@@ -204,6 +341,7 @@ impl TensorOp {
                 UnaryOp::Abs => "abs",
                 UnaryOp::Exp => "exp",
                 UnaryOp::Sqrt => "sqrt",
+                UnaryOp::Log => "log",
             },
             TensorOp::Binary { kind, .. } => match kind {
                 BinaryOp::Add => "add",
@@ -213,15 +351,23 @@ impl TensorOp {
             },
             TensorOp::Reduce { kind, .. } => match kind {
                 ReduceOp::Sum => "sum",
+                ReduceOp::Mean => "mean",
+                ReduceOp::Max => "max",
+                ReduceOp::Min => "min",
             },
             TensorOp::Matmul { .. } => "matmul",
+            TensorOp::Activation { kind, .. } => match kind {
+                ActivationOp::Softmax => "softmax",
+            },
         }
     }
 
     /// The rank of this case's arguments, which decides how it gets executed.
     pub fn rank(&self) -> usize {
         match self {
-            TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => arg.rank(),
+            TensorOp::Unary { arg, .. }
+            | TensorOp::Reduce { arg, .. }
+            | TensorOp::Activation { arg, .. } => arg.rank(),
             TensorOp::Binary { lhs, .. } | TensorOp::Matmul { lhs, .. } => lhs.rank(),
         }
     }
@@ -231,6 +377,54 @@ impl Input for TensorOp {}
 
 #[cfg(test)]
 mod tests {
+    /// **The regression that cost three findings.**
+    ///
+    /// JSON has no `NaN` or infinity, so `serde_json` wrote them as `null` and reading them
+    /// back failed. Three real findings were saved to disk, none could be parsed, and triage
+    /// announced "a campaign that found nothing". A long run would have lost hundreds
+    /// silently.
+    #[test]
+    fn a_case_holding_non_finite_values_survives_a_json_round_trip() {
+        let case = TensorOp::reduce(
+            ReduceOp::Max,
+            TensorValue::new(
+                vec![2, 3],
+                vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, 1.5],
+            ),
+            1,
+        );
+
+        let json = serde_json::to_string(&case).expect("serialises");
+        let back: TensorOp = serde_json::from_str(&json).expect("must parse back");
+
+        let TensorOp::Reduce { arg, .. } = &back else {
+            unreachable!()
+        };
+        let values = arg.data();
+        assert!(values[0].is_nan(), "NaN did not survive");
+        assert_eq!(values[1], f32::INFINITY);
+        assert_eq!(values[2], f32::NEG_INFINITY);
+        // Signed zero must survive too: its sign is observable, and `0.0 == -0.0` would let a
+        // broken round trip pass unnoticed.
+        assert_eq!(values[3].to_bits(), 0.0f32.to_bits());
+        assert_eq!(values[4].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(values[5], 1.5);
+    }
+
+    /// Ordinary numbers stay ordinary in the file — a finding is read by people, and turning
+    /// every value into a string to solve a problem three of them have would be a poor trade.
+    #[test]
+    fn finite_values_are_still_written_as_numbers() {
+        let case = TensorOp::unary(UnaryOp::Neg, TensorValue::new(vec![2], vec![1.5, -2.5]));
+        let json = serde_json::to_string(&case).expect("serialises");
+
+        assert!(json.contains("1.5"), "{json}");
+        assert!(
+            !json.contains("\"1.5\""),
+            "finite values should not be quoted: {json}"
+        );
+    }
+
     use super::*;
 
     fn value(shape: &[usize]) -> TensorValue {
@@ -263,10 +457,26 @@ mod tests {
         );
     }
 
+    /// Incompatible extents — neither equal nor 1 — are still rejected. Broadcasting widened
+    /// what is legal; it did not remove the constraint.
     #[test]
-    #[should_panic(expected = "identical shapes")]
-    fn elementwise_rejects_mismatched_shapes() {
+    #[should_panic(expected = "broadcast-compatible")]
+    fn elementwise_rejects_incompatible_shapes() {
         TensorOp::binary(BinaryOp::Add, value(&[2, 2]), value(&[3, 3]));
+    }
+
+    /// Differing ranks are rejected too, for burn's reason rather than ours: `Tensor<B, D>`
+    /// fixes the rank at compile time, so there is no way to express the NumPy form.
+    #[test]
+    #[should_panic(expected = "broadcast-compatible")]
+    fn elementwise_rejects_differing_ranks() {
+        TensorOp::binary(BinaryOp::Add, value(&[4]), value(&[3, 4]));
+    }
+
+    /// A stretched axis is now accepted where it previously panicked.
+    #[test]
+    fn elementwise_accepts_a_stretched_axis() {
+        TensorOp::binary(BinaryOp::Add, value(&[3, 1]), value(&[3, 4]));
     }
 
     #[test]

@@ -73,6 +73,13 @@ pub enum OpClass {
     Approximated,
     /// Sums many terms, so results depend on summation order.
     Accumulating,
+    /// A **composition** of the classes above, whose bound is derived from its parts.
+    ///
+    /// `softmax` is the first: an approximated `exp`, an accumulation over the normalised
+    /// axis, and a division. None of the three classes describes it, and picking the loosest
+    /// of them would be a guess rather than a derivation — the parts compose in a specific
+    /// way, and the composition is what has to be bounded.
+    Composed,
 }
 
 impl TensorOp {
@@ -82,7 +89,9 @@ impl TensorOp {
 
         match self {
             TensorOp::Unary { kind, .. } => match kind {
-                UnaryOp::Exp => OpClass::Approximated,
+                // Neither is required to be correctly rounded, and their error grows in
+                // opposite directions — see `approximated_tolerance`.
+                UnaryOp::Exp | UnaryOp::Log => OpClass::Approximated,
                 // `sqrt` is correctly rounded by IEEE-754; `neg` and `abs` only touch
                 // the sign bit.
                 UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Sqrt => OpClass::CorrectlyRounded,
@@ -92,8 +101,23 @@ impl TensorOp {
             TensorOp::Binary { .. } => OpClass::CorrectlyRounded,
             TensorOp::Reduce { kind, .. } => match kind {
                 ReduceOp::Sum => OpClass::Accumulating,
+                // A sum plus a division: the accumulation dominates, and the extra rounding
+                // is added inside `accumulating_tolerance` rather than by changing class.
+                ReduceOp::Mean => OpClass::Accumulating,
+                // **Exact, and for a stronger reason than the other members of this class.**
+                // `sqrt` is correctly *rounded*; `max` and `min` do no arithmetic whatever —
+                // they select one of their inputs and return it untouched. Nothing can round
+                // differently because nothing is rounded.
+                //
+                // A disagreement is therefore never precision. It would be a semantic
+                // difference — most plausibly over `NaN`, which IEEE-754's `maxNum` ignores
+                // and which implementations genuinely handle differently — and that is a
+                // finding, not noise.
+                ReduceOp::Max | ReduceOp::Min => OpClass::CorrectlyRounded,
             },
             TensorOp::Matmul { .. } => OpClass::Accumulating,
+            // See `composed_tolerance`: `exp` over a sum, then a division.
+            TensorOp::Activation { .. } => OpClass::Composed,
         }
     }
 }
@@ -143,7 +167,9 @@ const METAL_SUBNORMAL_FLOOR: f64 = f32::MIN_POSITIVE as f64;
 /// produce a perfectly normal-sized difference in the output.
 fn has_subnormal_input(case: &TensorOp) -> bool {
     let operands: [&crate::input::TensorValue; 2] = match case {
-        TensorOp::Unary { arg, .. } | TensorOp::Reduce { arg, .. } => [arg, arg],
+        TensorOp::Unary { arg, .. }
+        | TensorOp::Reduce { arg, .. }
+        | TensorOp::Activation { arg, .. } => [arg, arg],
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => [lhs, rhs],
     };
 
@@ -257,6 +283,8 @@ impl TensorTolerancePolicy {
             OpClass::Approximated => approximated_tolerance(input),
 
             OpClass::Accumulating => accumulating_tolerance(input),
+
+            OpClass::Composed => composed_tolerance(input, implementations),
         }
     }
 }
@@ -299,14 +327,71 @@ fn ulps(n: f64) -> Tolerance {
 /// while measurement shows what these two particular libraries *happen* to do today. A
 /// threshold tightened to the latter would be fitted to an implementation detail.
 fn approximated_tolerance(input: &TensorOp) -> Tolerance {
-    let largest = match input {
-        TensorOp::Unary { arg, .. } => largest_magnitude(arg.data()),
+    let (kind, arg) = match input {
+        TensorOp::Unary { kind, arg } => (*kind, arg),
         // Every approximated operation is unary; anything else is misclassified.
         other => unreachable!("{} is not an approximated unary operation", other.name()),
     };
 
-    Tolerance::new(2.0 * (1.0 + largest) * EPSILON, 0.0)
+    // **The two approximated functions need different condition numbers, and using one for
+    // both would be wrong in opposite directions.** `exp` is hardest at large arguments;
+    // `log` is hardest near 1. Applying `exp`'s model to `log` would be tightest exactly
+    // where `log` is loosest.
+    let amplification = match kind {
+        UnaryOp::Exp => largest_magnitude(arg.data()),
+        UnaryOp::Log => log_amplification(arg.data()),
+        other => unreachable!("{other:?} is not approximated"),
+    };
+
+    Tolerance::new(2.0 * (1.0 + amplification) * EPSILON, 0.0)
 }
+
+/// How much `log` magnifies a relative perturbation of its argument, over a whole tensor.
+///
+/// # The derivation
+///
+/// `log(x(1 + d)) = log(x) + log(1 + d) ≈ log(x) + d`. The *absolute* error in the result is
+/// therefore about `d`, and the **relative** error is `d / |log(x)|` — so the condition
+/// number is `1 / |ln x|`.
+///
+/// **This diverges as `x` approaches 1**, because `log(1)` is exactly zero and a relative
+/// error measured against zero is unbounded. That is the opposite shape from `exp`, whose
+/// condition number is `|x|` and which is therefore benign near its own zero.
+///
+/// # Why it is capped
+///
+/// Taken literally the bound is infinite at `x = 1`, which would make every case containing
+/// a 1 unjudgeable — the tolerance would excuse anything. But `log(1)` is a value every
+/// implementation gets *exactly* right: it is a special case in every library, and the
+/// result is exactly `0.0` with no rounding at all.
+///
+/// So the relative bound is capped, and near-1 arguments are instead covered by an absolute
+/// term of one `EPSILON` — the largest absolute error a correctly-behaved implementation can
+/// have when the true answer is near zero. Capping without that absolute term would be the
+/// unsafe direction; capping *with* it bounds the same cases by a different measure rather
+/// than by a looser one.
+///
+/// `LOG_MAX_AMPLIFICATION` is a judgment about where "near 1" starts, not a fitted value:
+/// at `|ln x| = 1/64`, `x` is within about 1.6% of 1.
+fn log_amplification(data: &[f32]) -> f64 {
+    data.iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| {
+            let ln = (v as f64).ln().abs();
+            if ln == 0.0 {
+                LOG_MAX_AMPLIFICATION
+            } else {
+                (1.0 / ln).min(LOG_MAX_AMPLIFICATION)
+            }
+        })
+        .fold(0.0f64, f64::max)
+}
+
+/// The ceiling on `log`'s condition number, reached when the argument is within ~1.6% of 1.
+///
+/// See [`log_amplification`] for why a cap is needed and what covers the cases it excludes.
+const LOG_MAX_AMPLIFICATION: f64 = 64.0;
 
 /// Tolerance for an operation that sums `terms` values of magnitude up to `largest`.
 ///
@@ -325,12 +410,104 @@ fn bound(terms: usize, largest: f64) -> Tolerance {
     Tolerance::new(rtol, atol)
 }
 
+/// Tolerance for `softmax`, derived from the parts it is built out of.
+///
+/// # The composition
+///
+/// `softmax(x)_i = exp(x_i - m) / sum_j exp(x_j - m)`, where `m` is the maximum along the
+/// normalised axis. Four steps contribute error, and **relative errors add through a
+/// quotient**, so they sum:
+///
+/// | step | contribution, in units of `EPSILON` | why |
+/// |---|---|---|
+/// | `max` | 0 | returns one of its inputs unchanged; nothing is rounded |
+/// | `x_i - m` then `exp` | `1 + range` | the `Approximated` model, at argument `x_i - m`. `exp`'s condition number is the magnitude of its argument, and since `m` is the maximum, that magnitude is at most the **range** of values along the axis |
+/// | `sum_j` | `n` | the `Accumulating` model over `n` terms |
+/// | `/` | 1, or [`METAL_DIV_ULPS`] against a GPU | one correctly rounded division; Metal permits 2.5 ULP (`SPECS.md` §4.1) |
+///
+/// Doubled, as everywhere else here, because two implementations may sit on opposite sides
+/// of the true value.
+///
+/// # Two deliberate conservatisms, stated rather than hidden
+///
+/// **The range is taken over the whole tensor, not per slice.** Each output element depends
+/// only on its own slice along `dim`, so the exact bound would use that slice's range. The
+/// whole-tensor range is an upper bound on every slice's, which errs toward a looser
+/// tolerance — the direction that costs sensitivity rather than the one that hides defects.
+/// Computing it per slice is a refinement worth making only if this proves too loose.
+///
+/// **No absolute term.** The `Accumulating` class carries one because cancellation can
+/// destroy the scale a relative tolerance needs. Here it cannot: every `exp(x_i - m)` is
+/// positive and no term cancels another, so the sum keeps its scale and a relative bound is
+/// well founded. Against a GPU an absolute floor is still added upstream, for denormal
+/// flushing rather than for cancellation.
+///
+/// # What this does *not* assume
+///
+/// It does not assume how a backend organises the work. `burn-wgpu` composes five separate
+/// operations and `burn-flex` fuses three passes into one kernel; both perform the same
+/// mathematical steps, and the bound above covers either. A fused implementation should land
+/// *inside* it with margin, which is the point — a bound that only the composed version
+/// satisfied would be fitted to one implementation.
+fn composed_tolerance(input: &TensorOp, implementations: (&str, &str)) -> Tolerance {
+    let TensorOp::Activation { arg, dim, .. } = input else {
+        unreachable!("{} is not a composed operation", input.name());
+    };
+
+    let terms = arg.shape()[*dim] as f64;
+    let range = value_range(arg.data());
+    let division = if involves_gpu(implementations) {
+        METAL_DIV_ULPS
+    } else {
+        1.0
+    };
+
+    Tolerance::new(2.0 * ((1.0 + range) + terms + division) * EPSILON, 0.0)
+}
+
+/// The spread of finite values, which bounds `exp`'s condition number after the max-shift.
+///
+/// Non-finite values are skipped: they are handled by the special-value policy (§5), not by
+/// a tolerance, and letting an infinity into this arithmetic would produce a `NaN` bound.
+fn value_range(data: &[f32]) -> f64 {
+    let finite = data.iter().copied().filter(|v| v.is_finite());
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for value in finite {
+        low = low.min(value);
+        high = high.max(value);
+    }
+    if low > high {
+        return 0.0; // nothing finite; the bound is irrelevant to such a case
+    }
+    (high - low) as f64
+}
+
 fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
+    use crate::input::ReduceOp;
+
     match input {
-        TensorOp::Reduce { arg, axis, .. } => {
+        TensorOp::Reduce { kind, arg, axis } => {
             // Each output element sums exactly the values along the collapsed axis.
             let terms = arg.shape()[*axis];
-            bound(terms, largest_magnitude(arg.data()))
+            let summed = bound(terms, largest_magnitude(arg.data()));
+
+            match kind {
+                ReduceOp::Sum => summed,
+                // **`mean` is a sum and then a division, and the division is not free.**
+                // Reusing `sum`'s entry unchanged would understate the bound by one rounding
+                // — small, but the kind of omission that spreads silently once a class is
+                // shared. Relative errors add through a quotient, so one `EPSILON` is added
+                // to the relative term. The absolute term is scaled down by the same divisor
+                // the values are.
+                ReduceOp::Mean => {
+                    Tolerance::new(summed.rtol + 2.0 * EPSILON, summed.atol / terms as f64)
+                }
+                // Classified `CorrectlyRounded`; never routed here.
+                ReduceOp::Max | ReduceOp::Min => {
+                    unreachable!("{} does not accumulate", input.name())
+                }
+            }
         }
         TensorOp::Matmul { lhs, rhs } => {
             // Each output element sums `k` products, where `k` is the shared inner
@@ -361,6 +538,7 @@ fn largest_magnitude(values: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{FLEX_NAME, LIBTORCH_NAME, WGPU_NAME};
     use crate::input::{BinaryOp, ReduceOp, TensorValue, UnaryOp};
 
     fn value(shape: &[usize], fill: f32) -> TensorValue {
@@ -371,11 +549,17 @@ mod tests {
     fn tolerance_for(op: &TensorOp) -> Tolerance {
         // The CPU pair: these tests state what the *specification* requires of conforming
         // implementations, which is the bound before any hardware-specific relaxation.
-        TensorTolerancePolicy.tolerance_for(op, ("burn-ndarray", "burn-tch"))
+        //
+        // **Named by constant, not by literal.** These said `"burn-ndarray"` — a backend
+        // removed at PHASE-7A — for three phases, and passed the whole time, because the
+        // policy only inspects a name to decide whether it is a GPU and `"burn-ndarray"`
+        // correctly is not one. Right by accident, while asserting about something that no
+        // longer existed. A constant cannot go stale that way.
+        TensorTolerancePolicy.tolerance_for(op, (FLEX_NAME, LIBTORCH_NAME))
     }
 
     fn gpu_tolerance(op: &TensorOp) -> Tolerance {
-        TensorTolerancePolicy.tolerance_for(op, ("burn-ndarray", "burn-wgpu"))
+        TensorTolerancePolicy.tolerance_for(op, (FLEX_NAME, WGPU_NAME))
     }
 
     /// **The bound must come from the specification, not the measurement.** Pinned so that
@@ -437,7 +621,7 @@ mod tests {
         let op = TensorOp::binary(BinaryOp::Div, value(&[4], 1.0), value(&[4], 2.0));
 
         assert_eq!(
-            TensorTolerancePolicy.tolerance_for(&op, ("burn-ndarray", "burn-tch")),
+            TensorTolerancePolicy.tolerance_for(&op, (FLEX_NAME, LIBTORCH_NAME)),
             Tolerance::EXACT
         );
     }
@@ -478,7 +662,7 @@ mod tests {
         let op = TensorOp::binary(BinaryOp::Add, value(&[4], 1.0), value(&[4], 2.0));
 
         assert_eq!(
-            TensorTolerancePolicy.tolerance_for(&op, ("burn-ndarray", "burn-tch")),
+            TensorTolerancePolicy.tolerance_for(&op, (FLEX_NAME, LIBTORCH_NAME)),
             Tolerance::EXACT
         );
     }
@@ -488,7 +672,7 @@ mod tests {
     fn a_subnormal_input_against_the_gpu_is_licensed() {
         let op = TensorOp::unary(UnaryOp::Sqrt, value(&[2], 1e-45));
 
-        let licensed = TensorTolerancePolicy.known_legal(&op, ("burn-ndarray", "burn-wgpu"));
+        let licensed = TensorTolerancePolicy.known_legal(&op, (FLEX_NAME, WGPU_NAME));
         let (class, detail) = licensed.expect("Metal §8.1 permits flushing a denormal input");
 
         assert!(class.contains("subnormal"));
@@ -507,7 +691,7 @@ mod tests {
 
         assert!(
             TensorTolerancePolicy
-                .known_legal(&op, ("burn-ndarray", "burn-tch"))
+                .known_legal(&op, (FLEX_NAME, LIBTORCH_NAME))
                 .is_none()
         );
     }
@@ -520,7 +704,7 @@ mod tests {
 
         assert!(
             TensorTolerancePolicy
-                .known_legal(&op, ("burn-ndarray", "burn-wgpu"))
+                .known_legal(&op, (FLEX_NAME, WGPU_NAME))
                 .is_none()
         );
     }
@@ -533,7 +717,7 @@ mod tests {
 
         assert!(
             TensorTolerancePolicy
-                .known_legal(&op, ("burn-ndarray", "burn-wgpu"))
+                .known_legal(&op, (FLEX_NAME, WGPU_NAME))
                 .is_none()
         );
     }
