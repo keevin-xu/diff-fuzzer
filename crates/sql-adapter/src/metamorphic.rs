@@ -704,6 +704,104 @@ mod tests {
         )
     }
 
+    /// The `NOT IN` trap, built by hand and run on **both engines**.
+    ///
+    /// This is not a test of our code — it is a test of the *premise* the `not_in` axis rests
+    /// on. `t0.c0 NOT IN (SELECT t1.c0 FROM t1)` where `t1.c0` contains a `NULL` must return
+    /// **no rows at all**, because every row's predicate is UNKNOWN rather than TRUE. The
+    /// positive `IN` form must still return its match, which is the asymmetry that makes the
+    /// trap a trap.
+    ///
+    /// **If this test fails because both engines return rows, that is not a broken test — it
+    /// is the shared bug the metamorphic oracle exists to find**, and it would be the first
+    /// thing this project has found that a differential campaign structurally could not.
+    #[test]
+    fn not_in_with_a_null_returns_nothing_on_both_engines() {
+        use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
+
+        let column = |table: &str, name: &str| ColumnRef {
+            table: table.to_string(),
+            column: name.to_string(),
+        };
+        let table = |name: &str| Table {
+            name: name.to_string(),
+            columns: vec![Column {
+                name: "c0".to_string(),
+                sql_type: SqlType::Integer,
+            }],
+        };
+
+        let membership = |not: bool| SqlCase {
+            schema: vec![table("t0"), table("t1")],
+            data: vec![
+                InsertRows {
+                    table: "t0".to_string(),
+                    rows: vec![
+                        vec![Literal::Integer(1)],
+                        vec![Literal::Integer(2)],
+                        vec![Literal::Integer(3)],
+                    ],
+                },
+                InsertRows {
+                    table: "t1".to_string(),
+                    // The `NULL` is the whole point: without it `NOT IN` returns 1 and 3.
+                    rows: vec![vec![Literal::Integer(2)], vec![Literal::Null]],
+                },
+            ],
+            query: SelectStmt {
+                projection: vec![Expr::Column(column("t0", "c0"))],
+                from: "t0".to_string(),
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: Some(Expr::InSubquery {
+                    not,
+                    left: Box::new(Expr::Column(column("t0", "c0"))),
+                    query: Box::new(SelectStmt {
+                        projection: vec![Expr::Column(column("t1", "c0"))],
+                        from: "t1".to_string(),
+                        join: None,
+                        set_op: None,
+                        group_by: Vec::new(),
+                        filter: None,
+                        order_by: Vec::new(),
+                        limit: None,
+                    }),
+                }),
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let run = |case: &SqlCase| -> SqlOutcome {
+                if engine == "sqlite" {
+                    SqliteImpl.run(case).expect("sqlite runs the case")
+                } else {
+                    DuckDbImpl.run(case).expect("duckdb runs the case")
+                }
+            };
+
+            // `NOT IN` against a list containing NULL: every row is UNKNOWN, so none survive.
+            let negated = run(&membership(true));
+            assert_eq!(
+                negated,
+                SqlOutcome::Rows(vec![]),
+                "{engine}: NOT IN against a NULL-containing subquery returned rows. Either \
+                 three-valued logic is wrong here, or our understanding is. Check the plain IN \
+                 case below before believing the first."
+            );
+
+            // The control: `IN` is unaffected, because `true OR unknown` is true.
+            let plain = run(&membership(false));
+            assert_eq!(
+                plain,
+                SqlOutcome::Rows(vec![vec![Cell::Integer(2)]]),
+                "{engine}: IN should still find the matching row"
+            );
+        }
+    }
+
     /// Build a grouped result: each entry is a group key followed by its aggregate values,
     /// where `None` renders as `NULL`.
     fn groups(values: &[(i64, &[Option<i64>])]) -> SqlOutcome {

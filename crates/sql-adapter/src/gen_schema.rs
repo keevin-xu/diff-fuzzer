@@ -48,6 +48,17 @@ pub struct Bounds {
     ///
     /// Needs two tables, like joins, so it forces the same two-table schema.
     pub subqueries: bool,
+    /// Whether the generator may emit `x IN (SELECT ...)` / `x NOT IN (SELECT ...)`.
+    ///
+    /// **Aimed at one specific bug**, unlike the other axes, which widen the surface
+    /// generally. `NOT IN` against a subquery column containing a `NULL` is UNKNOWN for every
+    /// row, so the query correctly returns nothing — and engines get this wrong *in the same
+    /// direction*, by treating the UNKNOWN as FALSE and returning rows that should be
+    /// excluded. A shared wrong answer is invisible to the differential oracle, which is why
+    /// this axis exists to be pointed at the **metamorphic** one.
+    ///
+    /// Needs two tables, like joins and correlated subqueries.
+    pub not_in: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -110,11 +121,19 @@ impl Bounds {
         chained_set_ops: false,
         joins: false,
         subqueries: false,
+        not_in: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
     pub const V1_SUBQUERIES: Bounds = Bounds {
         subqueries: true,
+        ..Bounds::V1
+    };
+
+    /// V1 plus `IN`/`NOT IN` subqueries. One axis, as always — so its yield can be measured
+    /// against the others rather than confounded with them.
+    pub const V1_NOT_IN: Bounds = Bounds {
+        not_in: true,
         ..Bounds::V1
     };
 
@@ -154,6 +173,7 @@ impl Bounds {
         chained_set_ops: false,
         joins: true,
         subqueries: true,
+        not_in: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -192,7 +212,7 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={}, subqueries={})",
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={}, subqueries={}, not-in={})",
             self.max_tables,
             self.max_columns,
             self.max_rows,
@@ -202,7 +222,8 @@ impl Bounds {
             self.set_ops,
             self.chained_set_ops,
             self.joins,
-            self.subqueries
+            self.subqueries,
+            self.not_in
         )
     }
 }

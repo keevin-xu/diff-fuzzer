@@ -290,6 +290,28 @@ pub enum Expr {
         left: Box<Expr>,
         query: Box<SelectStmt>,
     },
+    /// `expr IN (SELECT ...)` / `expr NOT IN (SELECT ...)`.
+    ///
+    /// **This variant exists for one specific bug, and it is worth stating exactly.** `NOT IN`
+    /// against a subquery whose column contains a `NULL` returns **UNKNOWN for every row**, so
+    /// `WHERE x NOT IN (SELECT y FROM t)` correctly returns **no rows at all** when any `y` is
+    /// `NULL` — even for an `x` that plainly does not appear in `y`.
+    ///
+    /// The reason: `x NOT IN (a, b, NULL)` means `x <> a AND x <> b AND x <> NULL`, and the last
+    /// conjunct is UNKNOWN. `false AND unknown` is false, but `true AND unknown` is **unknown**,
+    /// so a row that differs from every non-`NULL` value cannot reach TRUE. `IN` is not
+    /// symmetric here: `x IN (a, b, NULL)` still returns TRUE when `x = a`, because
+    /// `true OR unknown` is true. The asymmetry is the whole trap.
+    ///
+    /// It is the most famous three-valued-logic trap in SQL, engines get it wrong *in the same
+    /// direction* (treating the UNKNOWN as FALSE and returning rows that should be excluded),
+    /// and a shared wrong answer is invisible to a differential oracle — which is precisely
+    /// what the metamorphic oracle exists to reach.
+    InSubquery {
+        not: bool,
+        left: Box<Expr>,
+        query: Box<SelectStmt>,
+    },
 }
 
 impl Expr {
@@ -307,7 +329,9 @@ impl Expr {
             // A subquery counts as its own size plus its query's, so minimization sees
             // removing one as the large reduction it is.
             Expr::Exists { query, .. } => 1 + query.node_count(),
-            Expr::ScalarSubquery { left, query, .. } => 1 + left.node_count() + query.node_count(),
+            Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
+                1 + left.node_count() + query.node_count()
+            }
         }
     }
 
@@ -341,7 +365,7 @@ impl Expr {
             // one is that it references the outer scope, and a caller checking which columns a
             // query needs must see those references or it will happily delete them.
             Expr::Exists { query, .. } => query.collect_columns(found),
-            Expr::ScalarSubquery { left, query, .. } => {
+            Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
                 left.collect_columns(found);
                 query.collect_columns(found);
             }
@@ -364,7 +388,7 @@ impl Expr {
             // An aggregate *inside* a subquery belongs to the subquery, not to this query —
             // `SELECT c0 FROM t WHERE c0 = (SELECT MAX(c1) FROM u)` is not an aggregate query.
             // Reporting otherwise would make the grouping rules reject a valid case.
-            Expr::Exists { .. } | Expr::ScalarSubquery { .. } => false,
+            Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => false,
         }
     }
 
@@ -397,7 +421,9 @@ impl Expr {
             }
             // Stops here, deliberately.
             Expr::Exists { .. } => {}
-            Expr::ScalarSubquery { left, .. } => left.collect_columns_here(found),
+            Expr::ScalarSubquery { left, .. } | Expr::InSubquery { left, .. } => {
+                left.collect_columns_here(found)
+            }
         }
     }
 
@@ -411,7 +437,7 @@ impl Expr {
     fn collect_subqueries<'a>(&'a self, found: &mut Vec<&'a SelectStmt>) {
         match self {
             Expr::Exists { query, .. } => found.push(query),
-            Expr::ScalarSubquery { left, query, .. } => {
+            Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
                 left.collect_subqueries(found);
                 found.push(query);
             }
@@ -433,7 +459,7 @@ impl Expr {
     /// Does this expression contain a subquery?
     pub fn contains_subquery(&self) -> bool {
         match self {
-            Expr::Exists { .. } | Expr::ScalarSubquery { .. } => true,
+            Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => true,
             Expr::Column(_) | Expr::Literal(_) => false,
             Expr::Unary { operand, .. } => operand.contains_subquery(),
             Expr::Binary { left, right, .. } => {
@@ -449,7 +475,11 @@ impl Expr {
     /// Does this expression produce a truth value rather than a stored value?
     pub fn is_predicate_shaped(&self) -> bool {
         match self {
-            Expr::Exists { .. } | Expr::ScalarSubquery { .. } => true,
+            // `InSubquery` is listed explicitly rather than left to the `_` arm below. The
+            // wildcard is why the compiler said nothing when this variant was added, and
+            // defaulting to `false` would have quietly declared `x NOT IN (...)` not a
+            // predicate — the one classification this variant exists to get right.
+            Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => true,
             Expr::Unary { op, .. } => {
                 matches!(op, UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull)
             }
@@ -475,7 +505,7 @@ impl Expr {
                 .as_ref()
                 .is_some_and(|inner| inner.contains_null_literal()),
             Expr::Exists { query, .. } => query.contains_null_literal(),
-            Expr::ScalarSubquery { left, query, .. } => {
+            Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
                 left.contains_null_literal() || query.contains_null_literal()
             }
         }

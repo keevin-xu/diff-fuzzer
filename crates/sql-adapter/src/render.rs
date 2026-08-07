@@ -223,6 +223,15 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
             binary_operator(*op),
             render_select(query, dialect)
         ),
+        // Spaces around `IN`/`NOT IN` matter for the same reason the unary minus needs one:
+        // the operand is already parenthesised, and `IN(` would still parse, but keeping the
+        // rendering uniform is what makes a generated query readable in a bug report.
+        Expr::InSubquery { not, left, query } => format!(
+            "({} {} ({}))",
+            render_expr(left, dialect),
+            if *not { "NOT IN" } else { "IN" },
+            render_select(query, dialect)
+        ),
         Expr::Aggregate { func, arg } => match (func, arg) {
             (AggregateFunc::CountRows, _) => "COUNT(*)".to_string(),
             (function, Some(inner)) => {

@@ -255,7 +255,7 @@ fn mentions_null_test(expression: &Expr) -> bool {
         Expr::Cast { expr, .. } => mentions_null_test(expr),
         Expr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|inner| mentions_null_test(inner)),
         Expr::Exists { query, .. } => query.filter.as_ref().is_some_and(mentions_null_test),
-        Expr::ScalarSubquery { left, query, .. } => {
+        Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
             mentions_null_test(left) || query.filter.as_ref().is_some_and(mentions_null_test)
         }
         Expr::Column(_) | Expr::Literal(_) => false,

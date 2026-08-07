@@ -98,6 +98,28 @@ pub fn generate_query(
     let mut filter =
         (rng.random_range(0..100) < 70).then(|| generate_predicate(rng, table, bounds, 0));
 
+    // An `IN`/`NOT IN` membership test in the `WHERE` clause. **Conjoined with `AND`
+    // specifically, never `OR`** — unlike the correlated subquery below, which picks either.
+    // `OR` would let the other side of the disjunction return rows on its own, which is
+    // exactly what would mask the trap: the whole signal here is a predicate that returns
+    // *nothing* when it should return something.
+    if bounds.not_in && tables.len() > 1 && rng.random_range(0..100) < 45 {
+        let inner = tables
+            .iter()
+            .find(|candidate| candidate.name != table.name)
+            .expect("more than one table");
+        if let Some(membership) = generate_not_in(rng, table, inner) {
+            filter = Some(match filter {
+                Some(existing) => Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(existing),
+                    right: Box::new(membership),
+                },
+                None => membership,
+            });
+        }
+    }
+
     // A correlated subquery in the `WHERE` clause. Conjoined with whatever predicate is
     // already there rather than replacing it, so enabling this axis **adds** to a case
     // instead of substituting for part of it — the rule three earlier confounds taught.
@@ -287,6 +309,50 @@ enum QueryShape {
 ///
 /// The correlation — `= outer.c` — is the point. Without it the subquery is a constant the
 /// optimizer can hoist, and both engines would compute it once and agree.
+/// `outer.c IN (SELECT inner.d FROM inner)` — or, mostly, `NOT IN`.
+///
+/// **Uncorrelated, deliberately.** The subquery has no `WHERE` referencing the outer row, so
+/// it is evaluated once and yields a fixed list. That is the canonical shape of the trap: the
+/// question "does this value appear in that column?" is one every reader believes they can
+/// answer, and `NULL` makes the negated form answer *nothing* instead. A correlated variant is
+/// also interesting, but it confounds two mechanisms — correlation is already its own axis.
+///
+/// **`NOT IN` is favoured 4:1 over `IN`**, because the asymmetry is the point: `IN` is
+/// well-behaved with `NULL` (`true OR unknown` is true), while `NOT IN` is not
+/// (`true AND unknown` is unknown). `IN` is still generated, at a low rate, as a control — if
+/// something fires on both forms it is not the trap.
+fn generate_not_in(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Option<Expr> {
+    // Same type discipline as everywhere else: comparing text against integer is a documented
+    // engine difference and is kept unrepresentable rather than catalogued.
+    let mut pairs = Vec::new();
+    for outer_column in &outer.columns {
+        for inner_column in &inner.columns {
+            if outer_column.sql_type.accepts(inner_column.sql_type) {
+                pairs.push((outer_column, inner_column));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    let (outer_column, inner_column) = pairs[rng.random_range(0..pairs.len())];
+
+    Some(Expr::InSubquery {
+        not: rng.random_range(0..100) < 80,
+        left: Box::new(Expr::Column(reference(outer, &outer_column.name))),
+        query: Box::new(SelectStmt {
+            projection: vec![Expr::Column(reference(inner, &inner_column.name))],
+            from: inner.name.clone(),
+            join: None,
+            set_op: None,
+            group_by: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+        }),
+    })
+}
+
 fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Option<Expr> {
     // The correlation needs one column of each table with compatible types.
     let mut pairs = Vec::new();
@@ -691,6 +757,67 @@ mod tests {
         (tables, data, query)
     }
 
+    /// The `not_in` axis must actually produce the construct, and must produce the **negated**
+    /// form most of the time — the positive form cannot exhibit the trap at all.
+    ///
+    /// Pinned as a rate rather than "at least one", because an axis that fires once in ten
+    /// thousand cases is indistinguishable from a disabled one over a short run.
+    #[test]
+    fn the_not_in_axis_generates_mostly_negated_membership_tests() {
+        fn count(expression: &Expr, negated: &mut usize, plain: &mut usize) {
+            match expression {
+                Expr::InSubquery { not: true, .. } => *negated += 1,
+                Expr::InSubquery { not: false, .. } => *plain += 1,
+                Expr::Unary { operand, .. } => count(operand, negated, plain),
+                Expr::Binary { left, right, .. } => {
+                    count(left, negated, plain);
+                    count(right, negated, plain);
+                }
+                _ => {}
+            }
+        }
+
+        let (mut negated, mut plain) = (0usize, 0usize);
+        for seed in 0..2_000 {
+            let mut rng = SeededRng::from_seed(seed);
+            let tables = generate_schema(&mut rng, Bounds::V1_NOT_IN);
+            let data = generate_data(&mut rng, &tables, Bounds::V1_NOT_IN);
+            let query = generate_query(&mut rng, &tables, &data, Bounds::V1_NOT_IN);
+            if let Some(filter) = &query.filter {
+                count(filter, &mut negated, &mut plain);
+            }
+        }
+
+        assert!(
+            negated > 200,
+            "only {negated} negated membership tests in 2000 cases — the axis is barely firing"
+        );
+        assert!(
+            plain > 0,
+            "no plain `IN` was generated; the control form is needed to tell the trap from a \
+             general membership bug"
+        );
+        assert!(
+            negated > plain * 2,
+            "expected NOT IN to dominate ({negated} negated vs {plain} plain)"
+        );
+
+        // And the axis must be **off** by default, or every earlier measurement changes meaning.
+        let mut rng = SeededRng::from_seed(0);
+        let tables = generate_schema(&mut rng, Bounds::V1);
+        let data = generate_data(&mut rng, &tables, Bounds::V1);
+        let query = generate_query(&mut rng, &tables, &data, Bounds::V1);
+        let (mut off_negated, mut off_plain) = (0usize, 0usize);
+        if let Some(filter) = &query.filter {
+            count(filter, &mut off_negated, &mut off_plain);
+        }
+        assert_eq!(
+            (off_negated, off_plain),
+            (0, 0),
+            "V1 must not generate membership tests"
+        );
+    }
+
     fn table_of<'a>(tables: &'a [Table], name: &str) -> &'a Table {
         tables
             .iter()
@@ -821,7 +948,10 @@ mod tests {
             // table — cannot say anything about its insides. It returns the *shape* of the
             // subquery's result and stops, which is the honest boundary.
             Expr::Exists { .. } => None,
-            Expr::ScalarSubquery { left, .. } => {
+            // Both carry a left operand in *this* scope and a query in its own, so the walk
+            // checks the operand and stops at the subquery boundary. `InSubquery` yields a
+            // truth value, so `None` is right for it in the same way it is for `EXISTS`.
+            Expr::ScalarSubquery { left, .. } | Expr::InSubquery { left, .. } => {
                 assert_types_agree(left, table, seed);
                 None
             }

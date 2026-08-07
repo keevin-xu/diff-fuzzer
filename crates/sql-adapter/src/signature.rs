@@ -211,6 +211,19 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
             collect_expr_tags(left, tags);
             collect_stmt_tags(query, tags);
         }
+        // `IN` and `NOT IN` get **separate** tags, because they are not the same construct
+        // for our purposes: the three-valued-logic trap is asymmetric and lives entirely on
+        // the negated side. Collapsing them would group a finding with cases that cannot
+        // exhibit it.
+        Expr::InSubquery { not, left, query } => {
+            tags.insert(if *not {
+                "not-in-subquery"
+            } else {
+                "in-subquery"
+            });
+            collect_expr_tags(left, tags);
+            collect_stmt_tags(query, tags);
+        }
         Expr::Aggregate { func, arg } => {
             tags.insert(match func {
                 crate::schema::AggregateFunc::CountRows => "count-rows",

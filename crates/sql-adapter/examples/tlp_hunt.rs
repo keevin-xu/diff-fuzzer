@@ -108,6 +108,7 @@ fn main() {
     let bounds = match arguments.next().as_deref() {
         Some("all") => Bounds::V1_ALL,
         Some("joins") => Bounds::V1_JOINS,
+        Some("not-in") => Bounds::V1_NOT_IN,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,
         // **The default is now `V1_ALL`, matching the differential campaign.** It used to be
