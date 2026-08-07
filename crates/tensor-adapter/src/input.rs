@@ -25,7 +25,70 @@ use diff_fuzzer_core::Input;
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TensorValue {
     shape: Vec<usize>,
+    #[serde(with = "non_finite_safe")]
     data: Vec<f32>,
+}
+
+/// Serialising `f32` values that JSON cannot represent.
+///
+/// **JSON has no `NaN` or infinity.** `serde_json` writes them as `null`, and reading a
+/// `null` back into an `f32` fails — so a finding containing one is written to disk and is
+/// then *unreadable*.
+///
+/// That is not hypothetical. It happened the first time a campaign generated non-finite
+/// inputs (PHASE-7E): three findings were saved, none could be parsed, and triage reported
+/// **"a campaign that found nothing"** — the reassuring message, for findings it had failed
+/// to read. A long campaign would have produced hundreds of unreadable files and said
+/// nothing was wrong.
+///
+/// So non-finite values are written as strings and read back from either form. Strings
+/// rather than bit patterns because **a finding is read by people**: `"NaN"` in the JSON says
+/// what it is, where `2143289344` does not.
+mod non_finite_safe {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// A value on the wire: an ordinary number, or a name JSON can carry.
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Number(f32),
+        Named(String),
+    }
+
+    pub fn serialize<S: Serializer>(data: &[f32], serializer: S) -> Result<S::Ok, S::Error> {
+        let wire: Vec<Value> = data
+            .iter()
+            .map(|v| {
+                if v.is_finite() {
+                    Value::Number(*v)
+                } else if v.is_nan() {
+                    Value::Named("NaN".to_string())
+                } else if *v > 0.0 {
+                    Value::Named("inf".to_string())
+                } else {
+                    Value::Named("-inf".to_string())
+                }
+            })
+            .collect();
+        wire.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<f32>, D::Error> {
+        let wire = Vec::<Value>::deserialize(deserializer)?;
+        wire.into_iter()
+            .map(|value| match value {
+                Value::Number(v) => Ok(v),
+                Value::Named(name) => match name.as_str() {
+                    "NaN" => Ok(f32::NAN),
+                    "inf" => Ok(f32::INFINITY),
+                    "-inf" => Ok(f32::NEG_INFINITY),
+                    other => Err(serde::de::Error::custom(format!(
+                        "unrecognised value {other:?}"
+                    ))),
+                },
+            })
+            .collect()
+    }
 }
 
 impl TensorValue {
@@ -314,6 +377,54 @@ impl Input for TensorOp {}
 
 #[cfg(test)]
 mod tests {
+    /// **The regression that cost three findings.**
+    ///
+    /// JSON has no `NaN` or infinity, so `serde_json` wrote them as `null` and reading them
+    /// back failed. Three real findings were saved to disk, none could be parsed, and triage
+    /// announced "a campaign that found nothing". A long run would have lost hundreds
+    /// silently.
+    #[test]
+    fn a_case_holding_non_finite_values_survives_a_json_round_trip() {
+        let case = TensorOp::reduce(
+            ReduceOp::Max,
+            TensorValue::new(
+                vec![2, 3],
+                vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, 1.5],
+            ),
+            1,
+        );
+
+        let json = serde_json::to_string(&case).expect("serialises");
+        let back: TensorOp = serde_json::from_str(&json).expect("must parse back");
+
+        let TensorOp::Reduce { arg, .. } = &back else {
+            unreachable!()
+        };
+        let values = arg.data();
+        assert!(values[0].is_nan(), "NaN did not survive");
+        assert_eq!(values[1], f32::INFINITY);
+        assert_eq!(values[2], f32::NEG_INFINITY);
+        // Signed zero must survive too: its sign is observable, and `0.0 == -0.0` would let a
+        // broken round trip pass unnoticed.
+        assert_eq!(values[3].to_bits(), 0.0f32.to_bits());
+        assert_eq!(values[4].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(values[5], 1.5);
+    }
+
+    /// Ordinary numbers stay ordinary in the file — a finding is read by people, and turning
+    /// every value into a string to solve a problem three of them have would be a poor trade.
+    #[test]
+    fn finite_values_are_still_written_as_numbers() {
+        let case = TensorOp::unary(UnaryOp::Neg, TensorValue::new(vec![2], vec![1.5, -2.5]));
+        let json = serde_json::to_string(&case).expect("serialises");
+
+        assert!(json.contains("1.5"), "{json}");
+        assert!(
+            !json.contains("\"1.5\""),
+            "finite values should not be quoted: {json}"
+        );
+    }
+
     use super::*;
 
     fn value(shape: &[usize]) -> TensorValue {

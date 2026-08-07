@@ -57,10 +57,32 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "findings".to_string());
 
-    let reports = load_all(&directory);
+    let (reports, unreadable) = load_all(&directory);
+
+    // **An unreadable report is a lost finding, and must never be reported as an absent
+    // one.** This printed "a campaign that found nothing" for three findings it had failed to
+    // parse — the most reassuring possible message for a data-loss bug. Saying so first, and
+    // loudly, is the fix that matters; the parse bug behind it was only the occasion.
+    if unreadable > 0 {
+        eprintln!(
+            "\n⚠ {unreadable} report(s) in {directory}/ could not be read — see the errors \
+             above.\n  These are findings that exist and are being ignored. Do not read what \
+             follows as a complete picture."
+        );
+    }
+
     if reports.is_empty() {
-        println!("no reports in {directory}/");
-        println!("  (a campaign that found nothing leaves none — that is a result, not a failure)");
+        if unreadable > 0 {
+            println!(
+                "\nno readable reports in {directory}/ — but {unreadable} exist and failed to parse"
+            );
+            println!("  THIS IS NOT A CLEAN RESULT. Fix the reader before drawing any conclusion.");
+        } else {
+            println!("no reports in {directory}/");
+            println!(
+                "  (a campaign that found nothing leaves none — that is a result, not a failure)"
+            );
+        }
         return;
     }
 
@@ -282,8 +304,13 @@ fn section(out: &mut String, signature: &str, group: &Group, known: Option<&'sta
 /// The recursion is written with an explicit stack rather than a recursive function — a
 /// findings tree is shallow, but a directory loop through a symlink is not something a
 /// triage tool should die on.
-fn load_all(directory: &str) -> Vec<(std::path::PathBuf, DivergenceReport<TensorOp>)> {
+/// Every readable report, **and how many were not**.
+///
+/// The count is returned rather than only logged, because a caller that receives just a list
+/// cannot tell an empty campaign from a broken reader — and will say the reassuring thing.
+fn load_all(directory: &str) -> (Vec<(std::path::PathBuf, DivergenceReport<TensorOp>)>, usize) {
     let mut reports = Vec::new();
+    let mut unreadable = 0usize;
     let mut pending = vec![std::path::PathBuf::from(directory)];
 
     while let Some(current) = pending.pop() {
@@ -299,13 +326,19 @@ fn load_all(directory: &str) -> Vec<(std::path::PathBuf, DivergenceReport<Tensor
                     Ok(report) => reports.push((path, report)),
                     // Named rather than silently skipped: an unreadable report is a lost
                     // finding, and losing one quietly is worse than failing loudly.
-                    Err(error) => eprintln!("could not read {}: {error}", path.display()),
+                    // **Counted as well as named** — printing an error and then returning a
+                    // list the caller reads as "nothing found" is how the loud failure became
+                    // a quiet one anyway.
+                    Err(error) => {
+                        eprintln!("could not read {}: {error}", path.display());
+                        unreadable += 1;
+                    }
                 }
             }
         }
     }
 
-    reports
+    (reports, unreadable)
 }
 
 /// Recompute a report's signature from its case, across every implementation.

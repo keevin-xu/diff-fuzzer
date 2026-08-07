@@ -259,23 +259,40 @@ impl Differential {
 
 fn load_findings(dir: &Path) -> Vec<TensorOp> {
     let mut out = Vec::new();
-    collect(dir, &mut out);
+    let mut unreadable = 0usize;
+    collect(dir, &mut out, &mut unreadable);
+
+    // **A finding that cannot be parsed is not a finding that does not exist.** Reporting
+    // "nothing to explain" for reports that failed to load is the same data-loss-as-success
+    // failure that `triage_findings` had; both are fixed, and both are loud.
+    if unreadable > 0 {
+        eprintln!(
+            "⚠ {unreadable} report(s) could not be read and are excluded. Every number below \
+             is computed from an incomplete set."
+        );
+    }
     out
 }
 
-fn collect(dir: &Path, out: &mut Vec<TensorOp>) {
+fn collect(dir: &Path, out: &mut Vec<TensorOp>, unreadable: &mut usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, out);
-        } else if path.extension().is_some_and(|e| e == "json")
-            && let Ok(report) = load_report::<TensorOp>(&path)
-        {
-            let report: DivergenceReport<TensorOp> = report;
-            out.push(report.input);
+            collect(&path, out, unreadable);
+        } else if path.extension().is_some_and(|e| e == "json") {
+            match load_report::<TensorOp>(&path) {
+                Ok(report) => {
+                    let report: DivergenceReport<TensorOp> = report;
+                    out.push(report.input);
+                }
+                Err(error) => {
+                    eprintln!("could not read {}: {error}", path.display());
+                    *unreadable += 1;
+                }
+            }
         }
     }
 }
