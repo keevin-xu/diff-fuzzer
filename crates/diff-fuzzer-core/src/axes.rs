@@ -28,6 +28,12 @@
 //! This trait is those three things and nothing else. Each domain lists its own axes; the
 //! description is derived here so it cannot drift from them.
 //!
+//! **A fourth thing, added when the second domain adopted it.** The derived description
+//! catches drift in *declared configuration* and is blind to drift in *generation logic* — a
+//! change to how a construct is chosen, touching no axis and no bound. See
+//! [`GenerationAxes::logic_version`], and note that the example which motivated this whole
+//! module is one the first version failed to catch.
+//!
 //! # The rule that is easiest to get wrong
 //!
 //! **Enabling an axis must add cases, never remove them.** The SQL adapter learned this by
@@ -62,6 +68,35 @@ pub trait GenerationAxes {
     /// hash map — because the derived description is compared verbatim.
     fn axes(&self) -> Vec<(&'static str, bool)>;
 
+    /// An identity for the generation **logic**, when the domain has one.
+    ///
+    /// # The gap this closes, found by the second domain adopting the trait
+    ///
+    /// [`Self::description`] catches drift in *declared configuration* — an axis flipped, a
+    /// bound changed. It cannot catch drift in *generation logic*, and the trait's own
+    /// motivating example is one it misses.
+    ///
+    /// The SQL adapter's joins-versus-ordering fix made joins probabilistic at 60% rather
+    /// than unconditional. That materially changed the distribution and touched **no axis and
+    /// no scalar**, so the derived description before and after is byte-identical. Two runs
+    /// either side of it would have been treated as comparable, which is exactly the confound
+    /// this module claims to prevent.
+    ///
+    /// So there are two kinds of drift and they need two instruments:
+    ///
+    /// | drift in | caught by |
+    /// |---|---|
+    /// | declared configuration | the derived description |
+    /// | generation logic | this hook |
+    ///
+    /// **`None` by default, and that default is a claim worth making deliberately:** a domain
+    /// returning `None` is saying its generation logic never changes in ways that matter, or
+    /// that it accepts old corpora being silently reinterpreted. Neither is usually true for
+    /// long. A hash of the generator's own source is the cheap implementation.
+    fn logic_version(&self) -> Option<String> {
+        None
+    }
+
     /// Bounds that are not on/off, rendered for the description.
     ///
     /// Magnitudes, dimensions, row counts: the numbers that change what is generated without
@@ -83,6 +118,10 @@ pub trait GenerationAxes {
         }
         for (name, value) in self.scalars() {
             parts.push(format!("{name}={value}"));
+        }
+        // Last, so a domain without one produces exactly what it did before this hook existed.
+        if let Some(version) = self.logic_version() {
+            parts.push(format!("logic={version}"));
         }
         parts.join(" ")
     }
@@ -173,6 +212,43 @@ mod tests {
     }
 
     /// The description is compared verbatim, so its order must not wobble between calls.
+    struct Versioned {
+        logic: &'static str,
+    }
+
+    impl GenerationAxes for Versioned {
+        fn axes(&self) -> Vec<(&'static str, bool)> {
+            vec![("joins", true)]
+        }
+        fn logic_version(&self) -> Option<String> {
+            Some(self.logic.to_string())
+        }
+    }
+
+    /// **The gap the second domain found.** Identical axes and scalars, different generation
+    /// logic: without this hook the two are indistinguishable, and a corpus from one would be
+    /// silently reused against the other.
+    #[test]
+    fn a_logic_change_alone_changes_the_description() {
+        let before = Versioned { logic: "a1b2c3d4" };
+        let after = Versioned { logic: "9f8e7d6c" };
+
+        assert_eq!(
+            before.axes(),
+            after.axes(),
+            "premise: the declared config is identical"
+        );
+        assert_ne!(before.description(), after.description());
+        assert!(!before.comparable_with(&after));
+    }
+
+    /// A domain without a logic version produces exactly what it did before the hook existed,
+    /// so adopting it is not a breaking change for the domain that does not need it.
+    #[test]
+    fn omitting_a_logic_version_leaves_the_description_unchanged() {
+        assert!(!config().description().contains("logic="));
+    }
+
     #[test]
     fn the_description_is_stable_across_calls() {
         let c = config();
