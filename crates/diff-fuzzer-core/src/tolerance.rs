@@ -40,6 +40,36 @@ impl Tolerance {
     /// and for tests that need to prove a comparison is not silently permissive.
     pub const EXACT: Self = Self::new(0.0, 0.0);
 
+    /// A relative bound at or above this accepts a completely wrong answer.
+    ///
+    /// At `rtol = 1.0` the test becomes `|a - b| <= max(|a|, |b|)`, which any two values of
+    /// the same sign satisfy — `1.0` against `2.0` passes, and so does `1.0` against
+    /// `1e30`. There is no scale at which that discriminates.
+    pub const VACUOUS_RTOL: f64 = 1.0;
+
+    /// An absolute bound at or above this accepts any pair of finite `f32` values.
+    ///
+    /// Two finite `f32`s differ by at most about `6.8e38`; `f32::MAX` is the point past
+    /// which an absolute allowance can no longer fail anything real.
+    pub const VACUOUS_ATOL: f64 = f32::MAX as f64;
+
+    /// **Is this bound so loose that nothing could fail it?**
+    ///
+    /// A per-case derivation can be correct and useless at the same time. `matmul` over
+    /// terms of `1e30` genuinely may cancel to anything within `±1e24`, so the derived
+    /// allowance really is that wide — and a comparison against it cannot distinguish a
+    /// defect from arithmetic.
+    ///
+    /// **Reporting such a case as agreement is a false pass**, and it was one at scale:
+    /// measured 2026-08-07, **96% of `matmul` cases and 65% of `softmax` cases** carried a
+    /// bound nothing could fail, and a six-hour campaign accordingly found nothing in
+    /// `softmax` — not because it agreed, but because it could not be judged and said
+    /// otherwise. The oracle now skips these, which is the same treatment an all-`NaN`
+    /// result already gets: an honest "no opinion" rather than a pass.
+    pub fn is_vacuous(self) -> bool {
+        self.rtol >= Self::VACUOUS_RTOL || self.atol >= Self::VACUOUS_ATOL
+    }
+
     /// Do these two values agree?
     ///
     /// The rule is `|a - b| <= atol + rtol * max(|a|, |b|)`.

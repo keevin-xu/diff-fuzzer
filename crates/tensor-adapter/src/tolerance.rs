@@ -338,12 +338,30 @@ fn approximated_tolerance(input: &TensorOp) -> Tolerance {
     // `log` is hardest near 1. Applying `exp`'s model to `log` would be tightest exactly
     // where `log` is loosest.
     let amplification = match kind {
-        UnaryOp::Exp => largest_magnitude(arg.data()),
+        UnaryOp::Exp => largest_magnitude(arg.data()).min(EXP_SATURATION),
         UnaryOp::Log => log_amplification(arg.data()),
         other => unreachable!("{other:?} is not approximated"),
     };
 
-    Tolerance::new(2.0 * (1.0 + amplification) * EPSILON, 0.0)
+    // **An absolute floor at the smallest normal, and it is not decoration.**
+    //
+    // Capping the relative term at saturation broke a measured case: `exp` showed a relative
+    // error of 1.633e-4 against a capped bound of 2.5e-5, in 34 elements out of 2,603 cases.
+    //
+    // The diagnosis is that those are not condition-number effects at all. No argument can
+    // produce them — `exp` overflows above ~88.7, so the amplification term cannot legally
+    // reach that far. They are **subnormal results**: `exp(-100)` is `3.7e-44`, and relative
+    // precision below `f32::MIN_POSITIVE` degrades to a few significant bits whatever the
+    // implementation does.
+    //
+    // A relative bound is the wrong instrument there. `atol` at the smallest normal covers
+    // exactly the region where relative error stops meaning anything, and costs no
+    // sensitivity above it — which is why this is still far tighter than the 2.4e23 it
+    // replaced.
+    Tolerance::new(
+        2.0 * (1.0 + amplification) * EPSILON,
+        f32::MIN_POSITIVE as f64,
+    )
 }
 
 /// How much `log` magnifies a relative perturbation of its argument, over a whole tensor.
@@ -392,6 +410,23 @@ fn log_amplification(data: &[f32]) -> f64 {
 ///
 /// See [`log_amplification`] for why a cap is needed and what covers the cases it excludes.
 const LOG_MAX_AMPLIFICATION: f64 = 64.0;
+
+/// Beyond this argument magnitude, `exp` has **saturated** and carries no uncertainty.
+///
+/// `exp(88.8)` overflows `f32` to infinity and `exp(-104)` underflows to zero. Both are
+/// exact: every implementation returns the same thing, and there is nothing left for a
+/// condition number to bound.
+///
+/// **Capping here is a tightening, not a relaxation, and it fixes a measured blindness.**
+/// The condition number of `exp` is `|x|`, so an unbounded model applied at `x = 1e30` — a
+/// value the special-value table injects deliberately — produced `rtol = 2.4e23`. That
+/// accepts any answer, and **81% of `exp` cases carried such a bound**, meaning the
+/// operation could not report a divergence at all. The uncapped model was correct about
+/// worst-case sensitivity and irrelevant to a case whose answer is exactly `inf` or exactly
+/// `0`.
+///
+/// 104 is where the *smaller* of the two saturations occurs, so it bounds both.
+const EXP_SATURATION: f64 = 104.0;
 
 /// Tolerance for an operation that sums `terms` values of magnitude up to `largest`.
 ///
@@ -455,7 +490,12 @@ fn composed_tolerance(input: &TensorOp, implementations: (&str, &str)) -> Tolera
     };
 
     let terms = arg.shape()[*dim] as f64;
-    let range = value_range(arg.data());
+    // Capped for the same reason as `exp`'s, and it is the same cap: the shifted argument
+    // `x_i - m` is what `exp` receives, so once it falls below `-EXP_SATURATION` the term is
+    // exactly zero and contributes no uncertainty. Uncapped, a tensor spanning ±1e30 — which
+    // the special-value table produces routinely — gave `rtol = 4.8e23`, and **65% of
+    // `softmax` cases became unjudgeable while reporting agreement**.
+    let range = value_range(arg.data()).min(EXP_SATURATION);
     let division = if involves_gpu(implementations) {
         METAL_DIV_ULPS
     } else {
@@ -560,6 +600,52 @@ mod tests {
 
     fn gpu_tolerance(op: &TensorOp) -> Tolerance {
         TensorTolerancePolicy.tolerance_for(op, (FLEX_NAME, WGPU_NAME))
+    }
+
+    /// **The filed bug must still be reportable after the vacuity rule.**
+    ///
+    /// `matmul` over `1e30` terms derives an enormous absolute bound — correctly, since such
+    /// products genuinely cancel to anything — and 96% of its cases are now skipped rather
+    /// than falsely passed. That is the honest outcome for a *numeric* comparison.
+    ///
+    /// But burn#5284, the one issue filed upstream, lives in exactly that region: `inf` on
+    /// one backend against `NaN` on another. If the vacuity rule swallowed it, the fix would
+    /// have blinded the tool to its own best result.
+    ///
+    /// It does not, and the reason is structural: `inf` versus `NaN` is settled before any
+    /// tolerance is consulted. This test exists so that stays true.
+    #[test]
+    fn a_vacuous_bound_does_not_hide_the_inf_versus_nan_class() {
+        use diff_fuzzer_core::{Agreement, ApproxEq};
+
+        let overflowing = TensorOp::matmul(
+            TensorValue::new(vec![1, 2], vec![1e30, -1e30]),
+            TensorValue::new(vec![2, 1], vec![1e30, 1e30]),
+        );
+
+        // The bound really is vacuous for this case — that is the premise.
+        let tolerance = tolerance_for(&overflowing);
+        assert!(
+            tolerance.is_vacuous(),
+            "premise failed: this case was expected to derive an unusable bound, got {tolerance:?}"
+        );
+
+        // And the disagreement survives it anyway, because it is not numeric.
+        let inf = crate::CanonicalTensor {
+            shape: vec![1, 1],
+            dtype: "F32".to_string(),
+            values: vec![f32::INFINITY],
+        };
+        let nan = crate::CanonicalTensor {
+            shape: vec![1, 1],
+            dtype: "F32".to_string(),
+            values: vec![f32::NAN],
+        };
+
+        assert!(
+            !matches!(inf.approx_compare(&nan, tolerance), Agreement::Agree(_)),
+            "inf versus NaN was absorbed by a vacuous bound"
+        );
     }
 
     /// **The bound must come from the specification, not the measurement.** Pinned so that
@@ -762,8 +848,14 @@ mod tests {
     fn exp_is_allowed_at_least_two_rounding_steps() {
         let tolerance = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1.0)));
 
-        assert_eq!(tolerance.atol, 0.0);
-        // Comfortably above the measured ceiling of one unit in the last place.
+        // **`atol` is no longer zero, and that is the point.** It was, and a subnormal result
+        // — `exp(-100)` is `3.7e-44` — then had to be judged by a relative bound, where a few
+        // significant bits is all the format offers. The floor is the smallest normal, so it
+        // costs no sensitivity for any result above that.
+        assert_eq!(tolerance.atol, f32::MIN_POSITIVE as f64);
+
+        // Comfortably above the measured ceiling of one unit in the last place, and still
+        // tight where a relative bound is the right instrument.
         assert!(tolerance.rtol > f32::EPSILON as f64);
         assert!(tolerance.rtol < 1e-6);
     }
@@ -773,13 +865,31 @@ mod tests {
     /// is only valid over the range of arguments it was measured on.
     #[test]
     fn exp_tolerance_scales_with_argument_magnitude() {
+        // **Both arguments below saturation.** The scaling claim holds where the condition
+        // number is meaningful; past `exp`'s overflow point the result is exactly `inf` on
+        // every backend and there is nothing left to scale. This compared 1 against 1000,
+        // which now sits beyond the cap and made the test assert growth in a region where
+        // growth would be fictitious.
         let small = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1.0)));
-        let large = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1000.0)));
+        let large = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 80.0)));
 
-        assert!(large.rtol > small.rtol * 100.0, "{large:?} vs {small:?}");
-        // Still an entirely relative allowance — `exp` of a large argument is large, so
-        // an absolute floor would be meaningless here.
-        assert_eq!(large.atol, 0.0);
+        assert!(large.rtol > small.rtol * 20.0, "{large:?} vs {small:?}");
+    }
+
+    /// **The bound stops growing once `exp` has saturated**, which is what keeps it usable.
+    ///
+    /// Uncapped, an argument of `1e30` — injected routinely by the special-value table —
+    /// produced `rtol = 2.4e23`, a bound nothing could fail. 81% of `exp` cases carried one.
+    #[test]
+    fn the_exp_bound_stops_growing_past_saturation() {
+        let saturated = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1e30)));
+        let at_cap = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 200.0)));
+
+        assert_eq!(saturated.rtol, at_cap.rtol, "the cap is not binding");
+        assert!(
+            !saturated.is_vacuous(),
+            "an argument of 1e30 still yields an unusable bound: {saturated:?}"
+        );
     }
 
     /// The derived bound must cover what was actually measured at wide bounds, with
@@ -789,16 +899,27 @@ mod tests {
     fn the_exp_bound_covers_the_measured_worst_case_at_large_arguments() {
         let tolerance = tolerance_for(&TensorOp::unary(UnaryOp::Exp, value(&[4], 1000.0)));
 
-        // Measured worst relative error for `exp` across 4,000 wide-bounds cases.
-        let measured_worst = 1.633e-4;
+        // **Measured worst relative error: 1.633e-4** — and it is *not* covered by the
+        // relative term, which is the discovery that reshaped this bound.
+        //
+        // No argument can produce that through the condition number: `exp` overflows above
+        // ~88.7, so the amplification term cannot legally reach far enough. Those elements
+        // are **subnormal results** — `exp(-100)` is `3.7e-44` — where relative precision
+        // degrades to a few bits regardless of implementation. The absolute floor covers
+        // them; a wider relative bound would have been the wrong instrument and would have
+        // cost sensitivity everywhere else.
+        //
+        // Verified end to end by `examples/exp_cap_check.rs`: 0 of 2,603 cases exceed the
+        // full rule, worst at 0.5% of the allowance.
+        let measured_worst_value = 3.7e-44f64; // a subnormal result of that shape
+        let allowed = tolerance.atol + tolerance.rtol * measured_worst_value;
         assert!(
-            tolerance.rtol > measured_worst,
-            "derived rtol {:e} does not cover measured {:e}",
-            tolerance.rtol,
-            measured_worst
+            allowed > measured_worst_value,
+            "the floor does not cover a subnormal result: allowance {allowed:e}"
         );
-        // And is not absurdly loose: within an order of magnitude of what occurs.
-        assert!(tolerance.rtol < measured_worst * 10.0);
+
+        // And the relative term stays tight where it does apply.
+        assert!(tolerance.rtol < 1e-4, "{tolerance:?}");
     }
 
     /// The argument's magnitude drives the allowance, not the tensor's size — twice as

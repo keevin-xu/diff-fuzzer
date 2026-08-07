@@ -150,7 +150,9 @@ pub trait Oracle {
 ///
 /// These categories come from practice rather than guesswork: the first three were each
 /// discovered by hitting them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` was dropped when `Unjudgeable` gained `f64` fields: floats are not `Eq`, and a skip
+// reason carrying the bound that made a case unjudgeable is worth more than the trait.
+#[derive(Debug, Clone, PartialEq)]
 pub enum SkipReason {
     /// Fewer than two results survived, so there was nothing to compare against.
     TooFewResults { available: usize },
@@ -169,6 +171,20 @@ pub enum SkipReason {
     /// what it is: a case that went unjudged.
     NothingComparable { elements: usize },
 
+    /// The derived tolerance is too loose to discriminate, so the case cannot be judged.
+    ///
+    /// **A bound wide enough to accept any answer is not a passing grade.** Tolerances here
+    /// are derived per case from the operation and its values, and for some inputs the
+    /// derivation is correct and useless at the same time: a `matmul` whose terms are `1e30`
+    /// can cancel to anything within `±1e24`, and no comparison can tell a defect from
+    /// arithmetic.
+    ///
+    /// Reporting those as `Agree` is a false pass, and it was: measured 2026-08-07, **96% of
+    /// `matmul` cases and 65% of `softmax` cases** carried a bound that nothing could fail.
+    /// Six hours of fuzzing found nothing in `softmax` for that reason — not because it
+    /// agreed, but because it could not be judged and said otherwise.
+    Unjudgeable { rtol: f64, atol: f64 },
+
     /// The operation is known to vary legitimately, so a difference here would not be a
     /// bug.
     ///
@@ -184,6 +200,11 @@ impl std::fmt::Display for SkipReason {
             SkipReason::TooFewResults { available } => {
                 write!(f, "need at least two results to compare, got {available}")
             }
+            SkipReason::Unjudgeable { rtol, atol } => write!(
+                f,
+                "the derived tolerance (rtol {rtol:.2e}, atol {atol:.2e}) accepts any answer, \
+                 so this case cannot be judged"
+            ),
             SkipReason::CouldNotRun { failures } => {
                 write!(f, "could not run: {}", failures.join("; "))
             }
@@ -200,7 +221,9 @@ impl std::fmt::Display for SkipReason {
 }
 
 /// An oracle's judgement on one test case.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: `SkipReason::Unjudgeable` carries the bound that made a case unjudgeable, and
+// floats are not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     /// The results are consistent, **and something was actually checked**. The
     /// overwhelmingly common outcome.

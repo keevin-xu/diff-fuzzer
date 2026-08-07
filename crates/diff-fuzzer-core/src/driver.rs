@@ -14,7 +14,8 @@ use crate::runner::Runner;
 use crate::traits::{Generator, NamedOutput, Oracle, SkipReason, Verdict};
 
 /// What one test case produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq` — it holds a `Verdict`, which now carries a float bound. See `SkipReason`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunOutcome {
     /// The seed this case came from. Carried because it is the whole of what someone
     /// else needs to reproduce the run — a verdict without it cannot be acted on.

@@ -90,6 +90,10 @@ where
         // groups rather than as a list of pairs.
         let mut agrees: Vec<Vec<bool>> = vec![vec![false; outputs.len()]; outputs.len()];
 
+        // Pairs whose derived bound was too loose to discriminate. Kept separately from
+        // agreement for the same reason licensed pairs are: nothing was learned.
+        let mut unjudgeable: Vec<Tolerance> = Vec::new();
+
         for left in 0..outputs.len() {
             agrees[left][left] = true;
             for right in (left + 1)..outputs.len() {
@@ -113,7 +117,19 @@ where
                     .policy
                     .tolerance_for(input, (&a.implementation, &b.implementation));
                 worst_tolerance = Some(tolerance);
+
                 match a.output.approx_compare(&b.output, tolerance) {
+                    // **A bound that accepts any answer is not a passing grade** — but the
+                    // check belongs *here*, on the agreement path, and nowhere else.
+                    //
+                    // A vacuous tolerance can only manufacture false agreement; it can never
+                    // manufacture disagreement. Testing it before the comparison would have
+                    // swallowed structural differences too, which must survive any tolerance
+                    // however wide — results of different shapes disagree about what the
+                    // operation produced, not by how much. A test caught exactly that.
+                    Agreement::Agree(_) if tolerance.is_vacuous() => {
+                        unjudgeable.push(tolerance);
+                    }
                     Agreement::Agree(comparison) => {
                         agrees[left][right] = true;
                         agrees[right][left] = true;
@@ -149,6 +165,15 @@ where
             if !licensed.is_empty() {
                 let (class, detail) = licensed.remove(0);
                 return Verdict::Skipped(SkipReason::KnownLegal { class, detail });
+            }
+
+            // Same reasoning as a licensed pair, one step further: the comparison was not
+            // declined by policy, it was attempted and found incapable of an answer.
+            if let Some(tolerance) = unjudgeable.first() {
+                return Verdict::Skipped(SkipReason::Unjudgeable {
+                    rtol: tolerance.rtol,
+                    atol: tolerance.atol,
+                });
             }
 
             return if examined_arithmetic {
@@ -499,6 +524,47 @@ mod tests {
             check_with(Tolerance::new(1e-5, 1e-8), &outputs),
             Verdict::Diverged(_)
         ));
+    }
+
+    /// **A bound nothing could fail is a skip, not a pass.**
+    ///
+    /// The failure this prevents was measured, not imagined: 96% of `matmul` cases and 65%
+    /// of `softmax` cases carried a derived bound that accepted any answer, and a six-hour
+    /// campaign reported nothing wrong with `softmax` as a result.
+    #[test]
+    fn a_vacuous_tolerance_yields_a_skip_rather_than_agreement() {
+        let outputs = [output("a", vec![1.0]), output("b", vec![2.0])];
+
+        // These two disagree by 100%, and this bound accepts it.
+        let verdict = check_with(Tolerance::new(1e6, 0.0), &outputs);
+
+        match verdict {
+            Verdict::Skipped(SkipReason::Unjudgeable { rtol, .. }) => assert_eq!(rtol, 1e6),
+            other => panic!("a bound that accepts anything reported {other:?}"),
+        }
+    }
+
+    /// The threshold is a property of the bound, not of the values: a bound just under it
+    /// still judges normally.
+    #[test]
+    fn a_merely_loose_tolerance_still_judges() {
+        let outputs = [output("a", vec![1.0]), output("b", vec![1.0])];
+        let verdict = check_with(Tolerance::new(0.5, 0.0), &outputs);
+
+        assert!(matches!(verdict, Verdict::Agree), "{verdict:?}");
+    }
+
+    /// **A vacuous bound must not suppress a real disagreement**, only a false agreement.
+    /// Two results of different shapes disagree structurally, and no width excuses that.
+    #[test]
+    fn a_vacuous_tolerance_does_not_hide_a_structural_difference() {
+        let outputs = [output("a", vec![1.0]), output("b", vec![1.0, 2.0])];
+        let verdict = check_with(Tolerance::new(1e30, 1e30), &outputs);
+
+        assert!(
+            matches!(verdict, Verdict::Diverged(_)),
+            "a vacuous bound swallowed a structural difference: {verdict:?}"
+        );
     }
 
     /// Structural disagreement must survive *any* tolerance. Results of different sizes
