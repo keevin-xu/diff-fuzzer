@@ -28,7 +28,10 @@ use serde::{Deserialize, Serialize};
 /// on IEEE 754 binary64 by affinity), while DuckDB has both natively. Generating either
 /// would produce differences on *every* such cell that are about representation rather
 /// than about correctness. See `SPECS.md` §4.1–4.2 and `POLICY.md` §3.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Hash` is derived so a cell can be a **group key** in the grouped-TLP check, which buckets
+// result rows by their `GROUP BY` value. Deriving it alongside `Eq` keeps the two consistent:
+// Rust requires that `a == b` implies equal hashes, and a hand-written `Hash` could drift.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Cell {
     /// SQL's `NULL` — distinct from every other value *and from itself* in SQL's own
     /// three-valued logic. Here it is an ordinary variant that compares equal to another

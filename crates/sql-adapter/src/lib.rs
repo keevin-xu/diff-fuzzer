@@ -45,6 +45,8 @@ pub mod backends;
 pub mod driver;
 /// Turning an engine's complaint into a class, so wording is never compared.
 pub mod errors;
+/// Properties of a case a trigger rule might key on — the domain-specific vocabulary.
+pub mod features;
 /// Generating the query, against a schema and data that already exist.
 pub mod gen_query;
 /// Generating the state a query runs against: tables, and the rows in them.
@@ -53,38 +55,36 @@ pub mod gen_schema;
 pub mod generator;
 /// Differences the engines are documented to have, which are therefore not bugs.
 pub mod known;
-/// Turning what an engine returned into a comparable canonical form.
-pub mod normalize;
-/// Properties of a case a trigger rule might key on — the domain-specific vocabulary.
-pub mod features;
 /// Checking one engine against itself — the class a differential oracle cannot reach.
 pub mod metamorphic;
 /// Copied from `tensor-adapter` — see `PENDING` 1.1 for the edit cost.
 pub mod negatives;
+/// Turning what an engine returned into a comparable canonical form.
+pub mod normalize;
 /// Deciding whether the engines disagreed.
 pub mod oracle;
-/// Copied verbatim from `tensor-adapter`.
-pub mod predicate;
-/// Copied verbatim from `tensor-adapter`.
-pub mod search;
-/// Copied verbatim from `tensor-adapter`.
-pub mod validation;
 /// Whether a query's `ORDER BY` actually orders the rows of this case.
 pub mod ordering;
 /// What running a case produces: rows, or a refusal.
 pub mod outcome;
+/// Copied verbatim from `tensor-adapter`.
+pub mod predicate;
 /// Turning the tree into SQL text, once per engine.
 pub mod render;
 /// What a finding is, on disk.
 pub mod report;
 /// The typed tree a case is made of: types, tables, values, expressions, one query.
 pub mod schema;
+/// Copied verbatim from `tensor-adapter`.
+pub mod search;
 /// Making a failing case small enough to look at.
 pub mod shrink;
 /// When two findings are the same problem.
 pub mod signature;
 /// An engine that is wrong on purpose, so "found nothing" can mean something.
 pub mod testing;
+/// Copied verbatim from `tensor-adapter`.
+pub mod validation;
 
 /// Where this domain's outputs live, relative to the repository root.
 ///

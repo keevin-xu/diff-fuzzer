@@ -626,7 +626,6 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     /// A case carrying `value` in its first cell — enough to make two cases distinguishable,
     /// which is all these tests need.

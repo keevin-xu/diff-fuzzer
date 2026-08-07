@@ -103,8 +103,8 @@ fn mask(names: &[&str]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::extract;
     use crate::ast::SqlCase;
+    use crate::features::extract;
 
     /// A case with a `NULL` in its data, whose features are known.
     ///

@@ -31,8 +31,8 @@
 //! - [`Outcome::Inconclusive`] — a few matched, too few to distinguish a real rate from
 //!   noise. Reported rather than rounded to one of the verdicts above.
 
-use crate::features::extract;
 use crate::ast::SqlCase;
+use crate::features::extract;
 use crate::predicate::Predicate;
 use diff_fuzzer_core::{Generator, SeededRng};
 
@@ -253,8 +253,12 @@ mod tests {
     #[test]
     fn the_same_seed_gives_the_same_result() {
         let predicate = Predicate::new(&[], &["outer_join_present"]);
-        let first = validate(predicate, &generator(), 99, 200, |case: &SqlCase| case.query.filter.is_some());
-        let second = validate(predicate, &generator(), 99, 200, |case: &SqlCase| case.query.filter.is_some());
+        let first = validate(predicate, &generator(), 99, 200, |case: &SqlCase| {
+            case.query.filter.is_some()
+        });
+        let second = validate(predicate, &generator(), 99, 200, |case: &SqlCase| {
+            case.query.filter.is_some()
+        });
 
         assert_eq!(first, second);
     }
@@ -264,8 +268,12 @@ mod tests {
     #[test]
     fn a_different_seed_explores_different_cases() {
         let predicate = Predicate::new(&[], &["outer_join_present"]);
-        let first = validate(predicate, &generator(), 1, 200, |case: &SqlCase| case.query.filter.is_some());
-        let second = validate(predicate, &generator(), 2, 200, |case: &SqlCase| case.query.filter.is_some());
+        let first = validate(predicate, &generator(), 1, 200, |case: &SqlCase| {
+            case.query.filter.is_some()
+        });
+        let second = validate(predicate, &generator(), 2, 200, |case: &SqlCase| {
+            case.query.filter.is_some()
+        });
 
         assert_ne!(
             (first.matched, first.diverged),

@@ -32,8 +32,8 @@
 //! informative thing this tool emits, because it is the one output that points at its own
 //! blind spot. It is never silently dropped.
 
-use crate::features::{FEATURES, FeatureVec, extract};
 use crate::ast::SqlCase;
+use crate::features::{FEATURES, FeatureVec, extract};
 use crate::negatives::{Pool, Source};
 use crate::predicate::Predicate;
 
@@ -257,7 +257,7 @@ mod tests {
     }
 
     use super::*;
-    
+
     use crate::negatives::{Negative, Provenance};
 
     /// A case with a `NULL` in its data, whose features are known.
@@ -419,10 +419,7 @@ mod tests {
     #[test]
     fn the_covering_loop_finds_several_classes_without_double_counting() {
         // Two distinct kinds of finding, separable from the negative by different features.
-        let findings = vec![
-            overflowing(),
-            case_with_null(),
-        ];
+        let findings = vec![overflowing(), case_with_null()];
         let negatives = pool(vec![(benign(), Source::Ordinary)]);
 
         let result = search(&findings, &negatives);

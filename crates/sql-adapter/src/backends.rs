@@ -264,6 +264,19 @@ fn duckdb_cell(value: duckdb::types::Value) -> Result<Cell, RunError> {
         Value::HugeInt(number) => i64::try_from(number)
             .map(Cell::Integer)
             .map_err(|_| unrepresentable(DUCKDB_NAME, Value::HugeInt(number))),
+        // **A boolean is read as `0`/`1`, matching what SQLite returns for the same
+        // expression.** Needed by NoREC, which projects a predicate rather than filtering on
+        // it, and is the only way a boolean can reach this reader.
+        //
+        // **The hazard, stated because it is real:** `SPECS.md` §4.1 records that DuckDB has a
+        // native `BOOLEAN` while SQLite stores `0`/`1`, and this mapping makes the two
+        // indistinguishable. That is *correct* for an expression result — `true` and `1` denote
+        // the same value — and it would be *wrong* for a `BOOLEAN` **column**, where the
+        // difference in representation is exactly what §4.1 says to avoid. Safe today only
+        // because `BOOLEAN` columns are never generated (`POLICY.md` §3). **If that changes,
+        // this mapping has to be revisited before the columns are switched on**, or the
+        // differential oracle will silently stop seeing a difference it was built to notice.
+        Value::Boolean(flag) => Ok(Cell::Integer(i64::from(flag))),
         Value::Text(text) => Ok(Cell::Text(text)),
         other => Err(unrepresentable(DUCKDB_NAME, other)),
     }
