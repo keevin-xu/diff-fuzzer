@@ -134,6 +134,43 @@ mod tests {
         )
     }
 
+    /// **A backend getting the broadcast output shape wrong must read as a divergence, not be
+    /// absorbed.** Broadcasting is the first feature where two backends could plausibly
+    /// disagree about the *shape* of a result rather than its values — one stretching an axis
+    /// and another failing to — so the phase confirms the existing structural rule covers it
+    /// rather than assuming so.
+    ///
+    /// The widest tolerance in the codebase is used deliberately: no amount of numeric
+    /// slack may ever excuse a shape difference.
+    #[test]
+    fn a_disagreement_about_the_broadcast_output_shape_is_structural() {
+        // What `[3,1] + [3,4]` should produce, against a backend that failed to stretch.
+        let stretched = CanonicalTensor {
+            shape: vec![3, 4],
+            dtype: "F32".to_string(),
+            values: vec![0.0; 12],
+        };
+        let unstretched = CanonicalTensor {
+            shape: vec![3, 1],
+            dtype: "F32".to_string(),
+            values: vec![0.0; 3],
+        };
+
+        let generous = Tolerance {
+            rtol: 1.0,
+            atol: 1e30,
+        };
+        match stretched.approx_compare(&unstretched, generous) {
+            Agreement::Structural { reason } => {
+                assert!(
+                    reason.contains("shapes differ"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("a shape disagreement was absorbed as {other:?}"),
+        }
+    }
+
     #[test]
     fn normalizing_keeps_shape_dtype_and_values() {
         let out = flex().run(&case()).unwrap();

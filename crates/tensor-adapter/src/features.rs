@@ -28,7 +28,7 @@ use crate::input::{TensorOp, TensorValue};
 /// Seventeen features: eight describing *values*, nine describing *shape*. The split
 /// matters because they answer different questions — what the numbers are, versus which
 /// kernel the shape will select.
-pub const FEATURES: [&str; 17] = [
+pub const FEATURES: [&str; 20] = [
     // --- value features: standard floating-point failure modes ---
     "overflow_product",
     "mixed_sign_overflow",
@@ -48,7 +48,24 @@ pub const FEATURES: [&str; 17] = [
     "all_same_sign",
     "m_not_multiple_of_tile",
     "n_not_multiple_of_tile",
+    // --- broadcast features (PHASE-7C): which shape-inference path an elementwise case
+    //     takes. Added *before* any broadcast findings exist, so they cannot be fitted to
+    //     what they will be scored on — the condition every previous search here has failed.
+    "broadcast_present",
+    "broadcast_whole_operand",
+    "broadcast_both_operands",
 ];
+
+/// A compile-time guard on the vocabulary size.
+///
+/// `FeatureVec` is a `u32`, so bit 32 would silently shift out and every predicate mentioning
+/// it would match nothing while looking perfectly reasonable. Widening to `u64` is a
+/// deliberate decision — the search space doubles per bit — and must be made on purpose
+/// rather than discovered from a rule that mysteriously never fires.
+const _: () = assert!(
+    FEATURES.len() <= 32,
+    "FEATURES exceeds the bits in FeatureVec; widen it to u64 deliberately"
+);
 
 /// One case's features, one bit each.
 ///
@@ -260,6 +277,38 @@ fn accumulation_features(values: &[f32], features: &mut FeatureVec) {
 }
 
 /// Properties of the shape — proxies for which kernel the backend will select.
+/// Which broadcasting an elementwise case does, if any.
+///
+/// Separate from `degenerate_dim`, which fires whenever *any* operand has an extent of 1 —
+/// including when both do and nothing stretches. These say something narrower and more
+/// useful: that a backend had to **reuse** an operand's elements, which is a different code
+/// path from an ordinary elementwise loop.
+fn broadcast_features(case: &TensorOp, features: &mut FeatureVec) {
+    let TensorOp::Binary { lhs, rhs, .. } = case else {
+        return;
+    };
+    let Some(result) = crate::ops::broadcast::result_shape(lhs.shape(), rhs.shape()) else {
+        return;
+    };
+
+    let lhs_stretches = lhs.shape() != result.as_slice();
+    let rhs_stretches = rhs.shape() != result.as_slice();
+
+    if lhs_stretches || rhs_stretches {
+        features.set("broadcast_present");
+    }
+    // One operand is a single element stretched across the whole result — the extreme case,
+    // and the one most likely to take a scalar fast path rather than a general one.
+    if (lhs_stretches && lhs.data().len() == 1) || (rhs_stretches && rhs.data().len() == 1) {
+        features.set("broadcast_whole_operand");
+    }
+    // Both sides stretch, on different axes — neither operand has the result's shape, so no
+    // backend can simply loop over one of them.
+    if lhs_stretches && rhs_stretches {
+        features.set("broadcast_both_operands");
+    }
+}
+
 fn shape_features(case: &TensorOp, features: &mut FeatureVec) {
     let operands = operands(case);
     if operands.iter().any(|o| o.rank() >= 3) {
@@ -268,6 +317,8 @@ fn shape_features(case: &TensorOp, features: &mut FeatureVec) {
     if operands.iter().any(|o| o.shape().contains(&1)) {
         features.set("degenerate_dim");
     }
+
+    broadcast_features(case, features);
 
     let TensorOp::Matmul { lhs, rhs } = case else {
         return;
@@ -312,6 +363,51 @@ fn operands(case: &TensorOp) -> Vec<&TensorValue> {
 
 #[cfg(test)]
 mod tests {
+    /// The three broadcast features, on cases built to isolate each.
+    #[test]
+    fn broadcast_features_distinguish_the_shape_of_the_stretch() {
+        use crate::input::BinaryOp;
+
+        let build = |ls: &[usize], rs: &[usize]| {
+            let l = TensorValue::new(ls.to_vec(), vec![1.0; ls.iter().product()]);
+            let r = TensorValue::new(rs.to_vec(), vec![1.0; rs.iter().product()]);
+            extract(&TensorOp::binary(BinaryOp::Add, l, r))
+        };
+
+        // No stretch: equal shapes.
+        let equal = build(&[3, 4], &[3, 4]);
+        assert!(!equal.has("broadcast_present"));
+
+        // One axis stretched on one side.
+        let one_axis = build(&[3, 1], &[3, 4]);
+        assert!(one_axis.has("broadcast_present"));
+        assert!(!one_axis.has("broadcast_whole_operand"));
+        assert!(!one_axis.has("broadcast_both_operands"));
+
+        // A single element stretched across the whole result.
+        let scalar = build(&[1, 1], &[3, 4]);
+        assert!(scalar.has("broadcast_present"));
+        assert!(scalar.has("broadcast_whole_operand"));
+
+        // Both sides stretch, on different axes — neither operand has the result's shape.
+        let both = build(&[3, 1], &[1, 4]);
+        assert!(both.has("broadcast_present"));
+        assert!(both.has("broadcast_both_operands"));
+        assert!(!both.has("broadcast_whole_operand"));
+    }
+
+    /// **`degenerate_dim` is not a broadcast test**, and conflating them would make the new
+    /// features redundant. A `[3,1] + [3,1]` case has an extent of 1 and stretches nothing.
+    #[test]
+    fn an_extent_of_one_on_both_sides_is_not_broadcasting() {
+        use crate::input::BinaryOp;
+        let v = |s: &[usize]| TensorValue::new(s.to_vec(), vec![1.0; s.iter().product()]);
+        let features = extract(&TensorOp::binary(BinaryOp::Add, v(&[3, 1]), v(&[3, 1])));
+
+        assert!(features.has("degenerate_dim"));
+        assert!(!features.has("broadcast_present"));
+    }
+
     use super::*;
     use crate::input::UnaryOp;
 
