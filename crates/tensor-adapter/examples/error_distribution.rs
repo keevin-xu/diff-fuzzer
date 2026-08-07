@@ -69,6 +69,17 @@ fn main() {
 
     let generator = TensorOpGenerator::new(bounds);
     let (cpu, torch) = (flex(), libtorch());
+
+    // One pair, deliberately: this measures how far two CPU implementations drift, which is
+    // the evidence the tolerance policy was derived from. A third backend would mix hardware
+    // classes into one distribution and make the answer meaningless — but it does mean a
+    // GPU-outlier disagreement is invisible here. `triage_findings` compares every pair.
+    println!(
+        "measuring the {} vs {} pair only\n",
+        cpu.name(),
+        torch.name()
+    );
+
     let mut per_operation: BTreeMap<&str, Errors> = BTreeMap::new();
 
     for seed in 0..cases {

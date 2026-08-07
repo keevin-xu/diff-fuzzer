@@ -12,14 +12,19 @@ use tensor_adapter::search;
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: search_check <dir>");
     let mut findings: Vec<TensorOp> = Vec::new();
-    collect(Path::new(&dir), &mut findings);
+    let mut observed: Vec<String> = Vec::new();
+    collect(Path::new(&dir), &mut findings, &mut observed);
+    observed.sort();
+    observed.dedup();
     println!("{} findings loaded from {dir}", findings.len());
 
     let all = negatives::load(tensor_adapter::NEGATIVES_ROOT);
-    let context = SamplingContext::new(
-        negatives::FUZZER_GENERATOR,
-        &[tensor_adapter::FLEX_NAME, tensor_adapter::LIBTORCH_NAME],
-    );
+    // **Read from the findings, not assumed** — the same fix `propose_predicates` needed.
+    // A hardcoded pair asks for a pool that a three-backend campaign never produced, and the
+    // refusal reads as missing data rather than as a stale constant.
+    let backends: Vec<&str> = observed.iter().map(String::as_str).collect();
+    println!("findings were observed on {backends:?}");
+    let context = SamplingContext::new(negatives::FUZZER_GENERATOR, &backends);
     let pool = match Pool::matched(all, &context) {
         Ok(p) => p,
         Err(e) => {
@@ -46,18 +51,19 @@ fn main() {
     );
 }
 
-fn collect(dir: &Path, out: &mut Vec<TensorOp>) {
+fn collect(dir: &Path, out: &mut Vec<TensorOp>, observed: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, out);
+            collect(&path, out, observed);
         } else if path.extension().is_some_and(|e| e == "json")
             && let Ok(report) = load_report::<TensorOp>(&path)
         {
             let report: DivergenceReport<TensorOp> = report;
+            observed.extend(report.outputs.iter().map(|(name, _)| name.clone()));
             out.push(report.input);
         }
     }

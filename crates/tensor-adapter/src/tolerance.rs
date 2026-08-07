@@ -538,6 +538,7 @@ fn largest_magnitude(values: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{FLEX_NAME, LIBTORCH_NAME, WGPU_NAME};
     use crate::input::{BinaryOp, ReduceOp, TensorValue, UnaryOp};
 
     fn value(shape: &[usize], fill: f32) -> TensorValue {
@@ -548,11 +549,17 @@ mod tests {
     fn tolerance_for(op: &TensorOp) -> Tolerance {
         // The CPU pair: these tests state what the *specification* requires of conforming
         // implementations, which is the bound before any hardware-specific relaxation.
-        TensorTolerancePolicy.tolerance_for(op, ("burn-ndarray", "burn-tch"))
+        //
+        // **Named by constant, not by literal.** These said `"burn-ndarray"` — a backend
+        // removed at PHASE-7A — for three phases, and passed the whole time, because the
+        // policy only inspects a name to decide whether it is a GPU and `"burn-ndarray"`
+        // correctly is not one. Right by accident, while asserting about something that no
+        // longer existed. A constant cannot go stale that way.
+        TensorTolerancePolicy.tolerance_for(op, (FLEX_NAME, LIBTORCH_NAME))
     }
 
     fn gpu_tolerance(op: &TensorOp) -> Tolerance {
-        TensorTolerancePolicy.tolerance_for(op, ("burn-ndarray", "burn-wgpu"))
+        TensorTolerancePolicy.tolerance_for(op, (FLEX_NAME, WGPU_NAME))
     }
 
     /// **The bound must come from the specification, not the measurement.** Pinned so that
@@ -614,7 +621,7 @@ mod tests {
         let op = TensorOp::binary(BinaryOp::Div, value(&[4], 1.0), value(&[4], 2.0));
 
         assert_eq!(
-            TensorTolerancePolicy.tolerance_for(&op, ("burn-ndarray", "burn-tch")),
+            TensorTolerancePolicy.tolerance_for(&op, (FLEX_NAME, LIBTORCH_NAME)),
             Tolerance::EXACT
         );
     }
@@ -655,7 +662,7 @@ mod tests {
         let op = TensorOp::binary(BinaryOp::Add, value(&[4], 1.0), value(&[4], 2.0));
 
         assert_eq!(
-            TensorTolerancePolicy.tolerance_for(&op, ("burn-ndarray", "burn-tch")),
+            TensorTolerancePolicy.tolerance_for(&op, (FLEX_NAME, LIBTORCH_NAME)),
             Tolerance::EXACT
         );
     }
@@ -665,7 +672,7 @@ mod tests {
     fn a_subnormal_input_against_the_gpu_is_licensed() {
         let op = TensorOp::unary(UnaryOp::Sqrt, value(&[2], 1e-45));
 
-        let licensed = TensorTolerancePolicy.known_legal(&op, ("burn-ndarray", "burn-wgpu"));
+        let licensed = TensorTolerancePolicy.known_legal(&op, (FLEX_NAME, WGPU_NAME));
         let (class, detail) = licensed.expect("Metal §8.1 permits flushing a denormal input");
 
         assert!(class.contains("subnormal"));
@@ -684,7 +691,7 @@ mod tests {
 
         assert!(
             TensorTolerancePolicy
-                .known_legal(&op, ("burn-ndarray", "burn-tch"))
+                .known_legal(&op, (FLEX_NAME, LIBTORCH_NAME))
                 .is_none()
         );
     }
@@ -697,7 +704,7 @@ mod tests {
 
         assert!(
             TensorTolerancePolicy
-                .known_legal(&op, ("burn-ndarray", "burn-wgpu"))
+                .known_legal(&op, (FLEX_NAME, WGPU_NAME))
                 .is_none()
         );
     }
@@ -710,7 +717,7 @@ mod tests {
 
         assert!(
             TensorTolerancePolicy
-                .known_legal(&op, ("burn-ndarray", "burn-wgpu"))
+                .known_legal(&op, (FLEX_NAME, WGPU_NAME))
                 .is_none()
         );
     }

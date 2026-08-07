@@ -75,6 +75,22 @@ fn main() {
     let (cpu, torch) = (flex(), libtorch());
     let policy = TensorTolerancePolicy;
 
+    // **Say which pair this analyses, because it analyses only one.**
+    //
+    // This is a distribution tool: it asks how measured error compares with the bound the
+    // arithmetic predicts, which is a question about a *pair*. That is a legitimate scope —
+    // but it was silent about it, and a finding where the GPU disagrees with two agreeing
+    // CPU backends is invisible here while looking like a clean pass.
+    //
+    // Use `triage_findings` for that; it compares every pair. Stated rather than fixed,
+    // because widening this one would change the question it answers.
+    println!(
+        "analysing the {} vs {} pair only — a GPU-outlier finding will not appear here; \
+         use triage_findings for those\n",
+        tensor_adapter::FLEX_NAME,
+        tensor_adapter::LIBTORCH_NAME
+    );
+
     let mut triaged = Vec::new();
 
     for finding in &findings {
@@ -84,7 +100,10 @@ fn main() {
         let right = TensorNormalizer.normalize(torch.run(&case).expect("valid case"));
 
         // Rung 1: does it still diverge, from the seed alone?
-        let tolerance = policy.tolerance_for(&case, ("burn-flex", "burn-tch"));
+        let tolerance = policy.tolerance_for(
+            &case,
+            (tensor_adapter::FLEX_NAME, tensor_adapter::LIBTORCH_NAME),
+        );
         let reproduced = !compare(&left.values, &right.values, tolerance).agrees();
 
         // Rung 2: how does the error compare with what the arithmetic predicts?

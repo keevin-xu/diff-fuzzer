@@ -430,16 +430,22 @@ mod tests {
     /// the two failures that causes.
     #[test]
     fn the_signature_never_contains_an_implementation_name() {
+        // **The real names**, not a placeholder. The point is that the names this project
+        // actually uses stay out of the key; testing it with `"burn-ndarray"` — removed at
+        // PHASE-7A — proved it about a backend nobody runs.
         let outputs = [
-            named("burn-ndarray", &[1], &[1.0]),
-            named("burn-wgpu", &[1], &[1.5]),
+            named(crate::backends::FLEX_NAME, &[1], &[1.0]),
+            named(crate::backends::WGPU_NAME, &[1], &[1.5]),
         ];
         let (signature, _) = signature_across(&case(&[1]), &outputs, Tolerance::EXACT);
 
-        assert!(
-            !signature.contains("ndarray") && !signature.contains("wgpu"),
-            "{signature}"
-        );
+        for name in [
+            crate::backends::FLEX_NAME,
+            crate::backends::LIBTORCH_NAME,
+            crate::backends::WGPU_NAME,
+        ] {
+            assert!(!signature.contains(name), "{signature} contains {name}");
+        }
     }
 
     /// A difference in *kind* outranks one of degree, however large the numeric gap: two
