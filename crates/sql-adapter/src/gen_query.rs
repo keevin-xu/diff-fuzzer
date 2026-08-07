@@ -95,7 +95,32 @@ pub fn generate_query(
         }
     };
 
-    let filter = (rng.random_range(0..100) < 70).then(|| generate_predicate(rng, table, bounds, 0));
+    let mut filter =
+        (rng.random_range(0..100) < 70).then(|| generate_predicate(rng, table, bounds, 0));
+
+    // A correlated subquery in the `WHERE` clause. Conjoined with whatever predicate is
+    // already there rather than replacing it, so enabling this axis **adds** to a case
+    // instead of substituting for part of it — the rule three earlier confounds taught.
+    if bounds.subqueries && tables.len() > 1 && rng.random_range(0..100) < 45 {
+        let inner = tables
+            .iter()
+            .find(|candidate| candidate.name != table.name)
+            .expect("more than one table");
+        if let Some(subquery) = generate_subquery(rng, table, inner) {
+            filter = Some(match filter {
+                Some(existing) => Expr::Binary {
+                    op: if rng.random_range(0..2) == 0 {
+                        BinaryOp::And
+                    } else {
+                        BinaryOp::Or
+                    },
+                    left: Box::new(existing),
+                    right: Box::new(subquery),
+                },
+                None => subquery,
+            });
+        }
+    }
 
     // Decided **before** the ordering, because it constrains it. Getting this order wrong is
     // not hypothetical: an earlier version suppressed `ORDER BY` for every row query whenever
@@ -230,6 +255,93 @@ enum QueryShape {
     WholeTableAggregate,
     /// `GROUP BY` one column, projecting it plus aggregates.
     Grouped,
+}
+
+/// A correlated subquery over `inner`, referencing `outer`'s row.
+///
+/// Two forms, chosen because they fail differently:
+///
+/// - **`EXISTS (SELECT ... WHERE inner.c = outer.c)`** — a truth value. Interesting because
+///   it is defined even when the inner query returns nothing, and because `NOT EXISTS` over
+///   an empty result is the natural way to write "no match", where `NOT IN` famously is not.
+/// - **`outer.c <op> (SELECT MAX(inner.c) ...)`** — a comparison against a scalar. Interesting
+///   because when the inner query returns **no rows** the scalar is `NULL` and the comparison
+///   is unknown rather than false. An aggregate is used so the subquery cannot accidentally
+///   return several rows, which is a runtime error rather than a divergence.
+///
+/// The correlation — `= outer.c` — is the point. Without it the subquery is a constant the
+/// optimizer can hoist, and both engines would compute it once and agree.
+fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Option<Expr> {
+    // The correlation needs one column of each table with compatible types.
+    let mut pairs = Vec::new();
+    for outer_column in &outer.columns {
+        for inner_column in &inner.columns {
+            if outer_column.sql_type.accepts(inner_column.sql_type) {
+                pairs.push((outer_column, inner_column));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    let (outer_column, inner_column) = pairs[rng.random_range(0..pairs.len())];
+
+    let correlation = Expr::Binary {
+        op: if rng.random_range(0..100) < 80 {
+            BinaryOp::Equal
+        } else {
+            BinaryOp::NotEqual
+        },
+        left: Box::new(Expr::Column(reference(inner, &inner_column.name))),
+        right: Box::new(Expr::Column(reference(outer, &outer_column.name))),
+    };
+
+    if rng.random_range(0..100) < 55 {
+        Some(Expr::Exists {
+            not: rng.random_range(0..2) == 0,
+            query: Box::new(SelectStmt {
+                projection: vec![Expr::Column(reference(inner, &inner_column.name))],
+                from: inner.name.clone(),
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: Some(correlation),
+                order_by: Vec::new(),
+                limit: None,
+            }),
+        })
+    } else {
+        // `MIN`/`MAX` keep the subquery scalar *and* keep its type equal to the column's, so
+        // the outer comparison stays well-typed. `COUNT` would be an integer regardless of the
+        // column, which would break the type discipline for a `TEXT` column.
+        let func = if rng.random_range(0..2) == 0 {
+            AggregateFunc::Min
+        } else {
+            AggregateFunc::Max
+        };
+        Some(Expr::ScalarSubquery {
+            op: match rng.random_range(0..4) {
+                0 => BinaryOp::Equal,
+                1 => BinaryOp::NotEqual,
+                2 => BinaryOp::Less,
+                _ => BinaryOp::Greater,
+            },
+            left: Box::new(Expr::Column(reference(outer, &outer_column.name))),
+            query: Box::new(SelectStmt {
+                projection: vec![Expr::Aggregate {
+                    func,
+                    arg: Some(Box::new(Expr::Column(reference(inner, &inner_column.name)))),
+                }],
+                from: inner.name.clone(),
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: Some(correlation),
+                order_by: Vec::new(),
+                limit: None,
+            }),
+        })
+    }
 }
 
 /// A join between two tables, with an `ON` predicate over type-compatible columns.

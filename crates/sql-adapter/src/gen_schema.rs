@@ -38,6 +38,16 @@ pub struct Bounds {
     pub max_tables: usize,
     pub max_columns: usize,
     pub max_rows: usize,
+    /// Whether the generator may emit **correlated subqueries** — `EXISTS (SELECT ... WHERE
+    /// inner.c = outer.c)` and comparisons against a scalar subquery.
+    ///
+    /// Historically the highest-yield SQL construct, and the reason is structural: a
+    /// correlated subquery is re-evaluated per outer row, so it exercises the optimizer's
+    /// decisions about *when* to evaluate what. Two engines that agree on every value can
+    /// still disagree here if one rewrites the subquery into a join and the other does not.
+    ///
+    /// Needs two tables, like joins, so it forces the same two-table schema.
+    pub subqueries: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -99,6 +109,13 @@ impl Bounds {
         set_ops: false,
         chained_set_ops: false,
         joins: false,
+        subqueries: false,
+    };
+
+    /// V1 plus correlated subqueries. One axis, as always.
+    pub const V1_SUBQUERIES: Bounds = Bounds {
+        subqueries: true,
+        ..Bounds::V1
     };
 
     /// V1 plus joins. One axis, as always.
@@ -136,6 +153,7 @@ impl Bounds {
         set_ops: true,
         chained_set_ops: false,
         joins: true,
+        subqueries: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -174,7 +192,7 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={})",
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={}, subqueries={})",
             self.max_tables,
             self.max_columns,
             self.max_rows,
@@ -183,7 +201,8 @@ impl Bounds {
             self.aggregates,
             self.set_ops,
             self.chained_set_ops,
-            self.joins
+            self.joins,
+            self.subqueries
         )
     }
 }
@@ -233,13 +252,13 @@ pub fn generate_schema(rng: &mut SeededRng, bounds: Bounds) -> Vec<Table> {
     // is on. Without this the generator would produce single-table schemas most of the time
     // and quietly test joins far less than the run appears to — the same shape of confound
     // that made the first set-op sweep meaningless.
-    let table_count = if bounds.joins {
+    let table_count = if bounds.joins || bounds.subqueries {
         // Exactly two. A join needs somewhere to join to, and v1 caps the schema at two
         // anyway — so this is not a clamp, it is the only value that makes the axis mean
         // anything.
         debug_assert!(
             bounds.max_tables >= 2,
-            "the joins axis needs a schema of at least two tables"
+            "the joins and subqueries axes need a schema of at least two tables"
         );
         2
     } else {

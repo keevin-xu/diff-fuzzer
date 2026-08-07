@@ -110,6 +110,17 @@ impl Shrink for SqlCase {
             }
         }
 
+        // Replace a subquery predicate with a constant. The single largest reduction
+        // available on a correlated case: it removes a whole nested query, its correlation,
+        // and the second table's relevance in one move.
+        if let Some(filter) = &self.query.filter
+            && filter.contains_subquery()
+        {
+            let mut candidate = self.clone();
+            candidate.query.filter = None;
+            proposals.push(candidate);
+        }
+
         // Simplify a projected expression to a leaf, keeping the column count.
         for (index, expression) in self.query.projection.iter().enumerate() {
             if expression.node_count() > 1 {
@@ -231,6 +242,73 @@ mod tests {
 
     fn generated(seed: u64) -> SqlCase {
         SqlGenerator::default().generate(&mut SeededRng::from_seed(seed))
+    }
+
+    fn generated_with(seed: u64, bounds: Bounds) -> SqlCase {
+        SqlGenerator::new(bounds).generate(&mut SeededRng::from_seed(seed))
+    }
+
+    /// The contract, checked on **every axis**, not just the default one.
+    ///
+    /// Reductions in this domain are not local: dropping a row can invalidate a `LIMIT`,
+    /// dropping a table can orphan a correlated subquery's reference. Those interactions are
+    /// only reachable when the axis that creates them is on, so a contract test that only
+    /// ever saw default cases would be checking the easy half.
+    #[test]
+    fn the_contract_holds_on_every_axis() {
+        for (name, bounds) in [
+            ("default", Bounds::V1),
+            ("aggregates", Bounds::V1_AGGREGATES),
+            ("set ops", Bounds::V1_SET_OPS),
+            ("chained set ops", Bounds::V1_CHAINED_SET_OPS),
+            ("joins", Bounds::V1_JOINS),
+            ("subqueries", Bounds::V1_SUBQUERIES),
+            ("all", Bounds::V1_ALL),
+        ] {
+            for seed in 0..120 {
+                let case = generated_with(seed, bounds);
+                let before = complexity(&case);
+                for candidate in case.candidates() {
+                    assert!(
+                        complexity(&candidate) < before,
+                        "{name}, seed {seed}: a candidate was not strictly simpler"
+                    );
+                    candidate.validate().unwrap_or_else(|problem| {
+                        panic!("{name}, seed {seed}: invalid candidate: {problem}")
+                    });
+                }
+            }
+        }
+    }
+
+    /// A correlated case must shrink without orphaning the reference that correlates it.
+    #[test]
+    fn shrinking_a_correlated_case_never_orphans_its_reference() {
+        for seed in 0..200 {
+            let case = generated_with(seed, Bounds::V1_SUBQUERIES);
+            if !case
+                .query
+                .filter
+                .as_ref()
+                .is_some_and(crate::schema::Expr::contains_subquery)
+            {
+                continue;
+            }
+
+            // Keep failing while the subquery survives: the search is then forced to try
+            // every reduction *around* it, including dropping the table it reads.
+            let result = minimize(case, |candidate| {
+                candidate
+                    .query
+                    .filter
+                    .as_ref()
+                    .is_some_and(crate::schema::Expr::contains_subquery)
+            });
+            result
+                .input
+                .validate()
+                .unwrap_or_else(|problem| panic!("seed {seed}: {problem}"));
+        }
     }
 
     #[test]

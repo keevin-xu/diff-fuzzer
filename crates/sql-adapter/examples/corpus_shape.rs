@@ -77,6 +77,15 @@ const FEATURES: &[Feature] = &[
         },
     },
     Feature {
+        name: "correlated subquery",
+        holds: |case| {
+            case.query
+                .filter
+                .as_ref()
+                .is_some_and(sql_adapter::schema::Expr::contains_subquery)
+        },
+    },
+    Feature {
         name: "empty table",
         holds: |case| case.queried_rows().is_empty(),
     },
@@ -121,6 +130,17 @@ const INTERACTIONS: &[Feature] = &[
         holds: |case| case.query.set_op.is_some() && case.query.join.is_some(),
     },
     Feature {
+        name: "subquery over a joined query",
+        holds: |case| {
+            case.query.join.is_some()
+                && case
+                    .query
+                    .filter
+                    .as_ref()
+                    .is_some_and(sql_adapter::schema::Expr::contains_subquery)
+        },
+    },
+    Feature {
         name: "outer join + NULL in the data",
         holds: |case| {
             case.query
@@ -147,6 +167,7 @@ fn main() {
     let bounds = match arguments.next().as_deref() {
         Some("all") => Bounds::V1_ALL,
         Some("joins") => Bounds::V1_JOINS,
+        Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("setops") => Bounds::V1_SET_OPS,
         Some("chained") => Bounds::V1_CHAINED_SET_OPS,
         Some("aggregates") => Bounds::V1_AGGREGATES,
