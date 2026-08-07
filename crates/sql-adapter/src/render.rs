@@ -113,6 +113,19 @@ pub fn render_select(query: &SelectStmt, dialect: Dialect) -> String {
         quote_identifier(&query.from)
     );
 
+    // The join goes on the `FROM` clause, before `WHERE`. Both engines spell all four kinds
+    // the same way, so this needs no dialect distinction — `RIGHT`/`FULL OUTER JOIN` are
+    // accepted by SQLite only from 3.39.0, which is a *version* constraint rather than a
+    // dialect one (`SPECS.md` §2.8).
+    if let Some(join) = &query.join {
+        sql.push_str(&format!(
+            " {} {} ON {}",
+            join.kind.as_sql(),
+            quote_identifier(&join.table),
+            render_expr(&join.on, dialect)
+        ));
+    }
+
     if let Some(filter) = &query.filter {
         sql.push_str(&format!(" WHERE {}", render_expr(filter, dialect)));
     }
@@ -404,6 +417,7 @@ mod tests {
             &SelectStmt {
                 projection: vec![Expr::Literal(Literal::Integer(1))],
                 from: "t0".to_string(),
+                join: None,
                 set_op: None,
                 group_by: vec![],
                 filter: None,

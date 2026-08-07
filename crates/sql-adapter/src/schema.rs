@@ -374,6 +374,51 @@ pub struct OrderKey {
     pub nulls_first: bool,
 }
 
+/// How two tables are joined.
+///
+/// The outer kinds are the interesting ones, and `RIGHT`/`FULL` especially so: **SQLite gained
+/// them only in 3.39.0 (2022)**, having refused them for its entire prior history, while DuckDB
+/// has had them throughout. One side's implementation is therefore much younger than the other's,
+/// which is exactly the asymmetry a differential test wants.
+///
+/// They are also where `NULL` arrives *from the join itself* rather than from the data — an
+/// unmatched row is padded with `NULL`s — so a predicate that behaved one way on stored `NULL`s
+/// meets a second source of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+impl JoinKind {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "INNER JOIN",
+            JoinKind::Left => "LEFT OUTER JOIN",
+            JoinKind::Right => "RIGHT OUTER JOIN",
+            JoinKind::Full => "FULL OUTER JOIN",
+        }
+    }
+
+    /// Can this join introduce `NULL`s that were never in the data?
+    pub fn pads_with_nulls(self) -> bool {
+        self != JoinKind::Inner
+    }
+}
+
+/// A join of the query's table with one other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Join {
+    pub kind: JoinKind,
+    /// The table being joined in. Must differ from the query's own table.
+    pub table: String,
+    /// The `ON` predicate. Never absent: a join without one is a cross product, which is a
+    /// different construct and is not what this axis is testing.
+    pub on: Expr,
+}
+
 /// A set operation combining two queries.
 ///
 /// **`UNION`, `INTERSECT` and `EXCEPT` deduplicate; `UNION ALL` does not** — which makes the
@@ -431,6 +476,11 @@ pub struct SelectStmt {
     pub from: String,
     /// `WHERE`, if any.
     pub filter: Option<Expr>,
+    /// A join with one other table, if any.
+    ///
+    /// At most one, so a case never depends on the associativity of chained joins — the same
+    /// discipline the set operations follow, and for the same reason.
+    pub join: Option<Join>,
     /// A set operation with another query, if any.
     ///
     /// Deliberately **not chained**: at most one operation, so no case can depend on the
@@ -593,6 +643,7 @@ mod tests {
         let statement = SelectStmt {
             projection: vec![Expr::Column(column_ref("a"))],
             from: "t".to_string(),
+            join: None,
             set_op: None,
             group_by: vec![],
             filter: Some(Expr::Binary {

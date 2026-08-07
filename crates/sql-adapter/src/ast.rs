@@ -102,6 +102,14 @@ impl SqlCase {
             return false;
         }
 
+        // A join changes which rows exist: an outer join manufactures rows that are in no
+        // table, padded with `NULL`s. The ordering check inspects the *queried table's* seeded
+        // rows, which are no longer what comes back, so — as with grouping and set operations —
+        // take the safe answer and sort before comparing.
+        if self.query.join.is_some() {
+            return false;
+        }
+
         // A set operation's output rows are neither branch's rows: `UNION` may drop
         // duplicates, `EXCEPT` removes matches. The seeded rows the ordering check inspects
         // are not what comes back, so — as with grouping — take the safe answer.
@@ -166,6 +174,7 @@ impl SqlCase {
             query: SelectStmt {
                 projection: vec![Expr::Column(reference("c0")), Expr::Column(reference("c1"))],
                 from: "t0".to_string(),
+                join: None,
                 set_op: None,
                 group_by: vec![],
                 filter: Some(Expr::Binary {
@@ -244,11 +253,24 @@ impl SqlCase {
         for key in &self.query.order_by {
             referenced.push(&key.column);
         }
+        // A join puts a second table in scope, so a reference resolves against either.
+        let joined = self.query.join.as_ref().and_then(|join| {
+            self.schema
+                .iter()
+                .find(|candidate| candidate.name == join.table)
+        });
         for reference in referenced {
-            if reference.table != table.name || table.column(&reference.column).is_none() {
+            let resolves = if reference.table == table.name {
+                table.column(&reference.column).is_some()
+            } else if let Some(joined) = joined {
+                reference.table == joined.name && joined.column(&reference.column).is_some()
+            } else {
+                false
+            };
+            if !resolves {
                 return Err(format!(
-                    "query references {}.{}, which is not a column of {}",
-                    reference.table, reference.column, table.name
+                    "query references {}.{}, which is not in scope",
+                    reference.table, reference.column
                 ));
             }
         }
@@ -288,6 +310,41 @@ impl SqlCase {
                         "an aggregate query without GROUP BY may not project bare columns"
                             .to_string(),
                     );
+                }
+            }
+        }
+
+        // Join rules. The joined table must exist, must not be the query's own table (a self
+        // join needs aliases, which the v1 AST has no way to express), and its `ON` predicate
+        // may reference only the two tables in scope.
+        if let Some(join) = &self.query.join {
+            if join.table == self.query.from {
+                return Err("a self join needs aliases, which v1 cannot express".to_string());
+            }
+            let joined = self
+                .schema
+                .iter()
+                .find(|candidate| candidate.name == join.table)
+                .ok_or_else(|| {
+                    format!(
+                        "join names table {}, which is not in the schema",
+                        join.table
+                    )
+                })?;
+
+            for reference in join.on.columns() {
+                let resolves = if reference.table == table.name {
+                    table.column(&reference.column).is_some()
+                } else if reference.table == joined.name {
+                    joined.column(&reference.column).is_some()
+                } else {
+                    false
+                };
+                if !resolves {
+                    return Err(format!(
+                        "the ON predicate references {}.{}, which is not in scope",
+                        reference.table, reference.column
+                    ));
                 }
             }
         }
@@ -368,6 +425,7 @@ mod tests {
                     column: "c0".to_string(),
                 })],
                 from: "t0".to_string(),
+                join: None,
                 set_op: None,
                 group_by: vec![],
                 filter: None,

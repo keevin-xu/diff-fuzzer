@@ -38,6 +38,10 @@ pub struct Bounds {
     pub max_tables: usize,
     pub max_columns: usize,
     pub max_rows: usize,
+    /// Whether the generator may emit a join, including the outer kinds.
+    ///
+    /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
+    pub joins: bool,
     /// Whether set operations may be **chained** — `A UNION B INTERSECT C`, unparenthesized.
     ///
     /// This is the probe for the one difference documented on one side only: SQLite states
@@ -94,6 +98,13 @@ impl Bounds {
         aggregates: false,
         set_ops: false,
         chained_set_ops: false,
+        joins: false,
+    };
+
+    /// V1 plus joins. One axis, as always.
+    pub const V1_JOINS: Bounds = Bounds {
+        joins: true,
+        ..Bounds::V1
     };
 
     /// V1 plus set operations. One axis, as always.
@@ -130,7 +141,7 @@ impl Bounds {
     /// must change whenever the numbers do. The test below fails if they drift apart.
     pub fn description(&self) -> String {
         format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={})",
+            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={})",
             self.max_tables,
             self.max_columns,
             self.max_rows,
@@ -138,7 +149,8 @@ impl Bounds {
             self.wide_arithmetic,
             self.aggregates,
             self.set_ops,
-            self.chained_set_ops
+            self.chained_set_ops,
+            self.joins
         )
     }
 }
@@ -184,7 +196,22 @@ const NULL_PERCENT: u32 = 25;
 /// noise to every minimized repro without testing anything — engines do not care what a
 /// column is called, and a human reading a finding does.
 pub fn generate_schema(rng: &mut SeededRng, bounds: Bounds) -> Vec<Table> {
-    let table_count = rng.random_range(1..=bounds.max_tables);
+    // A join needs somewhere to join to, so the schema is forced to two tables when the axis
+    // is on. Without this the generator would produce single-table schemas most of the time
+    // and quietly test joins far less than the run appears to — the same shape of confound
+    // that made the first set-op sweep meaningless.
+    let table_count = if bounds.joins {
+        // Exactly two. A join needs somewhere to join to, and v1 caps the schema at two
+        // anyway — so this is not a clamp, it is the only value that makes the axis mean
+        // anything.
+        debug_assert!(
+            bounds.max_tables >= 2,
+            "the joins axis needs a schema of at least two tables"
+        );
+        2
+    } else {
+        rng.random_range(1..=bounds.max_tables)
+    };
 
     (0..table_count)
         .map(|table_index| {

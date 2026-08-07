@@ -19,8 +19,8 @@
 use crate::gen_schema::Bounds;
 use crate::ordering::orders_rows_totally;
 use crate::schema::{
-    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, OrderKey, SelectStmt,
-    SetBranch, SetOp, SqlType, Table, UnaryOp,
+    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, Join, JoinKind, OrderKey,
+    SelectStmt, SetBranch, SetOp, SqlType, Table, UnaryOp,
 };
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
@@ -37,6 +37,26 @@ pub fn generate_query(
     bounds: Bounds,
 ) -> SelectStmt {
     let table = &tables[rng.random_range(0..tables.len())];
+
+    // A join, when enabled and when there is another table to join to. Chosen first because
+    // it puts a second table in scope, which every later choice may then reference.
+    //
+    // **Only some of the time**, and that matters: a joined query is treated as unordered, so
+    // joining *every* query would silently strip ordered queries out of the corpus — the same
+    // confound the set-op axis produced, where a run reporting clean agreement had quietly
+    // stopped testing ordering. Enabling an axis must add cases, never remove them.
+    let join = if bounds.joins && tables.len() > 1 && rng.random_range(0..100) < 60 {
+        let other = tables
+            .iter()
+            .find(|candidate| candidate.name != table.name)
+            .expect("more than one table");
+        generate_join(rng, table, other)
+    } else {
+        None
+    };
+    // A joined query is treated as unordered — an outer join manufactures rows that are in no
+    // table — so it gets no `ORDER BY` and no `LIMIT`, the same reasoning as grouping.
+    let joined = join.is_some();
     let rows = data
         .iter()
         .find(|insert| insert.table == table.name)
@@ -91,7 +111,7 @@ pub fn generate_query(
         // No ordering when *this query* has a set operation: an `ORDER BY` would attach to a
         // branch rather than to the combined result. Note the condition is `wants_set_op`,
         // not `bounds.set_ops` — a row query that did not get one still gets ordered.
-        QueryShape::Rows if wants_set_op => Vec::new(),
+        QueryShape::Rows if wants_set_op || joined => Vec::new(),
         QueryShape::Rows => generate_order_by(rng, table),
         QueryShape::WholeTableAggregate | QueryShape::Grouped => Vec::new(),
     };
@@ -105,6 +125,7 @@ pub fn generate_query(
     // rows — is answering a different question entirely. Rather than teach it to compute
     // groups, only row queries are eligible for a `LIMIT`.
     let limit = if shape == QueryShape::Rows
+        && !joined
         && orders_rows_totally(&order_by, table, rows)
         && rng.random_range(0..100) < 30
     {
@@ -153,6 +174,7 @@ pub fn generate_query(
                 right: Box::new(SelectStmt {
                     projection: projection.clone(),
                     from: table.name.clone(),
+                    join: None,
                     set_op: None,
                     group_by: Vec::new(),
                     filter: (rng.random_range(0..100) < 80)
@@ -170,6 +192,7 @@ pub fn generate_query(
             right: Box::new(SelectStmt {
                 projection: projection.clone(),
                 from: table.name.clone(),
+                join: None,
                 set_op: inner,
                 group_by: Vec::new(),
                 filter: (rng.random_range(0..100) < 80)
@@ -185,6 +208,7 @@ pub fn generate_query(
     SelectStmt {
         projection,
         from: table.name.clone(),
+        join,
         set_op,
         group_by,
         filter,
@@ -203,6 +227,51 @@ enum QueryShape {
     WholeTableAggregate,
     /// `GROUP BY` one column, projecting it plus aggregates.
     Grouped,
+}
+
+/// A join between two tables, with an `ON` predicate over type-compatible columns.
+///
+/// The `ON` predicate compares one column from each side, chosen so their types match — which
+/// is what makes the join meaningful rather than a filtered cross product. If no pair of
+/// compatible columns exists, no join is generated: a join on nothing would be testing the
+/// cross product, which is a different construct.
+///
+/// **Equality is favoured heavily.** An outer join's interest is in the rows that *fail* to
+/// match and get padded with `NULL`s, and equality is what produces a realistic mix of matched
+/// and unmatched rows. Inequality predicates tend to match everything or nothing.
+fn generate_join(rng: &mut SeededRng, left: &Table, right: &Table) -> Option<Join> {
+    let mut pairs = Vec::new();
+    for left_column in &left.columns {
+        for right_column in &right.columns {
+            if left_column.sql_type.accepts(right_column.sql_type) {
+                pairs.push((left_column, right_column));
+            }
+        }
+    }
+    let (left_column, right_column) = *pairs.get(rng.random_range(0..pairs.len().max(1)))?;
+
+    let kind = match rng.random_range(0..4) {
+        0 => JoinKind::Inner,
+        1 => JoinKind::Left,
+        2 => JoinKind::Right,
+        _ => JoinKind::Full,
+    };
+
+    let op = if rng.random_range(0..100) < 80 {
+        BinaryOp::Equal
+    } else {
+        BinaryOp::NotEqual
+    };
+
+    Some(Join {
+        kind,
+        table: right.name.clone(),
+        on: Expr::Binary {
+            op,
+            left: Box::new(Expr::Column(reference(left, &left_column.name))),
+            right: Box::new(Expr::Column(reference(right, &right_column.name))),
+        },
+    })
 }
 
 /// One aggregate over a column of this table.

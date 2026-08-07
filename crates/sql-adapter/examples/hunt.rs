@@ -71,6 +71,7 @@ fn main() {
         Some("aggregates") => sql_adapter::gen_schema::Bounds::V1_AGGREGATES,
         Some("setops") => sql_adapter::gen_schema::Bounds::V1_SET_OPS,
         Some("chained") => sql_adapter::gen_schema::Bounds::V1_CHAINED_SET_OPS,
+        Some("joins") => sql_adapter::gen_schema::Bounds::V1_JOINS,
         _ => sql_adapter::gen_schema::Bounds::V1,
     };
 
