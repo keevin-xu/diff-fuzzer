@@ -182,6 +182,32 @@ fn shape(u: &mut Unstructured<'_>, rank: usize) -> Vec<usize> {
     crate::ops::clamp_to(raw, element_budget(u))
 }
 
+/// Split a result shape into two operands that broadcast to it, one byte per axis.
+///
+/// Setting an axis to 1 on one side makes that side stretch along it. **Never both sides at
+/// once** — that would shrink the result below the shape already drawn and budgeted.
+///
+/// One byte per axis keeps the layout positional: flipping a shape byte changes an extent,
+/// flipping a stretch byte changes which operand broadcasts, and neither disturbs the values
+/// that follow.
+fn broadcast_operands(u: &mut Unstructured<'_>, result: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut lhs = result.to_vec();
+    let mut rhs = result.to_vec();
+
+    for i in 0..result.len() {
+        match byte(u) % 4 {
+            0 => lhs[i] = 1,
+            1 => rhs[i] = 1,
+            // Two of four outcomes leave the axis alone, so equal-shaped cases stay common.
+            // They are the ordinary path in real use and are where every finding so far came
+            // from; a decoder that always broadcast would have stopped testing them.
+            _ => {}
+        }
+    }
+
+    (lhs, rhs)
+}
+
 /// How many elements the remaining input can meaningfully describe.
 ///
 /// **The layout is one byte per value.** Once the input is exhausted `byte` returns 0, so a
@@ -219,14 +245,20 @@ impl<'a> Arbitrary<'a> for TensorOp {
             4..=7 => {
                 let kind = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div][choice - 4];
                 let rank = size(u, DECODE_BOUNDS.max_rank);
-                // One shape, used twice — the constraint cannot be violated because
-                // there is only one shape to violate it with.
-                let shape = shape(u, rank);
+                // The **result** shape, from which both operands are derived — the same
+                // correct-by-construction order the seeded generator uses. Deriving operands
+                // from the answer means the fuzzer cannot produce an incompatible pair, so no
+                // mutation is ever wasted on a case that would panic before running.
+                //
+                // It also puts the element budget where it belongs: `shape` clamps what it
+                // returns, and a broadcast result is larger than either operand.
+                let result = shape(u, rank);
+                let (lhs_shape, rhs_shape) = broadcast_operands(u, &result);
                 let right_domain = binary_right_domain(kind);
                 TensorOp::binary(
                     kind,
-                    tensor(u, shape.clone(), Domain::Any),
-                    tensor(u, shape, right_domain),
+                    tensor(u, lhs_shape, Domain::Any),
+                    tensor(u, rhs_shape, right_domain),
                 )
             }
             8 => {
@@ -268,6 +300,54 @@ impl<'a> Arbitrary<'a> for TensorOp {
 
 #[cfg(test)]
 mod tests {
+    /// **The decoder must never emit an operand pair that cannot run.** A case that panics
+    /// in `TensorOp::binary` would take the whole fuzz process down, and libFuzzer would
+    /// report it as a crash in the target rather than an invalid input.
+    #[test]
+    fn every_decoded_binary_case_has_operands_that_combine() {
+        for bytes in byte_strings(3_000) {
+            let mut u = Unstructured::new(&bytes);
+            let Ok(case) = TensorOp::arbitrary(&mut u) else {
+                continue;
+            };
+            if let TensorOp::Binary { lhs, rhs, .. } = case {
+                assert!(
+                    crate::ops::broadcast::compatible(lhs.shape(), rhs.shape()),
+                    "decoded an incompatible pair: {:?} and {:?}",
+                    lhs.shape(),
+                    rhs.shape()
+                );
+            }
+        }
+    }
+
+    /// **Broadcasting must be reachable from bytes**, not merely from the seeded generator.
+    /// The fuzzer is what runs for hours; if its decoder never stretches an axis, PHASE-7C
+    /// added nothing to a campaign however good the generator is.
+    #[test]
+    fn broadcasting_is_reachable_from_fuzzer_bytes() {
+        let mut broadcasting = 0;
+        let mut equal = 0;
+
+        for bytes in byte_strings(3_000) {
+            let mut u = Unstructured::new(&bytes);
+            let Ok(TensorOp::Binary { lhs, rhs, .. }) = TensorOp::arbitrary(&mut u) else {
+                continue;
+            };
+            if lhs.shape() == rhs.shape() {
+                equal += 1;
+            } else {
+                broadcasting += 1;
+            }
+        }
+
+        assert!(
+            broadcasting > 50,
+            "bytes rarely decode to a broadcast: {broadcasting}"
+        );
+        assert!(equal > 50, "equal shapes became rare: {equal}");
+    }
+
     /// **The tie between the decode bounds and the string that identifies them.**
     ///
     /// The pool matches negatives on the generator description verbatim. If the bounds are

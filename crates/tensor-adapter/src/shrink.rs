@@ -51,14 +51,43 @@ fn unary_candidates(kind: UnaryOp, arg: &TensorValue) -> Vec<TensorOp> {
 fn binary_candidates(kind: BinaryOp, lhs: &TensorValue, rhs: &TensorValue) -> Vec<TensorOp> {
     let mut out = Vec::new();
 
-    // Both operands must keep identical shapes, so a shape reduction applies to both at
-    // once. Shrinking one alone would produce a case neither backend could run.
-    for shape in smaller_shapes(lhs.shape()) {
-        out.push(TensorOp::binary(
-            kind,
-            lhs.resized(&shape),
-            rhs.resized(&shape),
-        ));
+    // **Shape reduction works on the *result*, not on either operand.** Since PHASE-7C the
+    // two shapes may differ, and shrinking one alone can leave a pair that does not combine —
+    // a case no backend can run, which the constructor would panic on. Deriving both from a
+    // smaller result keeps every candidate valid by construction.
+    let result = crate::ops::broadcast::result_shape(lhs.shape(), rhs.shape())
+        .expect("a constructed case always has combinable operands");
+    let lhs_stretched = stretched_axes(lhs.shape(), &result);
+    let rhs_stretched = stretched_axes(rhs.shape(), &result);
+
+    for (smaller, kept) in smaller_results(&result) {
+        let l = derive_operand(&smaller, &lhs_stretched, &kept);
+        let r = derive_operand(&smaller, &rhs_stretched, &kept);
+        out.push(TensorOp::binary(kind, lhs.resized(&l), rhs.resized(&r)));
+    }
+
+    // **Stretching one more axis is itself a reduction**, and it is new at PHASE-7C.
+    // Collapsing an axis to 1 on one side removes elements from that operand while leaving
+    // the result shape untouched: `[4,4] x [4,4]` is 32 elements, `[4,1] x [4,4]` is 20.
+    // Strictly simpler, so the `Shrink` contract holds and the search still terminates.
+    //
+    // The reverse move — un-broadcasting, giving both operands the full result shape — is
+    // deliberately **not** offered: it *increases* the element count, which would break that
+    // contract and could make minimisation loop.
+    for axis in 0..result.len() {
+        if result[axis] <= 1 {
+            continue;
+        }
+        if !lhs_stretched[axis] {
+            let mut shape = lhs.shape().to_vec();
+            shape[axis] = 1;
+            out.push(TensorOp::binary(kind, lhs.resized(&shape), rhs.clone()));
+        }
+        if !rhs_stretched[axis] {
+            let mut shape = rhs.shape().to_vec();
+            shape[axis] = 1;
+            out.push(TensorOp::binary(kind, lhs.clone(), rhs.resized(&shape)));
+        }
     }
 
     // Values, though, shrink independently — often only one operand matters to the
@@ -211,6 +240,65 @@ impl Dimension {
 ///
 /// Every result has strictly fewer elements than the input, which is what guarantees the
 /// search terminates rather than cycling.
+/// Which axes of an operand are being stretched to reach the result.
+///
+/// An axis stretches when the operand holds 1 there and the result holds more. An axis that
+/// is 1 on *both* sides is not stretched — it is simply small.
+fn stretched_axes(operand: &[usize], result: &[usize]) -> Vec<bool> {
+    operand
+        .iter()
+        .zip(result)
+        .map(|(&o, &r)| o == 1 && r > 1)
+        .collect()
+}
+
+/// Smaller result shapes, each paired with the original axis indices it kept.
+///
+/// The indices are what let the stretch pattern survive a dropped axis: after removing the
+/// leading dimension, axis 0 of the new shape was axis 1 of the old one, and applying the
+/// old flags positionally would silently stretch the wrong axis.
+fn smaller_results(result: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
+    let n = result.len();
+    let mut out = Vec::new();
+
+    if n > 1 {
+        out.push((result[1..].to_vec(), (1..n).collect()));
+        out.push((result[..n - 1].to_vec(), (0..n - 1).collect()));
+    }
+
+    let all: Vec<usize> = (0..n).collect();
+    for (axis, &size) in result.iter().enumerate() {
+        if size > 1 {
+            let mut smaller = result.to_vec();
+            smaller[axis] = 1;
+            out.push((smaller, all.clone()));
+        }
+    }
+    for (axis, &size) in result.iter().enumerate() {
+        if size > 2 {
+            let mut smaller = result.to_vec();
+            smaller[axis] = size / 2;
+            out.push((smaller, all.clone()));
+        }
+    }
+
+    out
+}
+
+/// Rebuild one operand against a smaller result, keeping the axes it was stretching.
+fn derive_operand(result: &[usize], stretched: &[bool], kept: &[usize]) -> Vec<usize> {
+    kept.iter()
+        .enumerate()
+        .map(|(new_axis, &old_axis)| {
+            if stretched[old_axis] {
+                1
+            } else {
+                result[new_axis]
+            }
+        })
+        .collect()
+}
+
 fn smaller_shapes(shape: &[usize]) -> Vec<Vec<usize>> {
     let mut out = Vec::new();
 
@@ -492,18 +580,109 @@ mod tests {
         }
     }
 
-    /// Elementwise operands must stay the same shape as each other through every
-    /// reduction — a candidate where they differ could not run at all.
+    /// Elementwise operands must stay **combinable** through every reduction. Since PHASE-7C
+    /// they need not be identical — but a candidate whose operands do not broadcast could not
+    /// run at all, and `TensorOp::binary` would panic building it.
     #[test]
-    fn binary_operands_keep_matching_shapes() {
-        let case = TensorOp::binary(BinaryOp::Sub, value(&[2, 6]), value(&[2, 6]));
+    fn binary_candidates_always_combine() {
+        let cases = [
+            TensorOp::binary(BinaryOp::Sub, value(&[2, 6]), value(&[2, 6])),
+            TensorOp::binary(BinaryOp::Sub, value(&[2, 1]), value(&[2, 6])),
+            TensorOp::binary(BinaryOp::Sub, value(&[1, 6]), value(&[2, 6])),
+            TensorOp::binary(BinaryOp::Add, value(&[1, 1, 1]), value(&[3, 2, 4])),
+        ];
+
+        for case in cases {
+            for candidate in case.candidates() {
+                let TensorOp::Binary { lhs, rhs, .. } = &candidate else {
+                    unreachable!()
+                };
+                assert!(
+                    crate::ops::broadcast::compatible(lhs.shape(), rhs.shape()),
+                    "shrinking {case:?} produced an unrunnable pair: {:?} and {:?}",
+                    lhs.shape(),
+                    rhs.shape()
+                );
+            }
+        }
+    }
+
+    /// **No candidate may grow.** Simplicity here is two-dimensional — a candidate either
+    /// holds fewer elements or holds the same elements with simpler values — so "strictly
+    /// fewer elements" is the wrong assertion and passes only by accident on shape moves.
+    ///
+    /// What must never happen is *growth*, and that is exactly what un-broadcasting would do:
+    /// giving both operands the full result shape turns `[2,1] x [2,6]` (14 elements) into
+    /// `[2,6] x [2,6]` (24). Offering it would break the `Shrink` contract and could make
+    /// minimisation loop, which is why the reverse move is not generated.
+    #[test]
+    fn no_binary_candidate_grows() {
+        let cases = [
+            TensorOp::binary(BinaryOp::Sub, value(&[2, 1]), value(&[2, 6])),
+            TensorOp::binary(BinaryOp::Sub, value(&[2, 6]), value(&[2, 6])),
+            TensorOp::binary(BinaryOp::Add, value(&[1, 4]), value(&[3, 4])),
+        ];
+
+        for case in cases {
+            let before = case_elements(&case);
+            for candidate in case.candidates() {
+                assert!(
+                    case_elements(&candidate) <= before,
+                    "candidate grew from {before}: {candidate:?}"
+                );
+                assert_ne!(
+                    candidate, case,
+                    "a candidate equal to its parent loops forever"
+                );
+            }
+        }
+    }
+
+    /// And a shape move specifically *must* shrink, or the shape search would not converge.
+    #[test]
+    fn every_shape_changing_candidate_holds_fewer_elements() {
+        let case = TensorOp::binary(BinaryOp::Sub, value(&[2, 1]), value(&[2, 6]));
+        let before = case_elements(&case);
+        let (lhs_shape, rhs_shape) = shapes(&case);
 
         for candidate in case.candidates() {
-            let TensorOp::Binary { lhs, rhs, .. } = &candidate else {
+            if shapes(&candidate) != (lhs_shape.clone(), rhs_shape.clone()) {
+                assert!(
+                    case_elements(&candidate) < before,
+                    "a shape move did not shrink: {candidate:?}"
+                );
+            }
+        }
+    }
+
+    fn shapes(case: &TensorOp) -> (Vec<usize>, Vec<usize>) {
+        let TensorOp::Binary { lhs, rhs, .. } = case else {
+            unreachable!()
+        };
+        (lhs.shape().to_vec(), rhs.shape().to_vec())
+    }
+
+    /// The move PHASE-7C adds: shrinking an operand *into* a broadcast, which reaches minimal
+    /// cases the old shrinker could not express.
+    #[test]
+    fn an_axis_can_shrink_to_one_on_a_single_side() {
+        let case = TensorOp::binary(BinaryOp::Sub, value(&[2, 6]), value(&[2, 6]));
+
+        let reached = case.candidates().into_iter().any(|c| {
+            let TensorOp::Binary { lhs, rhs, .. } = &c else {
                 unreachable!()
             };
-            assert_eq!(lhs.shape(), rhs.shape());
-        }
+            lhs.shape() != rhs.shape()
+        });
+        assert!(reached, "no candidate stretches an axis on one side only");
+    }
+
+    /// Total elements across both operands.
+    fn case_elements(case: &TensorOp) -> usize {
+        let TensorOp::Binary { lhs, rhs, .. } = case else {
+            unreachable!()
+        };
+        lhs.data().len() + rhs.data().len()
     }
 
     /// Matrix multiplication's shared inner dimension must stay shared.
