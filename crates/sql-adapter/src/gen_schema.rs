@@ -24,6 +24,7 @@
 //! cluster exactly where random sampling does not go.
 
 use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
+use diff_fuzzer_core::GenerationAxes;
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
@@ -258,29 +259,58 @@ impl Bounds {
         wide_arithmetic: true,
         ..Bounds::V1
     };
+}
 
-    /// A description that names the parameters, for recording alongside a case.
-    ///
-    /// Compared as an exact string when deciding whether two pools are comparable, so it
-    /// must change whenever the numbers do. The test below fails if they drift apart.
-    pub fn description(&self) -> String {
-        format!(
-            "sql-v1(tables<={}, columns<={}, rows<={}, depth<={}, wide-arith={}, aggregates={}, set-ops={}, chained={}, joins={}, subqueries={}, not-in={}, logic={:08x})",
-            self.max_tables,
-            self.max_columns,
-            self.max_rows,
-            self.max_expr_depth,
-            self.wide_arithmetic,
-            self.aggregates,
-            self.set_ops,
-            self.chained_set_ops,
-            self.joins,
-            self.subqueries,
-            self.not_in,
-            // The bounds above say what was *configured*; this says what the generator *was*.
-            // Two corpora agreeing on every bound but differing here are not comparable.
-            GENERATOR_FINGERPRINT
-        )
+/// The engine's cross-domain view of a generator configuration.
+///
+/// Adopted 2026-08-07 at the tensor domain's request, after both domains built the same
+/// mechanism independently. **The derived `description()` replaces the hand-written format
+/// string, and that is the point:** the old one had to be edited by hand for every new axis,
+/// and adding `not_in` required remembering to add `not-in={}` to it. Forgetting would have
+/// produced two configurations sharing one identity — exactly what the trait prevents.
+///
+/// # Why the logic fingerprint goes through `scalars()`
+///
+/// The trait derives identity from **declared** axes and scalars. That catches a configuration
+/// changing without its description changing — but only when the *configuration* changed.
+/// It does not catch the generation **logic** changing while every axis stays put, and this
+/// domain has had three of those (see [`GENERATOR_FINGERPRINT`]).
+///
+/// The sharpest example is the trait's own: `axes.rs` cites this adapter's joins-versus-ordering
+/// finding, and the **fix** for it was making joins probabilistic at 60% rather than
+/// unconditional. That changed no axis and no scalar. Under a description derived from declared
+/// configuration alone, the corpus before that fix and the corpus after it are byte-identical in
+/// identity — the failure the trait exists to prevent, arriving through the door it does not
+/// watch.
+///
+/// So the fingerprint is reported as a scalar. It is a slight stretch of "bounds that are not
+/// on/off", and it is deliberate: it keeps the derived description honest with a one-line
+/// implementation instead of overriding `description()` and losing the cannot-drift guarantee.
+/// A `logic_version()` hook on the trait would be the cleaner home — raised as a finding rather
+/// than changed unilaterally, since the engine is not this domain's to edit.
+impl GenerationAxes for Bounds {
+    /// Every axis, **including the disabled ones**, in a fixed order.
+    fn axes(&self) -> Vec<(&'static str, bool)> {
+        vec![
+            ("wide-arith", self.wide_arithmetic),
+            ("aggregates", self.aggregates),
+            ("set-ops", self.set_ops),
+            ("chained", self.chained_set_ops),
+            ("joins", self.joins),
+            ("subqueries", self.subqueries),
+            ("not-in", self.not_in),
+        ]
+    }
+
+    /// The size bounds, plus the generation-logic fingerprint — see the note above.
+    fn scalars(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("tables", self.max_tables.to_string()),
+            ("columns", self.max_columns.to_string()),
+            ("rows", self.max_rows.to_string()),
+            ("depth", self.max_expr_depth.to_string()),
+            ("logic", format!("{GENERATOR_FINGERPRINT:08x}")),
+        ]
     }
 }
 
@@ -477,11 +507,14 @@ mod tests {
 
         // Every axis still named — the fingerprint supplements the bounds, it does not replace
         // them. A reader must be able to see *what was configured* without recompiling.
+        // Spellings follow the engine's derived format (`name=on`/`name=off`/`name=value`),
+        // adopted 2026-08-07. The old hand-written form read `tables<=2`; the change is
+        // cosmetic, and every axis is still required to appear.
         for axis in [
-            "tables<=",
-            "columns<=",
-            "rows<=",
-            "depth<=",
+            "tables=",
+            "columns=",
+            "rows=",
+            "depth=",
             "wide-arith=",
             "aggregates=",
             "set-ops=",
@@ -495,6 +528,14 @@ mod tests {
                 "{axis} missing from {description}"
             );
         }
+
+        // A **disabled** axis must still be named, or "off" is indistinguishable from "this
+        // axis did not exist yet" — which is what makes an old corpus silently incomparable.
+        assert!(
+            Bounds::V1.description().contains("joins=off"),
+            "a disabled axis must appear: {}",
+            Bounds::V1.description()
+        );
 
         // Two configurations differing only in one bound remain distinguishable.
         assert_ne!(Bounds::V1.description(), Bounds::V1_ALL.description());

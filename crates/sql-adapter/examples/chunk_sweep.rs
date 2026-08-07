@@ -103,8 +103,17 @@ fn main() {
 
     println!(
         "  {:>7} {:>9} {:>9} {:>8} {:>9} {:>10} {:>8} {:>10} {:>10} {:>10} {:>9}",
-        "rows", "agreed", "diverged", "skipped", "tlp-chk", "tlp-viol", "ordered", "cases/s",
-        "duckdb ms", "shrink ms", "shr cand"
+        "rows",
+        "agreed",
+        "diverged",
+        "skipped",
+        "tlp-chk",
+        "tlp-viol",
+        "ordered",
+        "cases/s",
+        "duckdb ms",
+        "shrink ms",
+        "shr cand"
     );
     for m in &table {
         println!(
@@ -124,8 +133,16 @@ fn main() {
     }
 
     println!("\nreading");
-    let below: usize = table.iter().filter(|m| m.rows < 2048).map(|m| m.diverged + m.tlp_violations).sum();
-    let at_or_above: usize = table.iter().filter(|m| m.rows >= 2048).map(|m| m.diverged + m.tlp_violations).sum();
+    let below: usize = table
+        .iter()
+        .filter(|m| m.rows < 2048)
+        .map(|m| m.diverged + m.tlp_violations)
+        .sum();
+    let at_or_above: usize = table
+        .iter()
+        .filter(|m| m.rows >= 2048)
+        .map(|m| m.diverged + m.tlp_violations)
+        .sum();
     if below == 0 && at_or_above == 0 {
         println!(
             "  Nothing on either side of the boundary. Crossing 2048 did not change the yield,\n  \
@@ -139,8 +156,10 @@ fn main() {
     let fastest = table.first().expect("settings is non-empty");
     println!(
         "  Throughput cost of the largest setting: {:.0}x slower than 8 rows.",
-        (fastest.agreed + fastest.diverged + fastest.skipped) as f64 / fastest.seconds
-            / (((slowest.agreed + slowest.diverged + slowest.skipped) as f64 / slowest.seconds).max(0.001))
+        (fastest.agreed + fastest.diverged + fastest.skipped) as f64
+            / fastest.seconds
+            / (((slowest.agreed + slowest.diverged + slowest.skipped) as f64 / slowest.seconds)
+                .max(0.001))
     );
     println!(
         "  Findings per second is the number that decides, and a multiple of zero is zero —\n  \
@@ -192,13 +211,25 @@ fn measure(bounds: Bounds, rows: usize, cases: usize) -> Measurement {
         // and SQLite is not vectorized so it has no chunk boundary to cross.
         let run = |c: &_| -> Option<SqlOutcome> { DuckDbImpl.run(c).ok() };
         let relation = if let Some(parts) = partition(&case) {
-            match (run(&parts.whole), run(&parts.is_true), run(&parts.is_false), run(&parts.is_unknown)) {
+            match (
+                run(&parts.whole),
+                run(&parts.is_true),
+                run(&parts.is_false),
+                run(&parts.is_unknown),
+            ) {
                 (Some(w), Some(t), Some(f), Some(u)) => Some(check(&w, &t, &f, &u)),
                 _ => None,
             }
         } else if let Some(parts) = partition_aggregate(&case) {
-            match (run(&parts.whole), run(&parts.is_true), run(&parts.is_false), run(&parts.is_unknown)) {
-                (Some(w), Some(t), Some(f), Some(u)) => Some(check_aggregate(parts.func, &w, &t, &f, &u)),
+            match (
+                run(&parts.whole),
+                run(&parts.is_true),
+                run(&parts.is_false),
+                run(&parts.is_unknown),
+            ) {
+                (Some(w), Some(t), Some(f), Some(u)) => {
+                    Some(check_aggregate(parts.func, &w, &t, &f, &u))
+                }
                 _ => None,
             }
         } else {

@@ -234,8 +234,11 @@ fn simplify_literal(value: &Literal) -> Vec<Literal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Needed for `Bounds::description` — a trait method since the engine's `GenerationAxes`
+    // was adopted, so the trait must be in scope at the call site.
     use crate::gen_schema::Bounds;
     use crate::generator::SqlGenerator;
+    use diff_fuzzer_core::GenerationAxes;
     use diff_fuzzer_core::SeededRng;
     use diff_fuzzer_core::minimize::minimize;
     use diff_fuzzer_core::traits::Generator;

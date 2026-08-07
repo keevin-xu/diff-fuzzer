@@ -15,6 +15,7 @@
 use crate::ast::SqlCase;
 use crate::gen_query::generate_query;
 use crate::gen_schema::{Bounds, generate_data, generate_schema};
+use diff_fuzzer_core::GenerationAxes;
 use diff_fuzzer_core::rng::SeededRng;
 use diff_fuzzer_core::traits::Generator;
 
