@@ -505,10 +505,20 @@ mod tests {
 
     /// Decoding is a pure function of the bytes, which is what lets a saved corpus entry
     /// or a crashing input be replayed exactly.
+    ///
+    /// **Compared by their rendering rather than by `==`.** Since PHASE-7E a decoded case may
+    /// contain `NaN`, and `NaN != NaN` — so `TensorOp`'s derived `PartialEq` is no longer
+    /// reflexive, and a case containing one does not equal *itself*. Asserting equality here
+    /// would fail on a decoder that is perfectly deterministic.
+    ///
+    /// This is worth knowing beyond this test: **any equality comparison on a case is now
+    /// unreliable in the presence of `NaN`.** De-duplication is unaffected because it hashes
+    /// the same rendering used here, which prints `NaN` identically every time.
     #[test]
     fn decoding_is_deterministic() {
         for bytes in byte_strings(200) {
-            assert_eq!(decode(&bytes), decode(&bytes));
+            let (first, second) = (decode(&bytes), decode(&bytes));
+            assert_eq!(format!("{first:?}"), format!("{second:?}"));
         }
     }
 

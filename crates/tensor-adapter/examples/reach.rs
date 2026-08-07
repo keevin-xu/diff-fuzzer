@@ -6,11 +6,14 @@ use tensor_adapter::ops::Bounds;
 
 fn main() {
     let bounds = match std::env::args().nth(1).as_deref() {
+        // The fuzzer's actual configuration: wide *and* unrestricted. Leaving
+        // `restrict_domains` at its default measured a setting nothing runs.
         Some("wide") => Bounds {
             max_rank: 3,
             max_dim: 64,
             magnitude: 1000.0,
             special_value_rate: 0.125,
+            restrict_domains: false,
             ..Bounds::default()
         },
         _ => Bounds::default(),

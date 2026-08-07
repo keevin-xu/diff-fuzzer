@@ -110,7 +110,28 @@ pub const DIVISOR_FLOOR: f32 = 0.5;
 /// the smallest normal and the smallest subnormal because precision degrades below them
 /// and some implementations flush them away; the extremes because they are where
 /// overflow and underflow begin.
-pub const SPECIAL_VALUES: [f32; 10] = [
+///
+/// # `NaN` and `±inf`, added at PHASE-7E — and why they were missing
+///
+/// Every entry above is **finite**, so no generated or decoded case could ever contain a
+/// non-finite *input*. That was invisible until it hid a real result: `max([1, NaN, 3])`
+/// returns `NaN` on both CPU backends and `3.0` on the GPU — a semantic disagreement no
+/// tolerance can absorb, found by a hand-built probe and **unreachable by a campaign of any
+/// length**. A four-hour run would have reported zero findings and looked clean.
+///
+/// The `input_special` feature had measured 0 of 20,000 since PHASE-7B and was noted as an
+/// example of validation's "not reachable" outcome. It was a curiosity until an actual
+/// finding turned out to live behind it.
+///
+/// **Gated on `restrict_domains`**, like every other route into the undefined region. The
+/// seeded generator's default stays finite, so every distribution measured before this is
+/// unchanged; the fuzzer runs unrestricted and reaches them.
+///
+/// **The cost is real and expected:** more campaign cases will be `Skipped` rather than
+/// judged, because two backends both returning `NaN` have compared nothing. That is the
+/// policy working — a skip is an honest "no opinion", not a pass — but it means the judged
+/// fraction drops, and the skip column has to be read alongside the case count.
+pub const SPECIAL_VALUES: [f32; 13] = [
     0.0,
     -0.0,
     1.0,
@@ -121,6 +142,9 @@ pub const SPECIAL_VALUES: [f32; 10] = [
     -1e-45,
     1e30,
     -1e30,
+    f32::NAN,
+    f32::INFINITY,
+    f32::NEG_INFINITY,
 ];
 
 /// Which values an operation is willing to accept.
@@ -227,6 +251,13 @@ fn special_value(rng: &mut SeededRng, domain: Domain, bounds: &Bounds) -> f32 {
     let allowed: Vec<f32> = SPECIAL_VALUES
         .iter()
         .copied()
+        // **Non-finite inputs are gated on `restrict_domains`, like every other way of
+        // reaching the undefined region.** Restricted mode means well-behaved arguments, and
+        // a `NaN` input is exactly what it exists to exclude; the fuzzer runs unrestricted
+        // and so reaches them. Without this gate, adding them to the table would have changed
+        // every seeded distribution measured so far, for no gain — the campaign is where they
+        // are wanted.
+        .filter(|v| v.is_finite() || !bounds.restrict_domains)
         .filter(|v| match domain {
             Domain::Any => true,
             Domain::NonNegative => *v >= 0.0,
@@ -325,12 +356,49 @@ mod tests {
         let mut rng = SeededRng::from_seed(0);
         let drawn = values(&mut rng, 5_000, Domain::Any, &bounds);
 
-        for special in SPECIAL_VALUES {
+        // The finite ones, under the default restricted bounds.
+        for special in SPECIAL_VALUES.iter().filter(|v| v.is_finite()) {
             assert!(
                 drawn.iter().any(|v| v.to_bits() == special.to_bits()),
                 "{special} was never generated"
             );
         }
+    }
+
+    /// **`NaN` and the infinities appear only when domains are unrestricted**, which is the
+    /// fuzzer's setting and not the seeded default.
+    ///
+    /// Both halves matter. Reaching them is what makes the `max`-versus-`NaN` disagreement
+    /// findable by a campaign at all; *not* reaching them by default is what keeps every
+    /// distribution measured before PHASE-7E comparable.
+    #[test]
+    fn non_finite_inputs_appear_only_when_domains_are_unrestricted() {
+        let mut rng = SeededRng::from_seed(0);
+
+        let restricted = values(&mut rng, 5_000, Domain::Any, &Bounds::default());
+        assert!(
+            restricted.iter().all(|v| v.is_finite()),
+            "a non-finite value reached a restricted case"
+        );
+
+        let unrestricted = values(
+            &mut rng,
+            5_000,
+            Domain::Any,
+            &Bounds {
+                restrict_domains: false,
+                ..Bounds::default()
+            },
+        );
+        assert!(unrestricted.iter().any(|v| v.is_nan()), "no NaN generated");
+        assert!(
+            unrestricted.contains(&f32::INFINITY),
+            "no positive infinity generated"
+        );
+        assert!(
+            unrestricted.contains(&f32::NEG_INFINITY),
+            "no negative infinity generated"
+        );
     }
 
     /// Turning the rate off must turn them off entirely — a knob that does nothing is
