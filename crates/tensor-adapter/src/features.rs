@@ -28,7 +28,7 @@ use crate::input::{TensorOp, TensorValue};
 /// Seventeen features: eight describing *values*, nine describing *shape*. The split
 /// matters because they answer different questions — what the numbers are, versus which
 /// kernel the shape will select.
-pub const FEATURES: [&str; 20] = [
+pub const FEATURES: [&str; 25] = [
     // --- value features: standard floating-point failure modes ---
     "overflow_product",
     "mixed_sign_overflow",
@@ -54,6 +54,13 @@ pub const FEATURES: [&str; 20] = [
     "broadcast_present",
     "broadcast_whole_operand",
     "broadcast_both_operands",
+    // --- normalisation features (PHASE-7D): aimed at specific mechanisms, not at coverage.
+    //     Added before any softmax finding exists, so they cannot be fitted to one.
+    "norm_dim_is_last",
+    "norm_dim_large",
+    "norm_values_identical",
+    "norm_range_wide",
+    "norm_underflows_exp",
 ];
 
 /// A compile-time guard on the vocabulary size.
@@ -283,6 +290,61 @@ fn accumulation_features(values: &[f32], features: &mut FeatureVec) {
 /// including when both do and nothing stretches. These say something narrower and more
 /// useful: that a backend had to **reuse** an operand's elements, which is a different code
 /// path from an ordinary elementwise loop.
+/// How far below the maximum a value must sit for `exp` of the shifted argument to
+/// underflow `f32` to zero.
+///
+/// `exp(-104)` is below `f32::MIN_POSITIVE * f32::EPSILON`, so the shifted term rounds to
+/// zero. **Where one backend underflows and another returns a subnormal, they disagree about
+/// a term of the sum** — a disagreement in the numerator *and* the denominator at once.
+const EXP_UNDERFLOW_SHIFT: f32 = 104.0;
+
+/// A normalised dimension long enough that the accumulating part of the bound dominates the
+/// approximated part. Not a tuning constant: below this the `exp` term is the larger.
+const LARGE_NORM_DIM: usize = 16;
+
+/// A value range wide enough to matter to `exp`'s condition number, which is the argument's
+/// magnitude after the max-shift.
+const WIDE_RANGE: f32 = 20.0;
+
+/// Which properties of a normalisation case might select a different code path.
+///
+/// **`norm_dim_is_last` is the one with a named mechanism.** `burn-flex` transposes when the
+/// normalised dimension is not the last, normalises, and transposes back; when it is the
+/// last it computes directly. Two paths chosen by a property of the input — the same shape
+/// as the one real bug this project has found.
+fn normalisation_features(case: &TensorOp, features: &mut FeatureVec) {
+    let TensorOp::Activation { arg, dim, .. } = case else {
+        return;
+    };
+
+    if *dim == arg.rank() - 1 {
+        features.set("norm_dim_is_last");
+    }
+    if arg.shape()[*dim] >= LARGE_NORM_DIM {
+        features.set("norm_dim_large");
+    }
+
+    let data = arg.data();
+    if data.len() > 1 && data.iter().all(|v| v == &data[0]) {
+        // An exactly known answer: `1/n` for every element, which no correct implementation
+        // may round. A disagreement here needs no tolerance argument.
+        features.set("norm_values_identical");
+    }
+
+    let finite: Vec<f32> = data.iter().copied().filter(|v| v.is_finite()).collect();
+    if let (Some(low), Some(high)) = (
+        finite.iter().copied().reduce(f32::min),
+        finite.iter().copied().reduce(f32::max),
+    ) {
+        if high - low > WIDE_RANGE {
+            features.set("norm_range_wide");
+        }
+        if high - low > EXP_UNDERFLOW_SHIFT {
+            features.set("norm_underflows_exp");
+        }
+    }
+}
+
 fn broadcast_features(case: &TensorOp, features: &mut FeatureVec) {
     let TensorOp::Binary { lhs, rhs, .. } = case else {
         return;
@@ -319,6 +381,7 @@ fn shape_features(case: &TensorOp, features: &mut FeatureVec) {
     }
 
     broadcast_features(case, features);
+    normalisation_features(case, features);
 
     let TensorOp::Matmul { lhs, rhs } = case else {
         return;
@@ -365,6 +428,43 @@ fn operands(case: &TensorOp) -> Vec<&TensorValue> {
 
 #[cfg(test)]
 mod tests {
+    /// The normalisation features, each on a case built to isolate it.
+    #[test]
+    fn normalisation_features_name_the_paths_they_target() {
+        use crate::input::ActivationOp;
+
+        let build = |shape: &[usize], data: Vec<f32>, dim: usize| {
+            extract(&TensorOp::activation(
+                ActivationOp::Softmax,
+                TensorValue::new(shape.to_vec(), data),
+                dim,
+            ))
+        };
+
+        // The last dimension: the path where `burn-flex` does not transpose.
+        let last = build(&[2, 3], vec![1.0; 6], 1);
+        assert!(last.has("norm_dim_is_last"));
+        assert!(last.has("norm_values_identical"));
+
+        // Not the last: the transposing path.
+        let off_last = build(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 0);
+        assert!(!off_last.has("norm_dim_is_last"));
+        assert!(!off_last.has("norm_values_identical"));
+
+        // A long normalised dimension drives the accumulating part of the bound.
+        let long = build(&[20], vec![0.0; 20], 0);
+        assert!(long.has("norm_dim_large"));
+
+        // A wide range drives `exp`'s condition number after the max-shift.
+        let wide = build(&[2], vec![0.0, 50.0], 0);
+        assert!(wide.has("norm_range_wide"));
+        assert!(!wide.has("norm_underflows_exp"));
+
+        // Wide enough that the shifted argument underflows `exp` to zero on one side.
+        let underflow = build(&[2], vec![0.0, 200.0], 0);
+        assert!(underflow.has("norm_underflows_exp"));
+    }
+
     /// The three broadcast features, on cases built to isolate each.
     #[test]
     fn broadcast_features_distinguish_the_shape_of_the_stretch() {
