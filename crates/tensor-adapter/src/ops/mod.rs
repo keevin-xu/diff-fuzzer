@@ -19,6 +19,7 @@
 pub mod activation;
 pub mod binary;
 pub mod broadcast;
+pub mod conv;
 pub mod matmul;
 pub mod reduce;
 pub mod scan;
