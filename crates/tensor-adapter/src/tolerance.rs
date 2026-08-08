@@ -122,11 +122,9 @@ impl TensorOp {
                 // see `accumulating_tolerance`.
                 ReduceOp::Prod => OpClass::Accumulating,
             },
-            // **Accumulating, and this is a real classification rather than a placeholder.**
-            // Each output element is a sum of `(in_channels / groups) * kh * kw` products, so
-            // the error grows with the term count exactly as `matmul`'s does. What 7G.5 still
-            // owes is the *count* — `accumulating_tolerance` must learn to compute it from the
-            // shapes, and until it does this operation is not generated.
+            // Each output element is a sum of `(in_channels / groups) * kh * kw` products,
+            // so the error grows with the term count exactly as `matmul`'s does. See
+            // `accumulating_tolerance`.
             TensorOp::Conv2d { .. } => OpClass::Accumulating,
             TensorOp::Matmul { .. } => OpClass::Accumulating,
             // See `composed_tolerance`: `exp` over a sum, then a division.
@@ -752,6 +750,53 @@ fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
             let largest = largest_magnitude(lhs.data()) * largest_magnitude(rhs.data());
             bound(terms, largest)
         }
+        // **A convolution is a matmul with a differently-shaped inner dimension.**
+        //
+        // Each output element is a sum of `(in_channels / groups) × kh × kw` products of one
+        // image value with one weight value, plus the bias when there is one. So it reuses
+        // `bound` unchanged, exactly as `matmul` does; only the term count is new.
+        //
+        // **The term count depends on the channels and the kernel, not on the size of the
+        // tensor** — which is the part worth being able to say out loud. A `256×256` image
+        // convolved with a `3×3` kernel over 4 channels sums **36** terms per output, not
+        // 65,536: widening the image adds more output elements, each one just as accurate.
+        // Deepening the channels or enlarging the kernel is what loosens the bound.
+        //
+        // **Fused multiply-add needs no extra allowance here.** libtorch's GEMM fuses inside
+        // its micro-kernel and not in the trailing corner (`SPECS.md` §3.1), so one
+        // implementation may round once per term where another rounds twice — a difference of
+        // at most one `EPSILON` per term, and `bound` already carries a factor of two for the
+        // two implementations sitting on opposite sides of the true value.
+        //
+        // **The GPU needs no extra *relative* slack either.** Metal's Table 8.2 lists `x + y`
+        // and `x * y` as correctly rounded (`SPECS.md` §4.1), so the per-operation rounding
+        // matches a CPU's; what differs is association order, which the term count already
+        // covers. The subnormal floor a GPU pair needs is added by `tolerance_for`, not here.
+        TensorOp::Conv2d {
+            input,
+            weight,
+            bias,
+            params,
+        } => {
+            let in_channels = input.shape()[1];
+            let (kernel_h, kernel_w) = (weight.shape()[2], weight.shape()[3]);
+            // `groups` divides `in_channels` by construction — `TensorOp::conv2d` asserts it.
+            let mut terms = (in_channels / params.groups) * kernel_h * kernel_w;
+
+            // A product of two values is bounded by the product of their largest magnitudes,
+            // as in `matmul`.
+            let mut largest = largest_magnitude(input.data()) * largest_magnitude(weight.data());
+
+            // **The bias is one more term, and it is not a product.** Folding it in as if it
+            // were would understate its magnitude whenever the bias is larger than the
+            // products it is added to — so the summand bound takes the larger of the two.
+            if let Some(bias) = bias {
+                terms += 1;
+                largest = largest.max(largest_magnitude(bias.data()));
+            }
+
+            bound(terms, largest)
+        }
         // Every accumulating operation is handled above; anything else is misclassified.
         other => unreachable!("{} is not an accumulating operation", other.name()),
     }
@@ -774,6 +819,86 @@ mod tests {
     use super::*;
     use crate::backends::{FLEX_NAME, LIBTORCH_NAME, WGPU_NAME};
     use crate::input::{BinaryOp, ReduceOp, TensorValue, UnaryOp};
+
+    fn conv(image: &[usize], weight: &[usize], groups: usize, bias: bool) -> TensorOp {
+        use crate::input::Conv2dParams;
+        let fill = |shape: &[usize]| {
+            TensorValue::new(shape.to_vec(), vec![1.0; shape.iter().product::<usize>()])
+        };
+        TensorOp::conv2d(
+            fill(image),
+            fill(weight),
+            bias.then(|| fill(&[weight[0]])),
+            Conv2dParams {
+                groups,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// **The claim the derivation rests on**, and the one worth being able to defend: a
+    /// convolution's accuracy is governed by how many products each output sums, which is a
+    /// property of the channels and the kernel. Making the *image* larger adds more output
+    /// elements, each one just as accurate — so the bound must not move.
+    #[test]
+    fn the_conv_bound_follows_the_kernel_and_channels_not_the_image_size() {
+        let small = tolerance_for(&conv(&[1, 4, 5, 5], &[2, 4, 3, 3], 1, false));
+        let large = tolerance_for(&conv(&[1, 4, 32, 32], &[2, 4, 3, 3], 1, false));
+        assert_eq!(
+            small.rtol, large.rtol,
+            "a wider image must not loosen the bound"
+        );
+
+        let deeper = tolerance_for(&conv(&[1, 8, 5, 5], &[2, 8, 3, 3], 1, false));
+        assert!(
+            deeper.rtol > small.rtol,
+            "doubling the input channels doubles the terms summed per output"
+        );
+
+        let wider_kernel = tolerance_for(&conv(&[1, 4, 5, 5], &[2, 4, 3, 3], 1, false));
+        let narrow_kernel = tolerance_for(&conv(&[1, 4, 5, 5], &[2, 4, 1, 1], 1, false));
+        assert!(
+            wider_kernel.rtol > narrow_kernel.rtol,
+            "a 3x3 kernel sums nine times as many terms as a 1x1"
+        );
+    }
+
+    /// **Grouping divides the term count.** Each output channel sees only `in_channels /
+    /// groups` inputs, so a grouped convolution is *more* accurate per output, not less — and
+    /// a bound that ignored `groups` would be loose by exactly that factor.
+    #[test]
+    fn grouping_tightens_the_bound_because_each_output_sums_fewer_terms() {
+        let dense = tolerance_for(&conv(&[1, 8, 5, 5], &[8, 8, 3, 3], 1, false));
+        let grouped = tolerance_for(&conv(&[1, 8, 5, 5], &[8, 2, 3, 3], 4, false));
+        assert!(
+            grouped.rtol < dense.rtol,
+            "grouped {} should be tighter than dense {}",
+            grouped.rtol,
+            dense.rtol
+        );
+    }
+
+    /// The bias is one more summand, so it must move the bound — by exactly one term.
+    #[test]
+    fn a_bias_adds_exactly_one_term() {
+        let without = tolerance_for(&conv(&[1, 1, 5, 5], &[1, 1, 1, 1], 1, false));
+        let with = tolerance_for(&conv(&[1, 1, 5, 5], &[1, 1, 1, 1], 1, true));
+        assert!(with.rtol > without.rtol);
+        // One term versus two: the relative term is `2 * terms * EPSILON`.
+        assert!((with.rtol - 2.0 * without.rtol).abs() < 1e-12, "{with:?}");
+    }
+
+    /// **A bound that cannot fail is not a passing grade.** A convolution over ordinary
+    /// values must stay judgeable, or the operation reports agreement it never tested — the
+    /// failure the tolerance audit found in 96% of `matmul` cases.
+    #[test]
+    fn an_ordinary_convolution_is_judgeable() {
+        let tolerance = tolerance_for(&conv(&[1, 4, 8, 8], &[4, 4, 3, 3], 1, true));
+        assert!(
+            !tolerance.is_vacuous(),
+            "an ordinary convolution should be judgeable, got {tolerance:?}"
+        );
+    }
 
     /// The exact case from `fuzz-cumprod-eeefcf7a81528bd`, row 4: multiplying left to right
     /// underflows to zero at step 2, while grouping the tiny factors against the huge ones
