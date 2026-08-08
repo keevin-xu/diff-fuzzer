@@ -253,6 +253,7 @@ pub fn generate_query(
             Some(SetBranch {
                 op: second,
                 right: Box::new(SelectStmt {
+                    having: None,
                     distinct: false,
                     projection: projection.clone(),
                     from: table.name.clone(),
@@ -272,6 +273,7 @@ pub fn generate_query(
         Some(SetBranch {
             op,
             right: Box::new(SelectStmt {
+                having: None,
                 distinct: false,
                 projection: projection.clone(),
                 from: table.name.clone(),
@@ -283,6 +285,41 @@ pub fn generate_query(
                 order_by: Vec::new(),
                 limit: None,
             }),
+        })
+    } else {
+        None
+    };
+
+    // `HAVING`, on aggregating queries only — it filters groups, so there must be groups.
+    //
+    // The predicate compares an **aggregate** against a small literal, which is the whole
+    // point: it applies three-valued logic to a value the engine *computed*. A `SUM` over a
+    // group of all-`NULL`s is `NULL`, so `HAVING SUM(x) > 0` is UNKNOWN and the group vanishes
+    // — the same trap as a `NULL` in a `WHERE`, one level up.
+    let having = if bounds.having && shape != QueryShape::Rows && rng.random_range(0..100) < 55 {
+        // Reuse a projected aggregate rather than inventing one, so the `HAVING` refers to
+        // something the reader can see in the result. Both engines also accept an aggregate in
+        // `HAVING` that is not projected, but a repro is easier to read when it is.
+        // **Only aggregates whose result is numeric**, and this restriction was added after a
+        // campaign found it missing. `MAX` over a `TEXT` column is `TEXT`, and comparing that
+        // against an integer literal is the documented text-versus-integer difference the
+        // subset keeps unrepresentable — SQLite coerces, DuckDB refuses. Generating it produced
+        // 825 `rows-vs-error` findings that were all our own invalid SQL.
+        //
+        // `COUNT` is always numeric; `MIN`/`MAX`/`SUM` are numeric only when their argument is.
+        let aggregate = projection
+            .iter()
+            .find(|expression| numeric_aggregate(expression, table))
+            .cloned();
+        aggregate.map(|aggregate| Expr::Binary {
+            op: match rng.random_range(0..4) {
+                0 => BinaryOp::Greater,
+                1 => BinaryOp::Less,
+                2 => BinaryOp::NotEqual,
+                _ => BinaryOp::Equal,
+            },
+            left: Box::new(aggregate),
+            right: Box::new(Expr::Literal(Literal::Integer(rng.random_range(-2..=2)))),
         })
     } else {
         None
@@ -317,6 +354,7 @@ pub fn generate_query(
         && rng.random_range(0..100) < 50;
 
     SelectStmt {
+        having,
         distinct,
         projection,
         from: table.name.clone(),
@@ -355,6 +393,31 @@ enum QueryShape {
 ///
 /// The correlation — `= outer.c` — is the point. Without it the subquery is a constant the
 /// optimizer can hoist, and both engines would compute it once and agree.
+/// Does this projected expression aggregate to a **number**?
+///
+/// The question a `HAVING` comparison against an integer literal has to ask first. `COUNT`
+/// counts, so it is numeric whatever it counted; `MIN`/`MAX`/`SUM` take the type of their
+/// argument, so over a `TEXT` column they are `TEXT` and comparing them to an integer is the
+/// cross-type comparison this subset exists to avoid.
+fn numeric_aggregate(expression: &Expr, table: &Table) -> bool {
+    let Expr::Aggregate { func, arg } = expression else {
+        return false;
+    };
+    match func {
+        // A count is a number however it was reached, including `COUNT(text_column)`.
+        AggregateFunc::CountRows | AggregateFunc::Count => true,
+        AggregateFunc::Min | AggregateFunc::Max | AggregateFunc::Sum => match arg.as_deref() {
+            Some(Expr::Column(reference)) => {
+                table.column(&reference.column).is_some_and(|(_, column)| {
+                    matches!(column.sql_type, SqlType::Integer | SqlType::BigInt)
+                })
+            }
+            // Anything else is not a shape this generator produces; refusing is the safe answer.
+            _ => false,
+        },
+    }
+}
+
 /// `c IN (1, 2, NULL)` — or, mostly, `NOT IN`.
 ///
 /// The constant-foldable sibling of [`generate_not_in`]. Three choices carry the design:
@@ -428,6 +491,7 @@ fn generate_not_in(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Option<
         not: rng.random_range(0..100) < 80,
         left: Box::new(Expr::Column(reference(outer, &outer_column.name))),
         query: Box::new(SelectStmt {
+            having: None,
             distinct: false,
             projection: vec![Expr::Column(reference(inner, &inner_column.name))],
             from: inner.name.clone(),
@@ -470,6 +534,7 @@ fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Optio
         Some(Expr::Exists {
             not: rng.random_range(0..2) == 0,
             query: Box::new(SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Column(reference(inner, &inner_column.name))],
                 from: inner.name.clone(),
@@ -499,6 +564,7 @@ fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Optio
             },
             left: Box::new(Expr::Column(reference(outer, &outer_column.name))),
             query: Box::new(SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Aggregate {
                     func,
@@ -1127,19 +1193,79 @@ mod tests {
     /// This is what keeps `1 = '1'` — where the two engines differ — out of every case, and
     /// it is worth testing rather than trusting, because the generator's type discipline is
     /// spread across three functions.
+    /// **Runs over every configuration, not just `V1` — and that is the point.**
+    ///
+    /// This test used to walk only `Bounds::V1`, which is the *narrowest* setting and contains
+    /// none of the constructs added after it. Every axis since — subqueries, `not_in`,
+    /// `not_in_list`, `distinct`, `having` — was outside its reach, so it could not have failed
+    /// no matter what they generated.
+    ///
+    /// It did not fail, and a campaign found what it missed: a `HAVING MAX(text_column) > -2`,
+    /// comparing `TEXT` against an integer, which SQLite coerces and DuckDB refuses. 825
+    /// findings, all of them our own invalid SQL. **A test pinned to the narrowest
+    /// configuration tests the code that was written before it and nothing since.**
     #[test]
     fn comparisons_never_mix_text_with_integers() {
-        for seed in 0..500 {
-            let (tables, _, query) = generated(seed);
-            let table = table_of(&tables, &query.from);
+        for (name, bounds) in [
+            ("V1", Bounds::V1),
+            ("V1_ALL", Bounds::V1_ALL),
+            ("V1_HAVING", Bounds::V1_HAVING),
+            ("V1_SUBQUERIES", Bounds::V1_SUBQUERIES),
+            ("V1_NOT_IN_LIST", Bounds::V1_NOT_IN_LIST),
+        ] {
+            for seed in 0..500 {
+                let mut rng = SeededRng::from_seed(seed);
+                let tables = generate_schema(&mut rng, bounds);
+                let data = generate_data(&mut rng, &tables, bounds);
+                let query = generate_query(&mut rng, &tables, &data, bounds);
+                let table = table_of(&tables, &query.from);
 
-            if let Some(filter) = &query.filter {
-                assert_types_agree(filter, table, seed);
-            }
-            for expression in &query.projection {
-                assert_types_agree(expression, table, seed);
+                if let Some(filter) = &query.filter {
+                    assert_types_agree(filter, table, seed);
+                }
+                for expression in &query.projection {
+                    assert_types_agree(expression, table, seed);
+                }
+                // **The clause the campaign found missing.** A `HAVING` compares an aggregate
+                // against a literal, and nothing was checking that the two had compatible
+                // types.
+                if let Some(having) = &query.having {
+                    assert!(
+                        !matches!(assert_types_agree(having, table, seed), Some(SqlType::Text)),
+                        "{name} seed {seed}: HAVING is a text comparison"
+                    );
+                }
             }
         }
+    }
+
+    /// A `HAVING` must compare a **numeric** aggregate, never a text one.
+    ///
+    /// Stated directly as well as via the type walk, because this is the specific rule the
+    /// campaign's 825 findings came from and it deserves a test that names it.
+    #[test]
+    fn having_never_compares_a_text_aggregate_against_a_number() {
+        let mut seen = 0;
+        for seed in 0..3_000 {
+            let mut rng = SeededRng::from_seed(seed);
+            let tables = generate_schema(&mut rng, Bounds::V1_HAVING);
+            let data = generate_data(&mut rng, &tables, Bounds::V1_HAVING);
+            let query = generate_query(&mut rng, &tables, &data, Bounds::V1_HAVING);
+            let table = table_of(&tables, &query.from);
+
+            let Some(Expr::Binary { left, .. }) = &query.having else {
+                continue;
+            };
+            seen += 1;
+            assert!(
+                numeric_aggregate(left, table),
+                "seed {seed}: HAVING compares a non-numeric aggregate {left:?}"
+            );
+        }
+        assert!(
+            seen > 100,
+            "only {seen} HAVING clauses generated in 3000 cases"
+        );
     }
 
     /// Walk an expression, checking that every binary operator sees compatible operand

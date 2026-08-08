@@ -191,6 +191,7 @@ impl SqlCase {
                 ],
             }],
             query: SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Column(reference("c0")), Expr::Column(reference("c1"))],
                 from: "t0".to_string(),
@@ -461,6 +462,7 @@ mod tests {
                 rows: vec![vec![Literal::Integer(1)], vec![Literal::Integer(2)]],
             }],
             query: SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Column(ColumnRef {
                     table: "t0".to_string(),
@@ -649,6 +651,7 @@ mod tests {
         case.query.filter = Some(Expr::Exists {
             not: false,
             query: Box::new(SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Column(inner_column.clone())],
                 from: "t1".to_string(),

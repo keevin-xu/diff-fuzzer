@@ -700,6 +700,17 @@ pub struct SelectStmt {
     /// and one whose DuckDB side has not been retrieved. Chaining is a separate axis to add
     /// deliberately, not something to inherit by accident.
     pub set_op: Option<SetBranch>,
+    /// `HAVING`, if any — a filter on **groups**, applied after aggregation.
+    ///
+    /// Only meaningful when the query aggregates, and only generated then. Worth an axis
+    /// because it applies three-valued logic to *aggregate results* rather than to rows: a
+    /// `HAVING SUM(x) > 0` on a group whose `SUM` is `NULL` is UNKNOWN, and the group vanishes.
+    ///
+    /// **It breaks the `WHERE`-partitioned TLP forms**, which is why they refuse it: the
+    /// partitions have different aggregate values than the whole, so a group passing
+    /// `HAVING SUM > 5` with `SUM = 6` fails in both partitions when split into 2 and 4.
+    /// Partitioning on *this* predicate instead is sound — see `metamorphic::partition_having`.
+    pub having: Option<Expr>,
     /// `GROUP BY` columns. Empty means no grouping.
     ///
     /// When non-empty, every projected expression must be either one of these columns or an
@@ -911,6 +922,7 @@ mod tests {
     #[test]
     fn the_tree_survives_a_round_trip_through_json() {
         let statement = SelectStmt {
+            having: None,
             distinct: false,
             projection: vec![Expr::Column(column_ref("a"))],
             from: "t".to_string(),

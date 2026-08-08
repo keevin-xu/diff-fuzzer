@@ -96,6 +96,7 @@ pub fn partition(case: &SqlCase) -> Option<Partitioned> {
         || case.aggregates()
         || case.query.set_op.is_some()
         || case.query.limit.is_some()
+        || case.query.having.is_some()
     {
         return None;
     }
@@ -163,6 +164,7 @@ pub fn partition_aggregate(case: &SqlCase) -> Option<PartitionedAggregate> {
         || !case.query.group_by.is_empty()
         || case.query.set_op.is_some()
         || case.query.limit.is_some()
+        || case.query.having.is_some()
     {
         return None;
     }
@@ -291,10 +293,16 @@ pub fn partition_grouped(case: &SqlCase) -> Option<PartitionedGroups> {
     // `DISTINCT` refused for the same reason as the whole-table form: `GROUP BY` already emits
     // one row per group, so `DISTINCT` is very likely a no-op — and the per-group recombination
     // was derived without it.
+    // **`HAVING` breaks this relation, and not subtly.** It filters groups by their aggregate
+    // value — but each partition's aggregate differs from the whole's, so a group with
+    // `SUM = 6` passes `HAVING SUM > 5` in the whole and fails in both partitions when its rows
+    // split 2 and 4. The whole keeps the group, the partitions lose it, on a correct engine.
+    // Partitioning on the `HAVING` predicate instead is sound — see [`partition_having`].
     if case.query.distinct
         || case.query.group_by.len() != 1
         || case.query.set_op.is_some()
         || case.query.limit.is_some()
+        || case.query.having.is_some()
     {
         return None;
     }
@@ -505,6 +513,68 @@ pub fn check_grouped(
     }
 }
 
+/// A query partitioned on its **`HAVING`** predicate rather than its `WHERE`.
+///
+/// # Why this exists, and why it is not a workaround
+///
+/// `HAVING` breaks the `WHERE`-partitioned forms, because splitting the *rows* changes each
+/// partition's aggregate and so changes which groups survive the `HAVING`. But the same
+/// observation supplies a sound relation: partition on the `HAVING` predicate itself. Every
+/// group falls into exactly one of `h` TRUE / `h` FALSE / `h` UNKNOWN, nothing else moves, and
+/// the three sets of groups reconstruct the unfiltered result.
+///
+/// It reaches a class the `WHERE` forms cannot: three-valued logic over a value the engine
+/// **computed** rather than one that was stored. `HAVING SUM(x) > 0` on a group whose `SUM` is
+/// `NULL` is UNKNOWN — so this tests the aggregation path's `NULL` handling, where the others
+/// test the comparison's.
+///
+/// The comparison is [`check`] unchanged: the output rows are groups, group keys are distinct,
+/// so the ordinary multiset relation applies with nothing added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedHaving {
+    /// The query with **no** `HAVING`: every group.
+    pub whole: SqlCase,
+    pub is_true: SqlCase,
+    pub is_false: SqlCase,
+    pub is_unknown: SqlCase,
+}
+
+/// Build the `HAVING` partition, or `None` if the case has no `HAVING` to partition on.
+pub fn partition_having(case: &SqlCase) -> Option<PartitionedHaving> {
+    let predicate = case.query.having.clone()?;
+
+    // A set operation or `LIMIT` would make "the groups this query returns" something other
+    // than what the relation is about, exactly as for the other forms. `DISTINCT` is excluded
+    // because it would deduplicate groups and reintroduce the straddling-duplicate problem.
+    if case.query.set_op.is_some() || case.query.limit.is_some() || case.query.distinct {
+        return None;
+    }
+
+    let base = |having: Option<Expr>| {
+        let mut variant = case.clone();
+        variant.query = SelectStmt {
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            ..case.query.clone()
+        };
+        variant
+    };
+
+    Some(PartitionedHaving {
+        whole: base(None),
+        is_true: base(Some(predicate.clone())),
+        is_false: base(Some(Expr::Unary {
+            op: UnaryOp::Not,
+            operand: Box::new(predicate.clone()),
+        })),
+        is_unknown: base(Some(Expr::Unary {
+            op: UnaryOp::IsNull,
+            operand: Box::new(predicate),
+        })),
+    })
+}
+
 /// The NoREC pair: the same question asked in a way the optimizer can use, and a way it cannot.
 ///
 /// # A different failure mode from TLP, which is the point of having both
@@ -535,7 +605,7 @@ pub fn norec(case: &SqlCase) -> Option<NoRec> {
     // rows. Counting those would compare "how many rows match" against "how many *distinct*
     // truth values occurred", which is not the same question and would fail on almost every
     // case with more than three rows.
-    if case.query.distinct {
+    if case.query.distinct || case.query.having.is_some() {
         return None;
     }
 
@@ -832,6 +902,7 @@ mod tests {
                 },
             ],
             query: SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Column(column("t0", "c0"))],
                 from: "t0".to_string(),
@@ -842,6 +913,7 @@ mod tests {
                     not,
                     left: Box::new(Expr::Column(column("t0", "c0"))),
                     query: Box::new(SelectStmt {
+                        having: None,
                         distinct: false,
                         projection: vec![Expr::Column(column("t1", "c0"))],
                         from: "t1".to_string(),
@@ -917,6 +989,7 @@ mod tests {
                 ],
             }],
             query: SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Column(ColumnRef {
                     table: "t0".to_string(),
@@ -1007,6 +1080,7 @@ mod tests {
                 ],
             }],
             query: SelectStmt {
+                having: None,
                 distinct,
                 projection: vec![Expr::Column(ColumnRef {
                     table: "t0".to_string(),
@@ -1096,6 +1170,168 @@ mod tests {
             Relation::Holds,
             "documented blind spot: set comparison cannot count copies"
         );
+    }
+
+    /// `HAVING` over a `NULL` aggregate drops the group, on both engines.
+    ///
+    /// The trap this axis exists for: `SUM` over a group of all-`NULL`s is `NULL`, so
+    /// `HAVING SUM(x) > 0` is UNKNOWN and the group disappears — not because its sum is small,
+    /// but because it has no sum. Three-valued logic on a **computed** value.
+    #[test]
+    fn having_over_a_null_aggregate_drops_the_group_on_both_engines() {
+        use crate::schema::{AggregateFunc, BinaryOp, Column, InsertRows, Literal, SqlType, Table};
+
+        let key = ColumnRef {
+            table: "t0".to_string(),
+            column: "g".to_string(),
+        };
+        let value = ColumnRef {
+            table: "t0".to_string(),
+            column: "v".to_string(),
+        };
+        let sum = || Expr::Aggregate {
+            func: AggregateFunc::Sum,
+            arg: Some(Box::new(Expr::Column(value.clone()))),
+        };
+
+        let query = |having: Option<Expr>| SqlCase {
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![
+                    Column {
+                        name: "g".to_string(),
+                        sql_type: SqlType::Integer,
+                    },
+                    Column {
+                        name: "v".to_string(),
+                        sql_type: SqlType::Integer,
+                    },
+                ],
+            }],
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                rows: vec![
+                    // Group 1 sums to 5. Group 2 is all NULL, so its SUM is NULL.
+                    vec![Literal::Integer(1), Literal::Integer(5)],
+                    vec![Literal::Integer(2), Literal::Null],
+                    vec![Literal::Integer(2), Literal::Null],
+                ],
+            }],
+            query: SelectStmt {
+                having,
+                distinct: false,
+                projection: vec![Expr::Column(key.clone()), sum()],
+                from: "t0".to_string(),
+                join: None,
+                set_op: None,
+                group_by: vec![key.clone()],
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        let greater_than_zero = || {
+            Some(Expr::Binary {
+                op: BinaryOp::Greater,
+                left: Box::new(sum()),
+                right: Box::new(Expr::Literal(Literal::Integer(0))),
+            })
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let run = |case: &SqlCase| -> Vec<Vec<Cell>> {
+                let outcome = if engine == "sqlite" {
+                    SqliteImpl.run(case).expect("sqlite runs the case")
+                } else {
+                    DuckDbImpl.run(case).expect("duckdb runs the case")
+                };
+                let SqlOutcome::Rows(mut rows) = outcome else {
+                    panic!("{engine}: expected rows")
+                };
+                rows.sort_by_key(|row| format!("{row:?}"));
+                rows
+            };
+
+            // Both groups exist without the HAVING — one summing to 5, one summing to NULL.
+            assert_eq!(
+                run(&query(None)).len(),
+                2,
+                "{engine}: two groups before HAVING"
+            );
+
+            // With it, only group 1 survives. Group 2 is dropped because UNKNOWN is not TRUE,
+            // which is the whole point — it is not dropped for being small.
+            assert_eq!(
+                run(&query(greater_than_zero())),
+                vec![vec![Cell::Integer(1), Cell::Integer(5)]],
+                "{engine}: a NULL aggregate must fail HAVING rather than pass it"
+            );
+
+            // **The control.** `HAVING SUM(v) IS NULL` picks out exactly the group the other
+            // form dropped — proving it was excluded by UNKNOWN, not by absence.
+            let is_null = Some(Expr::Unary {
+                op: UnaryOp::IsNull,
+                operand: Box::new(sum()),
+            });
+            assert_eq!(
+                run(&query(is_null)),
+                vec![vec![Cell::Integer(2), Cell::Null]],
+                "{engine}: the UNKNOWN partition must contain the dropped group"
+            );
+        }
+    }
+
+    /// The `HAVING` partition holds across generated cases, on both engines.
+    #[test]
+    fn the_having_relation_holds_across_generated_cases() {
+        let generator = SqlGenerator::new(Bounds::V1_HAVING);
+        let mut checked = 0;
+
+        for seed in 0..400 {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            let Some(parts) = partition_having(&case) else {
+                continue;
+            };
+
+            for engine in ["sqlite", "duckdb"] {
+                let run = |c: &SqlCase| -> Option<SqlOutcome> {
+                    if engine == "sqlite" {
+                        SqliteImpl.run(c).ok()
+                    } else {
+                        DuckDbImpl.run(c).ok()
+                    }
+                };
+                let (Some(w), Some(t), Some(f), Some(u)) = (
+                    run(&parts.whole),
+                    run(&parts.is_true),
+                    run(&parts.is_false),
+                    run(&parts.is_unknown),
+                ) else {
+                    continue;
+                };
+
+                match check(&w, &t, &f, &u) {
+                    Relation::Violated {
+                        only_in_whole,
+                        only_in_partitions,
+                        ..
+                    } => panic!(
+                        "seed {seed} on {engine}: HAVING TLP violated — far likelier a defect in \
+                         the transform than an engine bug at this stage.\n{}\n{}\n{}",
+                        only_in_whole.join(" "),
+                        only_in_partitions.join(" "),
+                        parts
+                            .whole
+                            .statements(crate::render::Dialect::Sqlite)
+                            .join(";\n")
+                    ),
+                    Relation::Holds => checked += 1,
+                    Relation::NotChecked(_) => {}
+                }
+            }
+        }
+        assert!(checked > 50, "only {checked} HAVING checks ran");
     }
 
     /// Build a grouped result: each entry is a group key followed by its aggregate values,
@@ -1685,7 +1921,7 @@ mod tests {
         // by adding a second or third form, so it cannot show whether they earn their place.
         for (name, bounds, floor) in [("V1", Bounds::V1, 50), ("V1_ALL", Bounds::V1_ALL, 40)] {
             let generator = SqlGenerator::new(bounds);
-            let (mut rows, mut aggregate, mut grouped) = (0, 0, 0);
+            let (mut rows, mut aggregate, mut grouped, mut having) = (0, 0, 0, 0);
             for seed in 0..300 {
                 let case = generator.generate(&mut SeededRng::from_seed(seed));
                 if partition(&case).is_some() {
@@ -1697,12 +1933,18 @@ mod tests {
                 if partition_grouped(&case).is_some() {
                     grouped += 1;
                 }
+                // The fourth form, added at S9.5. Counting only three was why this test failed
+                // when `HAVING` entered `V1_ALL`: the other three refuse a `HAVING` query, so
+                // coverage looked to have dropped when in fact a new form had picked it up.
+                if partition_having(&case).is_some() {
+                    having += 1;
+                }
             }
-            let percent = 100 * (rows + aggregate + grouped) / 300;
+            let percent = 100 * (rows + aggregate + grouped + having) / 300;
             assert!(
                 percent >= floor,
                 "{name}: only {percent}% partitionable ({rows} rows, {aggregate} aggregate, \
-                 {grouped} grouped), below the {floor}% this test pins"
+                 {grouped} grouped, {having} having), below the {floor}% this test pins"
             );
         }
     }

@@ -139,6 +139,15 @@ pub struct Bounds {
     /// ordering keys are already projected — which keeps the axis *additive*, rather than
     /// suppressing ordering the way three earlier widenings did.
     pub distinct: bool,
+    /// Whether the generator may emit `HAVING` — a filter on **groups**, after aggregation.
+    ///
+    /// Three-valued logic moved one level up: `HAVING SUM(x) > 0` on a group whose `SUM` is
+    /// `NULL` is UNKNOWN, and the group disappears. The same trap as a `WHERE` on a `NULL`, but
+    /// on a value the engine *computed* rather than one that was stored — so it exercises the
+    /// aggregation path's `NULL` handling rather than the comparison's.
+    ///
+    /// Requires aggregation, so it only attaches to grouped or whole-table-aggregate queries.
+    pub having: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -204,6 +213,7 @@ impl Bounds {
         not_in: false,
         not_in_list: false,
         distinct: false,
+        having: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -228,6 +238,15 @@ impl Bounds {
     /// V1 plus `SELECT DISTINCT`. One axis, as always.
     pub const V1_DISTINCT: Bounds = Bounds {
         distinct: true,
+        ..Bounds::V1
+    };
+
+    /// V1 plus `HAVING`. Needs aggregates to attach to, so this preset enables both — the one
+    /// axis in this crate that cannot be varied entirely alone, and it is noted rather than
+    /// hidden: yield here is `having` **given** aggregates, measured against `V1_AGGREGATES`.
+    pub const V1_HAVING: Bounds = Bounds {
+        aggregates: true,
+        having: true,
         ..Bounds::V1
     };
 
@@ -270,6 +289,7 @@ impl Bounds {
         not_in: true,
         not_in_list: true,
         distinct: true,
+        having: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -342,6 +362,7 @@ impl GenerationAxes for Bounds {
             ("not-in", self.not_in),
             ("not-in-list", self.not_in_list),
             ("distinct", self.distinct),
+            ("having", self.having),
         ]
     }
 

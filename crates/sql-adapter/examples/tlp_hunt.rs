@@ -40,9 +40,9 @@ use sql_adapter::backends::{DuckDbImpl, SqliteImpl};
 use sql_adapter::gen_schema::Bounds;
 use sql_adapter::generator::SqlGenerator;
 use sql_adapter::metamorphic::{
-    Partitioned, PartitionedAggregate, PartitionedGroups, Relation, check, check_aggregate,
-    check_distinct, check_grouped, check_norec, norec, partition, partition_aggregate,
-    partition_grouped,
+    Partitioned, PartitionedAggregate, PartitionedGroups, PartitionedHaving, Relation, check,
+    check_aggregate, check_distinct, check_grouped, check_norec, norec, partition,
+    partition_aggregate, partition_grouped, partition_having,
 };
 use sql_adapter::outcome::SqlOutcome;
 use sql_adapter::render::Dialect;
@@ -85,6 +85,23 @@ fn judge_grouped(engine: &str, parts: &PartitionedGroups) -> Relation {
     check_grouped(&parts.funcs, &whole, &t, &f, &u)
 }
 
+/// Run the four `HAVING` variants and check them.
+///
+/// Uses [`check`] unchanged: the output rows are groups and group keys are distinct, so the
+/// ordinary multiset relation applies with nothing added.
+fn judge_having(engine: &str, parts: &PartitionedHaving) -> Relation {
+    let (Some(whole), Some(t), Some(f), Some(u)) = (
+        run(engine, &parts.whole),
+        run(engine, &parts.is_true),
+        run(engine, &parts.is_false),
+        run(engine, &parts.is_unknown),
+    ) else {
+        return Relation::NotChecked("a variant could not be run");
+    };
+
+    check(&whole, &t, &f, &u)
+}
+
 /// Run the four variants on one engine and check the relation.
 fn judge(engine: &str, parts: &Partitioned) -> Relation {
     let (Some(whole), Some(is_true), Some(is_false), Some(is_unknown)) = (
@@ -119,6 +136,7 @@ fn main() {
         Some("not-in") => Bounds::V1_NOT_IN,
         Some("not-in-list") => Bounds::V1_NOT_IN_LIST,
         Some("distinct") => Bounds::V1_DISTINCT,
+        Some("having") => Bounds::V1_HAVING,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,
         // **The default is now `V1_ALL`, matching the differential campaign.** It used to be
@@ -153,6 +171,7 @@ fn main() {
     // most intricate of the three — ever ran at all. A form that never fires is dead weight
     // dressed up as coverage, and only a breakdown shows it.
     let (mut rows_checks, mut aggregate_checks, mut grouped_checks) = (0usize, 0usize, 0usize);
+    let mut having_checks = 0usize;
 
     let started = Instant::now();
     for seed in 0..total as u64 {
@@ -164,12 +183,42 @@ fn main() {
         let rows_parts = partition(&case);
         let aggregate_parts = partition_aggregate(&case);
         let grouped_parts = partition_grouped(&case);
-        if rows_parts.is_none() && aggregate_parts.is_none() && grouped_parts.is_none() {
+        // Checked first below, because a `HAVING` query is refused by all three of the others —
+        // this is the only form that can judge it.
+        let having_parts = partition_having(&case);
+        if rows_parts.is_none()
+            && aggregate_parts.is_none()
+            && grouped_parts.is_none()
+            && having_parts.is_none()
+        {
             not_partitionable += 1;
             continue;
         }
 
         for engine in &engines {
+            if let Some(parts) = &having_parts {
+                match judge_having(engine, parts) {
+                    Relation::Holds => {
+                        tlp_checks += 1;
+                        having_checks += 1;
+                    }
+                    Relation::NotChecked(_) => skipped += 1,
+                    Relation::Violated {
+                        whole, partitions, ..
+                    } => {
+                        violations += 1;
+                        println!(
+                            "HAVING VIOLATION  {engine}, seed {seed}: whole {whole}, \
+                             partitions {partitions}"
+                        );
+                        for statement in parts.whole.statements(Dialect::Sqlite) {
+                            println!("  {statement};");
+                        }
+                    }
+                }
+                continue;
+            }
+
             let (relation, statements, form) = match (&rows_parts, &aggregate_parts, &grouped_parts)
             {
                 (Some(parts), _, _) => (
@@ -273,6 +322,7 @@ fn main() {
     println!("    of which rows    {rows_checks:>8}");
     println!("    aggregate        {aggregate_checks:>8}");
     println!("    grouped          {grouped_checks:>8}");
+    println!("    having           {having_checks:>8}");
     println!("  NoREC held         {norec_checks:>8} engine-checks");
     let _ = checked;
     println!("  unchecked          {skipped:>8}");

@@ -145,6 +145,13 @@ pub fn render_select(query: &SelectStmt, dialect: Dialect) -> String {
         sql.push_str(&format!(" GROUP BY {}", columns.join(", ")));
     }
 
+    // `HAVING` goes after `GROUP BY` and before any set operation or `ORDER BY`. It is legal
+    // without a `GROUP BY` — filtering the single implicit group — and both engines accept
+    // that, which is why the generator is allowed to emit it on whole-table aggregates too.
+    if let Some(having) = &query.having {
+        sql.push_str(&format!(" HAVING {}", render_expr(having, dialect)));
+    }
+
     if let Some(branch) = &query.set_op {
         sql.push_str(&format!(
             " {} {}",
@@ -453,6 +460,7 @@ mod tests {
                 rows: vec![],
             }],
             &SelectStmt {
+                having: None,
                 distinct: false,
                 projection: vec![Expr::Literal(Literal::Integer(1))],
                 from: "t0".to_string(),
