@@ -113,11 +113,48 @@ pub const DEFAULT_DECODE_BOUNDS: Bounds = Bounds {
 /// ```text
 /// DIFF_FUZZER_OPS=unary,activations,accumulating_reductions
 /// ```
+///
+/// `DIFF_FUZZER_DOMAINS` selects `restricted` or `unrestricted`; unset means `unrestricted`,
+/// which is what every campaign before PHASE-7G ran.
+///
+/// **Added because the overflow region can crowd out the question a campaign is asking.**
+/// Unrestricted generation produces `NaN` and infinity, and for most operations that is where
+/// the interesting cases are — the one filed finding came from there. For `conv2d` it is the
+/// opposite: a 1,500-case smoke test found **192 divergences on extreme values, essentially
+/// all of them `X` against `NaN`** — the class already filed as burn#5284 — and **0 of 1,500
+/// on ordinary ones**. A long campaign at the default would therefore spend its budget
+/// re-deriving a filed result while saturating the corpus, which is exactly the failure the
+/// operation axes were introduced to prevent.
+///
+/// Restricting is a *narrowing*, and narrowing hides things: with domains restricted this
+/// campaign cannot find an overflow divergence at all. That is the trade, and it is the
+/// reason the setting appears in the generator's derived description — two runs either side
+/// of it are not comparable, and the corpus and negatives are scoped accordingly.
+///
+/// ```text
+/// DIFF_FUZZER_DOMAINS=restricted
+/// ```
+fn restrict_domains_from(value: Option<&str>) -> bool {
+    match value {
+        None | Some("unrestricted") => false,
+        Some("restricted") => true,
+        Some(other) => {
+            panic!("DIFF_FUZZER_DOMAINS: unknown value {other:?}. Known: restricted, unrestricted")
+        }
+    }
+}
+
 pub fn decode_bounds() -> &'static Bounds {
     static BOUNDS: std::sync::OnceLock<Bounds> = std::sync::OnceLock::new();
     BOUNDS.get_or_init(|| {
+        // Read first so it applies whether or not the operation set is narrowed.
+        let restrict = restrict_domains_from(std::env::var("DIFF_FUZZER_DOMAINS").ok().as_deref());
+
         let Ok(requested) = std::env::var("DIFF_FUZZER_OPS") else {
-            return DEFAULT_DECODE_BOUNDS;
+            return Bounds {
+                restrict_domains: restrict,
+                ..DEFAULT_DECODE_BOUNDS
+            };
         };
 
         let mut bounds = Bounds {
@@ -129,6 +166,7 @@ pub fn decode_bounds() -> &'static Bounds {
             activations: false,
             scans: false,
             convolution: false,
+            restrict_domains: restrict,
             ..DEFAULT_DECODE_BOUNDS
         };
 
@@ -548,6 +586,49 @@ impl<'a> Arbitrary<'a> for TensorOp {
 
 #[cfg(test)]
 mod tests {
+    /// The domain knob parses, defaults to the historical behaviour, and rejects typos.
+    ///
+    /// Tested on the parsing rather than through `decode_bounds`, which caches in a
+    /// `OnceLock` — a test that set the variable would race every other test in the binary
+    /// and would pass or fail depending on ordering.
+    #[test]
+    fn the_domain_setting_parses_and_defaults_to_unrestricted() {
+        assert!(
+            !restrict_domains_from(None),
+            "unset must not change behaviour"
+        );
+        assert!(!restrict_domains_from(Some("unrestricted")));
+        assert!(restrict_domains_from(Some("restricted")));
+    }
+
+    /// A misspelling must be loud. A silently-ignored setting produces a campaign that
+    /// quietly tests something other than what was asked for, and the run looks normal.
+    #[test]
+    #[should_panic(expected = "unknown value")]
+    fn a_misspelled_domain_setting_is_rejected() {
+        restrict_domains_from(Some("restrcted"));
+    }
+
+    /// **Restricting domains must change the generator's identity**, or a restricted run's
+    /// corpus and negatives would be silently reused against an unrestricted one — the exact
+    /// distributional confound `GenerationAxes` exists to prevent.
+    #[test]
+    fn restricting_domains_changes_the_configuration_identity() {
+        use diff_fuzzer_core::GenerationAxes;
+
+        let open = Bounds {
+            restrict_domains: false,
+            ..DEFAULT_DECODE_BOUNDS
+        };
+        let closed = Bounds {
+            restrict_domains: true,
+            ..DEFAULT_DECODE_BOUNDS
+        };
+        assert_ne!(open.description(), closed.description());
+        assert!(open.description().contains("unrestricted_domains=on"));
+        assert!(closed.description().contains("unrestricted_domains=off"));
+    }
+
     /// **The decoder must never emit an operand pair that cannot run.** A case that panics
     /// in `TensorOp::binary` would take the whole fuzz process down, and libFuzzer would
     /// report it as a crash in the target rather than an invalid input.
