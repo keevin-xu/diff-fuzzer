@@ -14,9 +14,12 @@
 //! in [`BurnBackend::run`] is where those meet, and confining it here is what lets
 //! everything else treat rank as an ordinary value.
 
-use crate::input::{ActivationOp, BinaryOp, ReduceOp, ScanOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{
+    ActivationOp, BinaryOp, Conv2dParams, ReduceOp, ScanOp, TensorOp, TensorValue, UnaryOp,
+};
 use burn::backend::{Flex, LibTorch, Wgpu};
 use burn::tensor::backend::Backend;
+use burn::tensor::ops::ConvOptions;
 use burn::tensor::{Tensor, TensorData};
 use diff_fuzzer_core::{Implementation, RunError};
 
@@ -63,21 +66,45 @@ impl<B: Backend> BurnBackend<B> {
         }
     }
 
+    /// Execute a 2-D convolution, which is always rank 4 and so needs no rank dispatch.
+    ///
+    /// The one place in this file where a concrete rank is written down rather than being a
+    /// generic parameter — and it is deliberate. `conv2d` is defined only on
+    /// `[batch, channels, height, width]`, so a rank table would have three arms that cannot
+    /// occur.
+    ///
+    /// `burn::tensor::module::conv2d` takes `impl Into<PaddedConvOptions<2>>`, and
+    /// `ConvOptions<2>` converts. Note `ConvOptions::new` re-checks that stride, dilation and
+    /// groups are non-zero and **panics** if not — harmless here only because
+    /// [`TensorOp::conv2d`] already refused such a case at construction. Two layers asserting
+    /// the same thing is fine; the case that reaches burn has been checked once by us and is
+    /// checked again by them.
+    fn run_conv2d(
+        &self,
+        image: &TensorValue,
+        weight: &TensorValue,
+        bias: Option<&TensorValue>,
+        params: Conv2dParams,
+    ) -> Result<TensorData, RunError> {
+        let out = burn::tensor::module::conv2d(
+            self.tensor::<4>(image),
+            self.tensor::<4>(weight),
+            bias.map(|b| self.tensor::<1>(b)),
+            ConvOptions::<2>::new(
+                params.stride,
+                params.padding,
+                params.dilation,
+                params.groups,
+            ),
+        );
+        Ok(out.into_data())
+    }
+
     /// Execute a case whose arguments are all of rank `D`.
     ///
     /// Written once and instantiated by the compiler for each supported rank, so every
     /// rank runs identical logic rather than four hand-maintained copies.
     fn run_at_rank<const D: usize>(&self, op: &TensorOp) -> Result<TensorData, RunError> {
-        // **`conv2d` cannot be executed here, and the reason is structural.** This function is
-        // generic over the rank `D`, while a convolution is always rank 4 and needs
-        // `Tensor<B, 4>` specifically — a concrete rank cannot be named inside a body
-        // parameterised by an abstract one. 7G.2 dispatches it before this call rather than
-        // inside it, which is the same shape of fix `reshape` would need for a different
-        // reason (7E.4).
-        if let TensorOp::Conv2d { .. } = op {
-            return Err(self.unsupported("conv2d dispatch is not wired up yet (step 7G.2)"));
-        }
-
         let out: Tensor<B, D> = match op {
             TensorOp::Unary { kind, arg } => {
                 let t = self.tensor::<D>(arg);
@@ -99,11 +126,11 @@ impl<B: Backend> BurnBackend<B> {
                     BinaryOp::Div => a.div(b),
                 }
             }
-            // Guarded against above, so this arm cannot be reached. It exists because
-            // exhaustiveness is checked on the `match`, not on the early return — and an
-            // `unreachable!` that is genuinely unreachable is better than a silent catch-all,
-            // which would swallow the *next* variant somebody adds.
-            TensorOp::Conv2d { .. } => unreachable!("conv2d returns before this match"),
+            // `run` intercepts convolutions before this function is called, so this arm
+            // cannot be reached. It is spelled out rather than folded into a `_ =>` catch-all
+            // because a catch-all would silently swallow the *next* variant somebody adds —
+            // the compiler's exhaustiveness check is the main reason this enum has variants.
+            TensorOp::Conv2d { .. } => unreachable!("conv2d is dispatched in `run`"),
             TensorOp::Scan { kind, arg, dim } => {
                 let t = self.tensor::<D>(arg);
                 match kind {
@@ -163,6 +190,21 @@ impl<B: Backend> Implementation for BurnBackend<B> {
     }
 
     fn run(&self, input: &TensorOp) -> Result<Self::Out, RunError> {
+        // **Dispatched before the rank table, not inside it.** A convolution is always rank
+        // 4, and `run_at_rank` is generic over an abstract `D` — a body parameterised by `D`
+        // cannot name `Tensor<B, 4>`. Handling it here costs one branch and keeps the generic
+        // function honest; the alternative was a rank-4-only special case *inside* a function
+        // whose whole point is that every rank runs identical logic.
+        if let TensorOp::Conv2d {
+            input: image,
+            weight,
+            bias,
+            params,
+        } = input
+        {
+            return self.run_conv2d(image, weight, bias.as_ref(), *params);
+        }
+
         // The single place a runtime rank becomes a compile-time one. Each arm is a
         // separate instantiation of the same generic function, so this is a dispatch
         // table, not four implementations.
@@ -277,6 +319,87 @@ mod tests {
                     vec![expected],
                     "{} got {out:?} for {kind:?}, expected {expected}",
                     backend.name()
+                );
+            }
+        }
+    }
+
+    /// `conv2d` runs on all three backends and gives the exact answer it must.
+    ///
+    /// Every value is a small integer and each output element is a sum of at most four
+    /// products, so the result is exactly representable in `f32`. A backend disagreeing here
+    /// is wrong, not imprecise — which makes this a dispatch test, not a tolerance test.
+    ///
+    /// Hand-checkable: a 3×3 of ones convolved with a 2×2 of ones gives a 2×2 where every
+    /// element is `1+1+1+1 = 4`. Adding a bias of 10 makes every element 14.
+    #[test]
+    fn conv2d_runs_on_every_backend_and_gives_exact_answers() {
+        use crate::input::Conv2dParams;
+
+        let image = value(&[1, 1, 3, 3], &[1.0; 9]);
+        let kernel = value(&[1, 1, 2, 2], &[1.0; 4]);
+
+        let cases: Vec<(TensorOp, Vec<f32>)> = vec![
+            (
+                TensorOp::conv2d(image.clone(), kernel.clone(), None, Conv2dParams::default()),
+                vec![4.0; 4],
+            ),
+            (
+                TensorOp::conv2d(
+                    image.clone(),
+                    kernel.clone(),
+                    Some(value(&[1], &[10.0])),
+                    Conv2dParams::default(),
+                ),
+                vec![14.0; 4],
+            ),
+            // Stride 2 takes only the top-left window of the four.
+            (
+                TensorOp::conv2d(
+                    image.clone(),
+                    kernel.clone(),
+                    None,
+                    Conv2dParams {
+                        stride: [2, 2],
+                        ..Default::default()
+                    },
+                ),
+                vec![4.0],
+            ),
+            // Two independent groups: 2 input channels, 2 output channels, one each. Each
+            // output channel sees only its own input channel, so the sums stay at 4 rather
+            // than becoming 8 — which is exactly what a mishandled `groups` gets wrong.
+            (
+                TensorOp::conv2d(
+                    value(&[1, 2, 3, 3], &[1.0; 18]),
+                    value(&[2, 1, 2, 2], &[1.0; 8]),
+                    None,
+                    Conv2dParams {
+                        groups: 2,
+                        ..Default::default()
+                    },
+                ),
+                vec![4.0; 8],
+            ),
+        ];
+
+        for (case, expected) in cases {
+            for backend in [
+                &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+                &libtorch(),
+                &wgpu(),
+            ] {
+                let out = backend
+                    .run(&case)
+                    .unwrap_or_else(|e| panic!("{} failed to run {case:?}: {e}", backend.name()))
+                    .to_vec::<f32>()
+                    .unwrap();
+                assert_eq!(
+                    out,
+                    expected,
+                    "{} got {out:?} for {}, expected {expected:?}",
+                    backend.name(),
+                    case.name()
                 );
             }
         }
