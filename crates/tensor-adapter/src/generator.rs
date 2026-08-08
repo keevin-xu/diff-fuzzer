@@ -9,7 +9,7 @@
 //! the search for real divergences uses the varied one.
 
 use crate::input::{BinaryOp, TensorOp, TensorValue};
-use crate::ops::{Bounds, activation, binary, matmul, reduce, scan, unary};
+use crate::ops::{Bounds, activation, binary, conv, matmul, reduce, scan, unary};
 use diff_fuzzer_core::{Generator, SeededRng};
 use rand::RngExt;
 
@@ -19,13 +19,16 @@ use rand::RngExt;
 /// Choosing uniformly between the four classes would hand `matmul` — one operation —
 /// as many cases as all four elementwise binary operations put together, so a quarter
 /// of the entire budget would go to one kernel while `sub` got a sixteenth.
-const CLASS_WEIGHTS: [(Class, usize); 6] = [
+const CLASS_WEIGHTS: [(Class, usize); 7] = [
     (Class::Unary, unary::ALL.len()),
     (Class::Binary, binary::ALL.len()),
     (Class::Reduce, reduce::ALL.len()),
     (Class::Matmul, 1),
     (Class::Activation, activation::ALL.len()),
     (Class::Scan, scan::ALL.len()),
+    // One operation, but it selects among five backend algorithms — so it is weighted like
+    // five, matching how the other classes are weighted by what they actually reach.
+    (Class::Conv2d, conv::ALL_PROFILES.len()),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +39,7 @@ enum Class {
     Matmul,
     Activation,
     Scan,
+    Conv2d,
 }
 
 impl Class {
@@ -52,6 +56,12 @@ impl Class {
             Class::Matmul => bounds.matmul,
             Class::Activation => bounds.activations,
             Class::Scan => bounds.scans,
+            // **A convolution is always rank 4, so it cannot honour a lower `max_rank`.**
+            // Excluding it is the honest reading of a bound that says "highest rank to
+            // generate" — the alternative is emitting rank-4 cases under a configuration
+            // that declared rank 2, which would make the bound decorative. The exclusion is
+            // visible because `max_rank` is part of the configuration's derived identity.
+            Class::Conv2d => bounds.convolution && bounds.max_rank >= 4,
         }
     }
 }
@@ -112,6 +122,7 @@ impl Generator for TensorOpGenerator {
             Class::Matmul => matmul::generate(rng, &self.bounds),
             Class::Activation => activation::generate(rng, &self.bounds),
             Class::Scan => scan::generate(rng, &self.bounds),
+            Class::Conv2d => conv::generate(rng, &self.bounds),
         }
     }
 }
@@ -227,7 +238,7 @@ mod tests {
 
         let expected = [
             "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "erf", "sum", "mean",
-            "max", "min", "prod", "matmul", "softmax", "cumsum", "cumprod",
+            "max", "min", "prod", "matmul", "softmax", "cumsum", "cumprod", "conv2d",
         ];
         for name in expected {
             assert!(counts.contains_key(name), "{name} was never generated");
@@ -313,6 +324,10 @@ mod tests {
 
     /// Bounds must actually bound. Narrowing them should visibly narrow the output —
     /// otherwise the knob is decorative.
+    ///
+    /// **`conv2d` is the one operation with a fixed rank**, so a `max_rank` below 4 excludes
+    /// it entirely rather than being ignored. This test is what says so: it was failing on
+    /// generated rank-4 convolutions until `enabled_by` was taught the rule.
     #[test]
     fn bounds_are_respected() {
         let generator = TensorOpGenerator::new(Bounds {
