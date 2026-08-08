@@ -253,6 +253,7 @@ pub fn generate_query(
             Some(SetBranch {
                 op: second,
                 right: Box::new(SelectStmt {
+                    distinct: false,
                     projection: projection.clone(),
                     from: table.name.clone(),
                     join: None,
@@ -271,6 +272,7 @@ pub fn generate_query(
         Some(SetBranch {
             op,
             right: Box::new(SelectStmt {
+                distinct: false,
                 projection: projection.clone(),
                 from: table.name.clone(),
                 join: None,
@@ -286,7 +288,36 @@ pub fn generate_query(
         None
     };
 
+    // **`DISTINCT` is decided last, and only when it cannot invalidate the query.** With
+    // `DISTINCT`, every `ORDER BY` key must appear in the projection or DuckDB refuses — the
+    // same shape of mistake the aggregate widening made, where generated `ORDER BY` on grouped
+    // queries was rejected for 24.5% of cases. Deciding after the projection and ordering are
+    // fixed means the axis *adds* `DISTINCT` to queries that already permit it, rather than
+    // forcing a query shape to accommodate it.
+    //
+    // Also excluded on set operations: `UNION` already deduplicates, so `SELECT DISTINCT` on a
+    // branch tests nothing new while confounding two dedup mechanisms in one case.
+    let ordering_is_projected = order_by.iter().all(|key| {
+        projection
+            .iter()
+            .any(|expression| matches!(expression, Expr::Column(column) if *column == key.column))
+    });
+    // **Row queries only**, and this was caught by a test rather than foreseen. Allowing
+    // `DISTINCT` on aggregate and grouped queries dropped the metamorphic oracle's coverage of
+    // `V1_ALL` from 40% to 36%, because those two partition forms refuse `DISTINCT` — so the
+    // axis was *removing* judgeable cases, which is exactly rule 3.
+    //
+    // It also loses nothing: `GROUP BY` already emits one row per group and a whole-table
+    // aggregate returns a single row, so `DISTINCT` there is a no-op wearing the costume of a
+    // construct. The restriction makes the axis additive and costs no coverage of its own.
+    let distinct = bounds.distinct
+        && shape == QueryShape::Rows
+        && set_op.is_none()
+        && ordering_is_projected
+        && rng.random_range(0..100) < 50;
+
     SelectStmt {
+        distinct,
         projection,
         from: table.name.clone(),
         join,
@@ -397,6 +428,7 @@ fn generate_not_in(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Option<
         not: rng.random_range(0..100) < 80,
         left: Box::new(Expr::Column(reference(outer, &outer_column.name))),
         query: Box::new(SelectStmt {
+            distinct: false,
             projection: vec![Expr::Column(reference(inner, &inner_column.name))],
             from: inner.name.clone(),
             join: None,
@@ -438,6 +470,7 @@ fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Optio
         Some(Expr::Exists {
             not: rng.random_range(0..2) == 0,
             query: Box::new(SelectStmt {
+                distinct: false,
                 projection: vec![Expr::Column(reference(inner, &inner_column.name))],
                 from: inner.name.clone(),
                 join: None,
@@ -466,6 +499,7 @@ fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Optio
             },
             left: Box::new(Expr::Column(reference(outer, &outer_column.name))),
             query: Box::new(SelectStmt {
+                distinct: false,
                 projection: vec![Expr::Aggregate {
                     func,
                     arg: Some(Box::new(Expr::Column(reference(inner, &inner_column.name)))),
@@ -811,6 +845,67 @@ mod tests {
         let data = generate_data(&mut rng, &tables, Bounds::V1);
         let query = generate_query(&mut rng, &tables, &data, Bounds::V1);
         (tables, data, query)
+    }
+
+    /// The `distinct` axis must fire, must stay on row queries, and must never attach an
+    /// `ORDER BY` key that is not projected — which DuckDB refuses.
+    #[test]
+    fn the_distinct_axis_stays_valid_and_does_not_suppress_ordering() {
+        let (mut distinct, mut distinct_and_ordered, mut ordered) = (0usize, 0usize, 0usize);
+
+        for seed in 0..2_000 {
+            let mut rng = SeededRng::from_seed(seed);
+            let tables = generate_schema(&mut rng, Bounds::V1_DISTINCT);
+            let data = generate_data(&mut rng, &tables, Bounds::V1_DISTINCT);
+            let query = generate_query(&mut rng, &tables, &data, Bounds::V1_DISTINCT);
+
+            if !query.order_by.is_empty() {
+                ordered += 1;
+            }
+            if !query.distinct {
+                continue;
+            }
+            distinct += 1;
+
+            // Never on an aggregate or grouped query — a no-op there, and it costs the
+            // metamorphic oracle coverage it would otherwise have.
+            assert!(
+                query.group_by.is_empty() && !query.projection.iter().any(Expr::contains_aggregate),
+                "seed {seed}: DISTINCT on an aggregate/grouped query"
+            );
+            assert!(
+                query.set_op.is_none(),
+                "seed {seed}: DISTINCT with a set operation"
+            );
+
+            // **The validity rule DuckDB enforces**: every ordering key must be projected.
+            for key in &query.order_by {
+                assert!(
+                    query
+                        .projection
+                        .iter()
+                        .any(|e| matches!(e, Expr::Column(column) if *column == key.column)),
+                    "seed {seed}: ORDER BY {:?} is not in the projection of a DISTINCT query",
+                    key.column
+                );
+            }
+            if !query.order_by.is_empty() {
+                distinct_and_ordered += 1;
+            }
+        }
+
+        assert!(distinct > 200, "only {distinct} DISTINCT queries in 2000");
+        assert!(
+            ordered > 200,
+            "the axis must not suppress ordering: {ordered} ordered"
+        );
+        // The two must co-occur, or "DISTINCT is only applied where ordering permits it" has
+        // silently become "DISTINCT is only applied to unordered queries".
+        assert!(
+            distinct_and_ordered > 20,
+            "only {distinct_and_ordered} queries were both DISTINCT and ordered — the axis is \
+             avoiding ordering rather than accommodating it"
+        );
     }
 
     /// The `not_in_list` axis must fire, must favour the negated form, and must usually put a

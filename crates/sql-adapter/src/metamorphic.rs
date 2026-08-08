@@ -65,6 +65,13 @@ pub struct Partitioned {
     /// touches the predicate, and an oracle built on the other two would report every such
     /// case as a bug.
     pub is_unknown: SqlCase,
+    /// Whether the query is `SELECT DISTINCT`, which changes **which relation holds**.
+    ///
+    /// Not a detail: under `DISTINCT` the multiset relation is *false*, and checking it anyway
+    /// would report a violation on nearly every such case. The caller must use
+    /// [`check_distinct`] when this is set. See its docs for why the set relation survives and
+    /// what it costs.
+    pub distinct: bool,
 }
 
 /// Build the four queries from a case, or `None` if TLP does not apply to it.
@@ -108,6 +115,7 @@ pub fn partition(case: &SqlCase) -> Option<Partitioned> {
     };
 
     Some(Partitioned {
+        distinct: case.query.distinct,
         whole: base(None),
         is_true: base(Some(predicate.clone())),
         is_false: base(Some(Expr::Unary {
@@ -148,7 +156,13 @@ pub struct PartitionedAggregate {
 pub fn partition_aggregate(case: &SqlCase) -> Option<PartitionedAggregate> {
     let predicate = case.query.filter.clone()?;
 
-    if !case.query.group_by.is_empty() || case.query.set_op.is_some() || case.query.limit.is_some()
+    // `DISTINCT` is refused rather than handled: `SELECT DISTINCT SUM(x)` returns one row
+    // whatever `DISTINCT` does, so it is a no-op here — but "probably a no-op" is not a basis
+    // for a relation, and the recombination rules were derived without it.
+    if case.query.distinct
+        || !case.query.group_by.is_empty()
+        || case.query.set_op.is_some()
+        || case.query.limit.is_some()
     {
         return None;
     }
@@ -274,7 +288,14 @@ pub fn partition_grouped(case: &SqlCase) -> Option<PartitionedGroups> {
 
     // One key, because the check buckets by a single cell. Several keys is the same idea with
     // a tuple key and no new insight, so it is left out rather than built speculatively.
-    if case.query.group_by.len() != 1 || case.query.set_op.is_some() || case.query.limit.is_some() {
+    // `DISTINCT` refused for the same reason as the whole-table form: `GROUP BY` already emits
+    // one row per group, so `DISTINCT` is very likely a no-op — and the per-group recombination
+    // was derived without it.
+    if case.query.distinct
+        || case.query.group_by.len() != 1
+        || case.query.set_op.is_some()
+        || case.query.limit.is_some()
+    {
         return None;
     }
 
@@ -509,6 +530,15 @@ pub struct NoRec {
 pub fn norec(case: &SqlCase) -> Option<NoRec> {
     let predicate = case.query.filter.clone()?;
 
+    // **`DISTINCT` breaks NoREC outright**, and not subtly: the projected side becomes
+    // `SELECT DISTINCT (p) FROM t`, which collapses every row's truth value into at most three
+    // rows. Counting those would compare "how many rows match" against "how many *distinct*
+    // truth values occurred", which is not the same question and would fail on almost every
+    // case with more than three rows.
+    if case.query.distinct {
+        return None;
+    }
+
     // Same exclusions as TLP, and for the same reason: with grouping, a set operation or a
     // `LIMIT`, "the number of rows the predicate selects" is not what either query returns.
     if !case.query.group_by.is_empty()
@@ -617,6 +647,54 @@ pub fn check(
     is_false: &SqlOutcome,
     is_unknown: &SqlOutcome,
 ) -> Relation {
+    compare(whole, is_true, is_false, is_unknown, false)
+}
+
+/// The same relation for a **`SELECT DISTINCT`** query, compared as **sets**.
+///
+/// # Why the multiset relation is false here
+///
+/// Take two rows that project to the same value, one where the predicate is TRUE and one where
+/// it is FALSE. Each partition deduplicates within itself and keeps its copy, so the union has
+/// the value **twice**. The unpartitioned query deduplicates across everything and has it
+/// **once**. The relation fails — on the engine being correct. Running [`check`] on a
+/// `DISTINCT` query would therefore report a violation on nearly every case with a duplicate,
+/// which is the tool reporting its own misunderstanding at scale.
+///
+/// # Why the set relation survives
+///
+/// Every row is still in exactly one partition, so the *set* of values appearing in the whole
+/// is exactly the set appearing across the partitions. Deduplicating both sides before
+/// comparing restores a true relation.
+///
+/// # What that costs, stated plainly
+///
+/// **This is a strictly weaker oracle.** Comparing as sets means an engine that returns the
+/// wrong *number* of copies of a row cannot be caught here — and duplicate handling is
+/// precisely what `DISTINCT` is about. The alternative was to refuse `DISTINCT` cases entirely,
+/// which reaches nothing at all; a weaker check over the cases is better than no check, as long
+/// as nobody later reads a clean `DISTINCT` run as evidence about duplicate counts. It is not.
+pub fn check_distinct(
+    whole: &SqlOutcome,
+    is_true: &SqlOutcome,
+    is_false: &SqlOutcome,
+    is_unknown: &SqlOutcome,
+) -> Relation {
+    compare(whole, is_true, is_false, is_unknown, true)
+}
+
+/// The shared body of [`check`] and [`check_distinct`].
+///
+/// `deduplicate` decides whether the comparison is over sets or multisets — the one thing the
+/// two relations differ in. Note it must be applied **after** concatenating the partitions, not
+/// to each partition: the whole point is that duplicates can straddle two partitions.
+fn compare(
+    whole: &SqlOutcome,
+    is_true: &SqlOutcome,
+    is_false: &SqlOutcome,
+    is_unknown: &SqlOutcome,
+    deduplicate: bool,
+) -> Relation {
     let parts = [whole, is_true, is_false, is_unknown];
     if parts
         .iter()
@@ -655,8 +733,13 @@ pub fn check(
         lines
     };
 
-    let left = render(whole_rows);
-    let right = render(partition_rows);
+    let mut left = render(whole_rows);
+    let mut right = render(partition_rows);
+    if deduplicate {
+        // `render` sorts, so equal lines are already adjacent and `dedup` removes all repeats.
+        left.dedup();
+        right.dedup();
+    }
 
     if left == right {
         return Relation::Holds;
@@ -749,6 +832,7 @@ mod tests {
                 },
             ],
             query: SelectStmt {
+                distinct: false,
                 projection: vec![Expr::Column(column("t0", "c0"))],
                 from: "t0".to_string(),
                 join: None,
@@ -758,6 +842,7 @@ mod tests {
                     not,
                     left: Box::new(Expr::Column(column("t0", "c0"))),
                     query: Box::new(SelectStmt {
+                        distinct: false,
                         projection: vec![Expr::Column(column("t1", "c0"))],
                         from: "t1".to_string(),
                         join: None,
@@ -832,6 +917,7 @@ mod tests {
                 ],
             }],
             query: SelectStmt {
+                distinct: false,
                 projection: vec![Expr::Column(ColumnRef {
                     table: "t0".to_string(),
                     column: "c0".to_string(),
@@ -889,6 +975,127 @@ mod tests {
                 "{engine}: IN is not affected by a NULL in the list"
             );
         }
+    }
+
+    /// `DISTINCT` collapses two `NULL`s into one, on both engines.
+    ///
+    /// The one place SQL contradicts its own equality rule: `NULL = NULL` is UNKNOWN
+    /// everywhere else, but `DISTINCT` treats two `NULL`s as the same value. An engine has to
+    /// special-case it rather than reuse its equality, and a special case is somewhere to be
+    /// wrong. Verified before hunting, as with both `NOT IN` forms.
+    #[test]
+    fn distinct_collapses_nulls_on_both_engines() {
+        use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
+
+        let query = |distinct: bool| SqlCase {
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![Column {
+                    name: "c0".to_string(),
+                    sql_type: SqlType::Integer,
+                }],
+            }],
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                // Two NULLs and two 1s: both kinds of duplicate, so the result distinguishes
+                // "deduplicates values" from "deduplicates NULLs" from "does neither".
+                rows: vec![
+                    vec![Literal::Null],
+                    vec![Literal::Integer(1)],
+                    vec![Literal::Null],
+                    vec![Literal::Integer(1)],
+                ],
+            }],
+            query: SelectStmt {
+                distinct,
+                projection: vec![Expr::Column(ColumnRef {
+                    table: "t0".to_string(),
+                    column: "c0".to_string(),
+                })],
+                from: "t0".to_string(),
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let run = |case: &SqlCase| -> Vec<Vec<Cell>> {
+                let outcome = if engine == "sqlite" {
+                    SqliteImpl.run(case).expect("sqlite runs the case")
+                } else {
+                    DuckDbImpl.run(case).expect("duckdb runs the case")
+                };
+                let SqlOutcome::Rows(mut rows) = outcome else {
+                    panic!("{engine}: expected rows");
+                };
+                rows.sort_by_key(|row| format!("{row:?}"));
+                rows
+            };
+
+            assert_eq!(
+                run(&query(false)).len(),
+                4,
+                "{engine}: no DISTINCT keeps all four"
+            );
+            assert_eq!(
+                run(&query(true)),
+                vec![vec![Cell::Integer(1)], vec![Cell::Null]],
+                "{engine}: DISTINCT must collapse the two NULLs to one, and the two 1s to one"
+            );
+        }
+    }
+
+    /// **The multiset relation really does fail under `DISTINCT`** — checked rather than
+    /// assumed, because the whole reason `check_distinct` exists rests on it.
+    ///
+    /// A value appearing in two different partitions survives once in each, so the union has it
+    /// twice while the deduplicated whole has it once.
+    #[test]
+    fn distinct_breaks_the_multiset_relation_and_the_set_relation_survives() {
+        // The whole deduplicates across everything: one row.
+        let whole = rows(&[&[1]]);
+        // The same value falls either side of the predicate, deduplicated within each side.
+        let is_true = rows(&[&[1]]);
+        let is_false = rows(&[&[1]]);
+        let is_unknown = rows(&[]);
+
+        assert!(
+            matches!(
+                check(&whole, &is_true, &is_false, &is_unknown),
+                Relation::Violated { .. }
+            ),
+            "the multiset relation must fail here — if it did not, `check_distinct` would be \
+             unnecessary and its weaker comparison unjustified"
+        );
+
+        assert_eq!(
+            check_distinct(&whole, &is_true, &is_false, &is_unknown),
+            Relation::Holds,
+            "the set relation must survive the same case"
+        );
+    }
+
+    /// And the weakening is real: a lost duplicate is invisible to the set comparison.
+    ///
+    /// Pinned so nobody later reads a clean `DISTINCT` run as evidence about duplicate counts.
+    #[test]
+    fn the_set_comparison_cannot_see_a_lost_duplicate() {
+        let whole = rows(&[&[1], &[1]]);
+        let partitions = rows(&[&[1]]);
+
+        assert!(matches!(
+            check(&whole, &partitions, &rows(&[]), &rows(&[])),
+            Relation::Violated { .. }
+        ));
+        assert_eq!(
+            check_distinct(&whole, &partitions, &rows(&[]), &rows(&[])),
+            Relation::Holds,
+            "documented blind spot: set comparison cannot count copies"
+        );
     }
 
     /// Build a grouped result: each entry is a group key followed by its aggregate values,

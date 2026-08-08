@@ -74,6 +74,7 @@ fn main() {
         Some("joins") => sql_adapter::gen_schema::Bounds::V1_JOINS,
         Some("not-in") => sql_adapter::gen_schema::Bounds::V1_NOT_IN,
         Some("not-in-list") => sql_adapter::gen_schema::Bounds::V1_NOT_IN_LIST,
+        Some("distinct") => sql_adapter::gen_schema::Bounds::V1_DISTINCT,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
         _ => sql_adapter::gen_schema::Bounds::V1,

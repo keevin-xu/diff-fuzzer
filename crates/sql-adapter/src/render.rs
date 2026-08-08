@@ -108,7 +108,8 @@ pub fn render_select(query: &SelectStmt, dialect: Dialect) -> String {
         .collect();
 
     let mut sql = format!(
-        "SELECT {} FROM {}",
+        "SELECT {}{} FROM {}",
+        if query.distinct { "DISTINCT " } else { "" },
         projection.join(", "),
         quote_identifier(&query.from)
     );
@@ -452,6 +453,7 @@ mod tests {
                 rows: vec![],
             }],
             &SelectStmt {
+                distinct: false,
                 projection: vec![Expr::Literal(Literal::Integer(1))],
                 from: "t0".to_string(),
                 join: None,

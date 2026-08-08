@@ -41,7 +41,8 @@ use sql_adapter::gen_schema::Bounds;
 use sql_adapter::generator::SqlGenerator;
 use sql_adapter::metamorphic::{
     Partitioned, PartitionedAggregate, PartitionedGroups, Relation, check, check_aggregate,
-    check_grouped, check_norec, norec, partition, partition_aggregate, partition_grouped,
+    check_distinct, check_grouped, check_norec, norec, partition, partition_aggregate,
+    partition_grouped,
 };
 use sql_adapter::outcome::SqlOutcome;
 use sql_adapter::render::Dialect;
@@ -95,7 +96,14 @@ fn judge(engine: &str, parts: &Partitioned) -> Relation {
         return Relation::NotChecked("a variant could not be run");
     };
 
-    check(&whole, &is_true, &is_false, &is_unknown)
+    // **Which relation holds depends on the query.** Under `DISTINCT` the multiset relation is
+    // false on a correct engine, so checking it would manufacture violations; the set relation
+    // holds instead, at the cost of not seeing duplicate-count bugs.
+    if parts.distinct {
+        check_distinct(&whole, &is_true, &is_false, &is_unknown)
+    } else {
+        check(&whole, &is_true, &is_false, &is_unknown)
+    }
 }
 
 fn main() {
@@ -110,6 +118,7 @@ fn main() {
         Some("joins") => Bounds::V1_JOINS,
         Some("not-in") => Bounds::V1_NOT_IN,
         Some("not-in-list") => Bounds::V1_NOT_IN_LIST,
+        Some("distinct") => Bounds::V1_DISTINCT,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,
         // **The default is now `V1_ALL`, matching the differential campaign.** It used to be

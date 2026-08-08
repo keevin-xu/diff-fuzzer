@@ -670,6 +670,17 @@ pub struct SetBranch {
 /// are not present yet because an unused field is an invitation to fill it in early.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectStmt {
+    /// `SELECT DISTINCT` rather than plain `SELECT`.
+    ///
+    /// **Worth an axis because deduplication changes `NULL`'s rules.** Everywhere else in SQL,
+    /// `NULL = NULL` is UNKNOWN — two `NULL`s are not equal. `DISTINCT` contradicts that: it
+    /// treats two `NULL`s as *the same value* and collapses them to one. It is the same
+    /// exception the set operations make, applied within a single query, and an engine has to
+    /// implement it as a deliberate special case rather than by reusing its equality.
+    ///
+    /// **It also breaks TLP's multiset relation**, which is why the metamorphic side handles it
+    /// separately — see `metamorphic::check_distinct`.
+    pub distinct: bool,
     /// What to return. Never empty — `SELECT` with nothing to select is not a case.
     pub projection: Vec<Expr>,
     /// The single table read from.
@@ -900,6 +911,7 @@ mod tests {
     #[test]
     fn the_tree_survives_a_round_trip_through_json() {
         let statement = SelectStmt {
+            distinct: false,
             projection: vec![Expr::Column(column_ref("a"))],
             from: "t".to_string(),
             join: None,

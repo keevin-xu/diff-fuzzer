@@ -126,6 +126,19 @@ pub struct Bounds {
     /// **Needs no second table**, unlike `not_in` — a list is self-contained. So this axis is
     /// reachable in single-table schemas where the subquery form is not.
     pub not_in_list: bool,
+    /// Whether the generator may emit `SELECT DISTINCT`.
+    ///
+    /// **Deduplication is where `NULL` stops behaving like `NULL`.** Everywhere else in SQL
+    /// `NULL = NULL` is UNKNOWN, so two `NULL`s are not equal — but `DISTINCT` collapses them
+    /// to one row, treating them as the same value. An engine cannot get this right by reusing
+    /// its equality; it has to special-case it, and a special case is somewhere to be wrong.
+    /// The set operations make the same exception, and this applies it within a single query.
+    ///
+    /// **Constrained at generation:** with `DISTINCT`, an `ORDER BY` key must appear in the
+    /// projection or DuckDB refuses the query. So `DISTINCT` is only applied to queries whose
+    /// ordering keys are already projected — which keeps the axis *additive*, rather than
+    /// suppressing ordering the way three earlier widenings did.
+    pub distinct: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -190,6 +203,7 @@ impl Bounds {
         subqueries: false,
         not_in: false,
         not_in_list: false,
+        distinct: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -208,6 +222,12 @@ impl Bounds {
     /// V1 plus `IN`/`NOT IN` over a literal list. One axis, as always.
     pub const V1_NOT_IN_LIST: Bounds = Bounds {
         not_in_list: true,
+        ..Bounds::V1
+    };
+
+    /// V1 plus `SELECT DISTINCT`. One axis, as always.
+    pub const V1_DISTINCT: Bounds = Bounds {
+        distinct: true,
         ..Bounds::V1
     };
 
@@ -249,6 +269,7 @@ impl Bounds {
         subqueries: true,
         not_in: true,
         not_in_list: true,
+        distinct: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -320,6 +341,7 @@ impl GenerationAxes for Bounds {
             ("subqueries", self.subqueries),
             ("not-in", self.not_in),
             ("not-in-list", self.not_in_list),
+            ("distinct", self.distinct),
         ]
     }
 
