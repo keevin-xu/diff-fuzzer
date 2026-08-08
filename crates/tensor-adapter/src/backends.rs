@@ -68,6 +68,16 @@ impl<B: Backend> BurnBackend<B> {
     /// Written once and instantiated by the compiler for each supported rank, so every
     /// rank runs identical logic rather than four hand-maintained copies.
     fn run_at_rank<const D: usize>(&self, op: &TensorOp) -> Result<TensorData, RunError> {
+        // **`conv2d` cannot be executed here, and the reason is structural.** This function is
+        // generic over the rank `D`, while a convolution is always rank 4 and needs
+        // `Tensor<B, 4>` specifically — a concrete rank cannot be named inside a body
+        // parameterised by an abstract one. 7G.2 dispatches it before this call rather than
+        // inside it, which is the same shape of fix `reshape` would need for a different
+        // reason (7E.4).
+        if let TensorOp::Conv2d { .. } = op {
+            return Err(self.unsupported("conv2d dispatch is not wired up yet (step 7G.2)"));
+        }
+
         let out: Tensor<B, D> = match op {
             TensorOp::Unary { kind, arg } => {
                 let t = self.tensor::<D>(arg);
@@ -89,6 +99,11 @@ impl<B: Backend> BurnBackend<B> {
                     BinaryOp::Div => a.div(b),
                 }
             }
+            // Guarded against above, so this arm cannot be reached. It exists because
+            // exhaustiveness is checked on the `match`, not on the early return — and an
+            // `unreachable!` that is genuinely unreachable is better than a silent catch-all,
+            // which would swallow the *next* variant somebody adds.
+            TensorOp::Conv2d { .. } => unreachable!("conv2d returns before this match"),
             TensorOp::Scan { kind, arg, dim } => {
                 let t = self.tensor::<D>(arg);
                 match kind {

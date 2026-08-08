@@ -30,6 +30,16 @@ impl Shrink for TensorOp {
             TensorOp::Matmul { lhs, rhs } => matmul_candidates(lhs, rhs),
             TensorOp::Activation { kind, arg, dim } => activation_candidates(*kind, arg, *dim),
             TensorOp::Scan { kind, arg, dim } => scan_candidates(*kind, arg, *dim),
+            // **7G.7 owns this.** Shrinking a convolution is harder than anything here so
+            // far, because every candidate must stay dimensionally valid: reducing
+            // `in_channels` has to keep it divisible by `groups`, and reducing a spatial
+            // extent has to keep the window fitting. An invalid candidate would turn a real
+            // finding into a panic during minimisation.
+            //
+            // Returning no candidates is the safe interim: minimisation reports the case as
+            // already minimal, which is honest — this shrinker cannot currently improve it —
+            // rather than emitting candidates that might crash.
+            TensorOp::Conv2d { .. } => Vec::new(),
         }
     }
 }
@@ -582,15 +592,7 @@ mod tests {
     }
 
     fn element_count(op: &TensorOp) -> usize {
-        match op {
-            TensorOp::Unary { arg, .. }
-            | TensorOp::Reduce { arg, .. }
-            | TensorOp::Activation { arg, .. }
-            | TensorOp::Scan { arg, .. } => arg.len(),
-            TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => {
-                lhs.len() + rhs.len()
-            }
-        }
+        op.element_count()
     }
 
     /// Every candidate must be constructible — which, since the constructors assert

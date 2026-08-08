@@ -132,15 +132,10 @@ fn largest_argument(case: &TensorOp) -> f64 {
             .fold(0.0, f64::max)
     };
 
-    match case {
-        TensorOp::Unary { arg, .. }
-        | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. }
-        | TensorOp::Scan { arg, .. } => largest(arg.data()),
-        TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => {
-            largest(lhs.data()).max(largest(rhs.data()))
-        }
-    }
+    case.operands()
+        .into_iter()
+        .map(|operand| largest(operand.data()))
+        .fold(0.0, f64::max)
 }
 
 /// What relative error floating-point arithmetic predicts for this operation.

@@ -271,14 +271,10 @@ impl Provenance {
 pub fn is_interesting(case: &TensorOp) -> bool {
     /// Every value a case carries, across however many operands it has.
     fn operand_values(case: &TensorOp) -> Vec<&f32> {
-        let operands: Vec<&crate::input::TensorValue> = match case {
-            TensorOp::Unary { arg, .. }
-            | TensorOp::Reduce { arg, .. }
-            | TensorOp::Activation { arg, .. }
-            | TensorOp::Scan { arg, .. } => vec![arg],
-            TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => vec![lhs, rhs],
-        };
-        operands.into_iter().flat_map(|o| o.data().iter()).collect()
+        case.operands()
+            .into_iter()
+            .flat_map(|o| o.data().iter())
+            .collect()
     }
 
     const OVERFLOW_RISK: f32 = 1e18; // squares to beyond f32's range

@@ -266,6 +266,80 @@ pub enum ActivationOp {
     Softmax,
 }
 
+/// The non-tensor parameters of a 2-D convolution.
+///
+/// **A struct rather than four loose fields on the variant**, because these four travel
+/// together everywhere — generation, shrinking, validity checking and the backend call all
+/// want the whole set — and because they are the *only* part of a convolution that is not a
+/// tensor.
+///
+/// **Why these four are the interesting part.** They do not change what a convolution
+/// computes so much as *which code path computes it*. `burn-flex` selects among five
+/// algorithms using exactly these values (`burn-flex/src/ops/conv.rs:1506`), and the one
+/// upstream forward-pass bug this phase is modelled on — burn#4727 — triggered on
+/// `groups > 1` together with `padding > 0`. So the generator's job is largely to move these
+/// numbers across path boundaries.
+///
+/// `Copy` because it is four `usize`s and a pair of two-element arrays: cheap to duplicate,
+/// and passing it by value avoids threading a borrow through the generator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Conv2dParams {
+    /// Step between successive windows, `[height, width]`. Never zero.
+    pub stride: [usize; 2],
+    /// Zeros added to each side of each spatial dimension, `[height, width]`.
+    pub padding: [usize; 2],
+    /// Spacing between kernel taps, `[height, width]`. Never zero; `1` means dense.
+    pub dilation: [usize; 2],
+    /// How many independent channel groups the convolution splits into.
+    ///
+    /// `1` is an ordinary convolution; `groups == in_channels == out_channels` is a depthwise
+    /// convolution, which `burn-flex` gives its own kernel. Never zero, and it must divide
+    /// both channel counts — see [`TensorOp::conv2d`].
+    pub groups: usize,
+}
+
+impl Default for Conv2dParams {
+    /// The identity-ish configuration: dense, unpadded, unit stride, one group.
+    ///
+    /// Note this is **not** `#[derive(Default)]`, which would give `0` for stride, dilation
+    /// and groups — all three of which are invalid. A derived default here would have been a
+    /// silent trap.
+    fn default() -> Self {
+        Conv2dParams {
+            stride: [1, 1],
+            padding: [0, 0],
+            dilation: [1, 1],
+            groups: 1,
+        }
+    }
+}
+
+/// The spatial extent a convolution produces along one axis, or `None` if the window does not
+/// fit even once.
+///
+/// `floor((in + 2*pad - dil*(k-1) - 1) / stride) + 1`, the standard formula. Returning
+/// `Option` rather than panicking is deliberate: **generation and shrinking both need to ask
+/// this question speculatively**, about a configuration they are considering and may reject.
+/// A panicking version would force them to duplicate the arithmetic to avoid tripping it.
+///
+/// The subtraction is done in `i64` because `dil*(k-1) + 1` can exceed `in + 2*pad`, and the
+/// same expression in `usize` would wrap to an enormous number rather than going negative —
+/// which would report a valid output size for a window that does not fit.
+pub fn conv2d_output_size(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+) -> Option<usize> {
+    let effective_kernel = dilation as i64 * (kernel as i64 - 1) + 1;
+    let span = input as i64 + 2 * padding as i64 - effective_kernel;
+    if span < 0 || stride == 0 {
+        return None;
+    }
+    Some((span / stride as i64) as usize + 1)
+}
+
 /// One tensor test case.
 ///
 /// An enum rather than a struct with optional fields, so that each operation carries
@@ -306,6 +380,26 @@ pub enum TensorOp {
         arg: TensorValue,
         /// Which axis is scanned along. Always less than the argument's rank.
         dim: usize,
+    },
+    /// A 2-D convolution — the first operation whose three backends run different
+    /// *algorithms* rather than the same arithmetic in a different order.
+    ///
+    /// `burn-flex` uses tiled im2col + GEMM with five shape-selected fast paths, `burn-tch`
+    /// hands off to libtorch, and `burn-wgpu` runs its own CubeCL kernel. See
+    /// `planning/phases/PHASE-7G-convolution.md`.
+    ///
+    /// **The first variant with an optional operand.** `bias` is `Option` because a
+    /// convolution genuinely may not have one, and that is itself a divergence surface: a
+    /// backend that folds the bias into its accumulator rounds differently from one that adds
+    /// it in a separate pass.
+    Conv2d {
+        /// `[batch, in_channels, height, width]`.
+        input: TensorValue,
+        /// `[out_channels, in_channels / groups, kernel_height, kernel_width]`.
+        weight: TensorValue,
+        /// `[out_channels]`, when present.
+        bias: Option<TensorValue>,
+        params: Conv2dParams,
     },
 }
 
@@ -354,6 +448,109 @@ impl TensorOp {
             arg.rank()
         );
         TensorOp::Scan { kind, arg, dim }
+    }
+
+    /// Builds a 2-D convolution, refusing anything dimensionally invalid.
+    ///
+    /// # Why every one of these is an assertion rather than a `Result`
+    ///
+    /// An invalid convolution is not a finding and not an error to recover from — it is a
+    /// **generator bug**. burn panics on a malformed one, and under `cargo-fuzz` that panic
+    /// is reported as a crash, which would bury real divergences under our own noise. So the
+    /// constraints are enforced where a case is *built*, and step 7G.2's job is to prove the
+    /// generator can never reach them.
+    ///
+    /// # Panics
+    ///
+    /// If any of the following does not hold:
+    /// - `input` is rank 4 and `weight` is rank 4;
+    /// - `groups`, every `stride` and every `dilation` are non-zero;
+    /// - `in_channels` and `out_channels` are both divisible by `groups`;
+    /// - `weight`'s second dimension equals `in_channels / groups`;
+    /// - `bias`, if present, is rank 1 with `out_channels` elements;
+    /// - the window fits at least once along both spatial axes.
+    pub fn conv2d(
+        input: TensorValue,
+        weight: TensorValue,
+        bias: Option<TensorValue>,
+        params: Conv2dParams,
+    ) -> Self {
+        assert_eq!(
+            input.rank(),
+            4,
+            "conv2d input must be [batch, in_channels, h, w], got {:?}",
+            input.shape()
+        );
+        assert_eq!(
+            weight.rank(),
+            4,
+            "conv2d weight must be [out_channels, in_channels/groups, kh, kw], got {:?}",
+            weight.shape()
+        );
+        assert!(params.groups > 0, "groups must be non-zero");
+        assert!(
+            params.stride.iter().all(|s| *s > 0),
+            "stride must be non-zero, got {:?}",
+            params.stride
+        );
+        assert!(
+            params.dilation.iter().all(|d| *d > 0),
+            "dilation must be non-zero, got {:?}",
+            params.dilation
+        );
+
+        let (in_channels, out_channels) = (input.shape()[1], weight.shape()[0]);
+        assert_eq!(
+            in_channels % params.groups,
+            0,
+            "in_channels {in_channels} is not divisible by groups {}",
+            params.groups
+        );
+        assert_eq!(
+            out_channels % params.groups,
+            0,
+            "out_channels {out_channels} is not divisible by groups {}",
+            params.groups
+        );
+        assert_eq!(
+            weight.shape()[1],
+            in_channels / params.groups,
+            "weight's input-channel dimension must be in_channels/groups = {}",
+            in_channels / params.groups
+        );
+
+        if let Some(bias) = &bias {
+            assert_eq!(
+                bias.shape(),
+                [out_channels],
+                "bias must be [out_channels] = [{out_channels}]"
+            );
+        }
+
+        // Both spatial axes, so a window that fits horizontally but not vertically is caught.
+        for axis in 0..2 {
+            assert!(
+                conv2d_output_size(
+                    input.shape()[2 + axis],
+                    weight.shape()[2 + axis],
+                    params.stride[axis],
+                    params.padding[axis],
+                    params.dilation[axis],
+                )
+                .is_some_and(|size| size > 0),
+                "the kernel does not fit along spatial axis {axis}: input {:?}, kernel {:?}, \
+                 {params:?}",
+                input.shape(),
+                weight.shape()
+            );
+        }
+
+        TensorOp::Conv2d {
+            input,
+            weight,
+            bias,
+            params,
+        }
     }
 
     /// # Panics
@@ -431,6 +628,59 @@ impl TensorOp {
                 ScanOp::CumSum => "cumsum",
                 ScanOp::CumProd => "cumprod",
             },
+            TensorOp::Conv2d { .. } => "conv2d",
+        }
+    }
+
+    /// Every tensor this case carries, in argument order.
+    ///
+    /// **The second thing `conv2d` found four copies of** — `features::operands`,
+    /// `negatives::operand_values`, `tolerance::has_subnormal_input` and
+    /// `examples/triage.rs` each rebuilt this list. One of them used a fixed `[&_; 2]` array
+    /// and had to write `[arg, arg]` for single-operand cases, which worked only because
+    /// every caller happened to be asking a disjunctive question. A convolution with a bias
+    /// has three operands and broke it.
+    pub fn operands(&self) -> Vec<&TensorValue> {
+        match self {
+            TensorOp::Unary { arg, .. }
+            | TensorOp::Reduce { arg, .. }
+            | TensorOp::Activation { arg, .. }
+            | TensorOp::Scan { arg, .. } => vec![arg],
+            TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => vec![lhs, rhs],
+            TensorOp::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => match bias {
+                Some(bias) => vec![input, weight, bias],
+                None => vec![input, weight],
+            },
+        }
+    }
+
+    /// How many values this case holds across all of its operands.
+    ///
+    /// **Centralised here after `conv2d` found four copies of it** — in `shrink`'s tests,
+    /// `examples/campaign.rs`, `examples/triage_findings.rs` and `tests/repro.rs`. Each was a
+    /// separate `match` that a new variant silently broke, and the fourth would have been
+    /// found only by a failing build. One definition means the next operation updates one
+    /// place.
+    pub fn element_count(&self) -> usize {
+        match self {
+            TensorOp::Unary { arg, .. }
+            | TensorOp::Reduce { arg, .. }
+            | TensorOp::Activation { arg, .. }
+            | TensorOp::Scan { arg, .. } => arg.len(),
+            TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => {
+                lhs.len() + rhs.len()
+            }
+            TensorOp::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => input.len() + weight.len() + bias.as_ref().map_or(0, |b| b.len()),
         }
     }
 
@@ -442,6 +692,9 @@ impl TensorOp {
             | TensorOp::Activation { arg, .. }
             | TensorOp::Scan { arg, .. } => arg.rank(),
             TensorOp::Binary { lhs, .. } | TensorOp::Matmul { lhs, .. } => lhs.rank(),
+            // Always 4. The constructor enforces it, so this reads the value rather than
+            // asserting it again — a second copy of the rule is a second thing to get wrong.
+            TensorOp::Conv2d { input, .. } => input.rank(),
         }
     }
 }
@@ -450,6 +703,166 @@ impl Input for TensorOp {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A tensor of the given shape filled with ones — shape is all these tests care about.
+    fn ones(shape: &[usize]) -> TensorValue {
+        TensorValue::new(shape.to_vec(), vec![1.0; shape.iter().product()])
+    }
+
+    /// `[batch=1, in=4, h=5, w=5]` convolved with `[out=2, in=4, kh=3, kw=3]`.
+    fn plain() -> (TensorValue, TensorValue) {
+        (ones(&[1, 4, 5, 5]), ones(&[2, 4, 3, 3]))
+    }
+
+    #[test]
+    fn a_valid_convolution_constructs_and_reports_itself() {
+        let (input, weight) = plain();
+        let case = TensorOp::conv2d(input, weight, None, Conv2dParams::default());
+
+        assert_eq!(case.name(), "conv2d");
+        assert_eq!(case.rank(), 4, "a convolution is always rank 4");
+    }
+
+    /// **The default must be a valid convolution, not a zeroed struct.** A derived `Default`
+    /// would give `stride: [0, 0]`, `dilation: [0, 0]` and `groups: 0`, all three invalid —
+    /// so this test guards a hand-written impl that exists precisely to avoid that trap.
+    #[test]
+    fn the_default_parameters_describe_a_dense_unpadded_convolution() {
+        let p = Conv2dParams::default();
+        assert_eq!(
+            (p.stride, p.padding, p.dilation, p.groups),
+            ([1, 1], [0, 0], [1, 1], 1)
+        );
+
+        let (input, weight) = plain();
+        TensorOp::conv2d(input, weight, None, p);
+    }
+
+    #[test]
+    fn a_grouped_convolution_constructs_when_the_channels_divide() {
+        // 4 input channels in 2 groups: each group sees 2, so the weight's second dim is 2.
+        let case = TensorOp::conv2d(
+            ones(&[1, 4, 5, 5]),
+            ones(&[2, 2, 3, 3]),
+            None,
+            Conv2dParams {
+                groups: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(case.name(), "conv2d");
+    }
+
+    #[test]
+    #[should_panic(expected = "not divisible by groups")]
+    fn channels_that_do_not_divide_by_groups_are_rejected() {
+        TensorOp::conv2d(
+            ones(&[1, 3, 5, 5]),
+            ones(&[2, 1, 3, 3]),
+            None,
+            Conv2dParams {
+                groups: 2,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The subtlest constraint, and the one a generator gets wrong most easily: the weight's
+    /// second dimension is `in_channels / groups`, **not** `in_channels`.
+    #[test]
+    #[should_panic(expected = "in_channels/groups")]
+    fn a_weight_sized_for_the_wrong_group_count_is_rejected() {
+        TensorOp::conv2d(
+            ones(&[1, 4, 5, 5]),
+            ones(&[2, 4, 3, 3]),
+            None,
+            Conv2dParams {
+                groups: 2,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit along spatial axis")]
+    fn a_kernel_larger_than_its_input_is_rejected() {
+        TensorOp::conv2d(
+            ones(&[1, 1, 3, 3]),
+            ones(&[1, 1, 5, 5]),
+            None,
+            Conv2dParams::default(),
+        );
+    }
+
+    /// Both spatial axes are checked, so a kernel that fits horizontally and not vertically
+    /// is still caught. An earlier draft checked only one axis and would have passed this.
+    #[test]
+    #[should_panic(expected = "spatial axis 0")]
+    fn a_kernel_that_fits_on_one_axis_only_is_still_rejected() {
+        TensorOp::conv2d(
+            ones(&[1, 1, 2, 9]),
+            ones(&[1, 1, 5, 5]),
+            None,
+            Conv2dParams::default(),
+        );
+    }
+
+    #[test]
+    fn padding_can_make_an_otherwise_oversized_kernel_fit() {
+        TensorOp::conv2d(
+            ones(&[1, 1, 3, 3]),
+            ones(&[1, 1, 5, 5]),
+            None,
+            Conv2dParams {
+                padding: [1, 1],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bias must be")]
+    fn a_bias_of_the_wrong_length_is_rejected() {
+        let (input, weight) = plain();
+        TensorOp::conv2d(input, weight, Some(ones(&[3])), Conv2dParams::default());
+    }
+
+    #[test]
+    fn a_bias_matching_the_output_channels_is_accepted() {
+        let (input, weight) = plain();
+        TensorOp::conv2d(input, weight, Some(ones(&[2])), Conv2dParams::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "groups must be non-zero")]
+    fn zero_groups_is_rejected() {
+        let (input, weight) = plain();
+        TensorOp::conv2d(
+            input,
+            weight,
+            None,
+            Conv2dParams {
+                groups: 0,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// **The reason `conv2d_output_size` does its arithmetic in `i64`.** In `usize`, the
+    /// subtraction `input + 2*padding - effective_kernel` wraps to an enormous number when the
+    /// kernel is too big, and the function would report a valid size for a window that does
+    /// not fit — turning a rejected case into a panic inside burn.
+    #[test]
+    fn the_output_size_is_none_when_the_window_does_not_fit() {
+        assert_eq!(conv2d_output_size(3, 5, 1, 0, 1), None);
+        assert_eq!(conv2d_output_size(5, 3, 1, 0, 1), Some(3));
+        assert_eq!(conv2d_output_size(5, 3, 2, 0, 1), Some(2));
+        assert_eq!(conv2d_output_size(5, 3, 1, 1, 1), Some(5));
+        // Dilation widens the kernel: 3 taps spaced 2 apart span 5.
+        assert_eq!(conv2d_output_size(5, 3, 1, 0, 2), Some(1));
+        assert_eq!(conv2d_output_size(4, 3, 1, 0, 2), None);
+    }
     /// **The regression that cost three findings.**
     ///
     /// JSON has no `NaN` or infinity, so `serde_json` wrote them as `null` and reading them
@@ -497,8 +910,6 @@ mod tests {
             "finite values should not be quoted: {json}"
         );
     }
-
-    use super::*;
 
     fn value(shape: &[usize]) -> TensorValue {
         let count = shape.iter().product();

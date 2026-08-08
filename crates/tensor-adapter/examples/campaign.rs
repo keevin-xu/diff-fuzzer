@@ -410,13 +410,7 @@ fn describe(
 
 /// How many values a case holds, for reporting what shrinking achieved.
 fn element_count(case: &TensorOp) -> usize {
-    match case {
-        TensorOp::Unary { arg, .. }
-        | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. }
-        | TensorOp::Scan { arg, .. } => arg.len(),
-        TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
-    }
+    case.element_count()
 }
 
 /// A compact description of a case's argument shapes, for the log line.
@@ -430,6 +424,20 @@ fn shapes_of(case: &TensorOp) -> String {
         TensorOp::Activation { arg, dim, .. } | TensorOp::Scan { arg, dim, .. } => {
             format!("{:?} dim {dim}", arg.shape())
         }
+        TensorOp::Conv2d {
+            input,
+            weight,
+            params,
+            ..
+        } => format!(
+            "{:?} * {:?} stride {:?} pad {:?} dil {:?} groups {}",
+            input.shape(),
+            weight.shape(),
+            params.stride,
+            params.padding,
+            params.dilation,
+            params.groups
+        ),
     }
 }
 

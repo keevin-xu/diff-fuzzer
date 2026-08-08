@@ -70,13 +70,7 @@ fn worst_absolute_error(case: &TensorOp) -> Option<f64> {
 }
 
 fn element_count(case: &TensorOp) -> usize {
-    match case {
-        TensorOp::Unary { arg, .. }
-        | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. }
-        | TensorOp::Scan { arg, .. } => arg.len(),
-        TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
-    }
+    case.element_count()
 }
 
 /// Does this case still diverge between a correct backend and a faulty one?

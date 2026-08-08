@@ -122,6 +122,12 @@ impl TensorOp {
                 // see `accumulating_tolerance`.
                 ReduceOp::Prod => OpClass::Accumulating,
             },
+            // **Accumulating, and this is a real classification rather than a placeholder.**
+            // Each output element is a sum of `(in_channels / groups) * kh * kw` products, so
+            // the error grows with the term count exactly as `matmul`'s does. What 7G.5 still
+            // owes is the *count* — `accumulating_tolerance` must learn to compute it from the
+            // shapes, and until it does this operation is not generated.
+            TensorOp::Conv2d { .. } => OpClass::Accumulating,
             TensorOp::Matmul { .. } => OpClass::Accumulating,
             // See `composed_tolerance`: `exp` over a sum, then a division.
             TensorOp::Activation { .. } => OpClass::Composed,
@@ -175,15 +181,7 @@ const METAL_SUBNORMAL_FLOOR: f64 = f32::MIN_POSITIVE as f64;
 /// input case is the one no tolerance can handle: a subnormal input flushed to zero can
 /// produce a perfectly normal-sized difference in the output.
 fn has_subnormal_input(case: &TensorOp) -> bool {
-    let operands: [&crate::input::TensorValue; 2] = match case {
-        TensorOp::Unary { arg, .. }
-        | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. }
-        | TensorOp::Scan { arg, .. } => [arg, arg],
-        TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => [lhs, rhs],
-    };
-
-    operands.iter().any(|operand| {
+    case.operands().iter().any(|operand| {
         operand
             .data()
             .iter()
