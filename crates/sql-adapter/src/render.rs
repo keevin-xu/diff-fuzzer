@@ -232,6 +232,19 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
             if *not { "NOT IN" } else { "IN" },
             render_select(query, dialect)
         ),
+        // An **empty** list is not rendered, because `x IN ()` is a syntax error in both
+        // engines. The generator never produces one, and the validity rules refuse it, so this
+        // arm is belt and braces rather than a live path — but a panic here would be worse
+        // than a query neither engine can parse.
+        Expr::InList { not, left, list } => {
+            let values: Vec<String> = list.iter().map(render_literal).collect();
+            format!(
+                "({} {} ({}))",
+                render_expr(left, dialect),
+                if *not { "NOT IN" } else { "IN" },
+                values.join(", ")
+            )
+        }
         Expr::Aggregate { func, arg } => match (func, arg) {
             (AggregateFunc::CountRows, _) => "COUNT(*)".to_string(),
             (function, Some(inner)) => {

@@ -312,6 +312,24 @@ pub enum Expr {
         left: Box<Expr>,
         query: Box<SelectStmt>,
     },
+    /// `expr IN (1, 2, NULL)` / `expr NOT IN (1, 2, NULL)` — a **literal** list.
+    ///
+    /// The same three-valued-logic trap as [`Expr::InSubquery`], reached by a different route
+    /// **and that is the entire reason it exists as a separate variant.** A subquery must be
+    /// executed; a literal list can be **constant-folded** at plan time, so an engine may
+    /// evaluate this through completely different code — rewriting it to a chain of `OR`s, to a
+    /// hash probe, or to a precomputed set. Each rewrite has to preserve `NULL` semantics
+    /// independently, and each is somewhere the same mistake can be made again.
+    ///
+    /// The list holds [`Literal`]s rather than [`Expr`]s deliberately: an expression list would
+    /// defeat constant folding and so would test the path this variant was added to reach.
+    InList {
+        not: bool,
+        left: Box<Expr>,
+        /// Two or more literals, at the left operand's type. May contain `NULL` — and usually
+        /// does, since without one the negated form is perfectly well-behaved.
+        list: Vec<Literal>,
+    },
 }
 
 impl Expr {
@@ -332,6 +350,9 @@ impl Expr {
             Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
                 1 + left.node_count() + query.node_count()
             }
+            // Each literal counts, so minimization can see that shortening the list is a
+            // genuine reduction — which it is, and often the one that isolates the `NULL`.
+            Expr::InList { left, list, .. } => 1 + left.node_count() + list.len(),
         }
     }
 
@@ -369,6 +390,8 @@ impl Expr {
                 left.collect_columns(found);
                 query.collect_columns(found);
             }
+            // The list is literals, so only the left operand can reference a column.
+            Expr::InList { left, .. } => left.collect_columns(found),
         }
     }
 
@@ -389,6 +412,9 @@ impl Expr {
             // `SELECT c0 FROM t WHERE c0 = (SELECT MAX(c1) FROM u)` is not an aggregate query.
             // Reporting otherwise would make the grouping rules reject a valid case.
             Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => false,
+            // Unlike the subquery forms, there is no inner scope here — an aggregate in the
+            // left operand would belong to *this* query, so it is reported rather than hidden.
+            Expr::InList { left, .. } => left.contains_aggregate(),
         }
     }
 
@@ -424,6 +450,7 @@ impl Expr {
             Expr::ScalarSubquery { left, .. } | Expr::InSubquery { left, .. } => {
                 left.collect_columns_here(found)
             }
+            Expr::InList { left, .. } => left.collect_columns_here(found),
         }
     }
 
@@ -441,6 +468,7 @@ impl Expr {
                 left.collect_subqueries(found);
                 found.push(query);
             }
+            Expr::InList { left, .. } => left.collect_subqueries(found),
             Expr::Column(_) | Expr::Literal(_) => {}
             Expr::Unary { operand, .. } => operand.collect_subqueries(found),
             Expr::Binary { left, right, .. } => {
@@ -460,6 +488,8 @@ impl Expr {
     pub fn contains_subquery(&self) -> bool {
         match self {
             Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => true,
+            // A literal list is not a subquery, whatever it superficially resembles.
+            Expr::InList { left, .. } => left.contains_subquery(),
             Expr::Column(_) | Expr::Literal(_) => false,
             Expr::Unary { operand, .. } => operand.contains_subquery(),
             Expr::Binary { left, right, .. } => {
@@ -478,8 +508,12 @@ impl Expr {
             // `InSubquery` is listed explicitly rather than left to the `_` arm below. The
             // wildcard is why the compiler said nothing when this variant was added, and
             // defaulting to `false` would have quietly declared `x NOT IN (...)` not a
-            // predicate — the one classification this variant exists to get right.
-            Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => true,
+            // predicate — the one classification this variant exists to get right. `InList`
+            // is here for the same reason: the wildcard stayed silent a second time.
+            Expr::Exists { .. }
+            | Expr::ScalarSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::InList { .. } => true,
             Expr::Unary { op, .. } => {
                 matches!(op, UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull)
             }
@@ -507,6 +541,12 @@ impl Expr {
             Expr::Exists { query, .. } => query.contains_null_literal(),
             Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
                 left.contains_null_literal() || query.contains_null_literal()
+            }
+            // **The important one for this variant.** A `NULL` in the list is exactly what makes
+            // the negated form return nothing, so a vocabulary that missed it would be blind to
+            // the feature this construct exists to exercise.
+            Expr::InList { left, list, .. } => {
+                left.contains_null_literal() || list.contains(&Literal::Null)
             }
         }
     }

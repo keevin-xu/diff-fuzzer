@@ -19,8 +19,8 @@
 use crate::gen_schema::Bounds;
 use crate::ordering::orders_rows_totally;
 use crate::schema::{
-    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, Join, JoinKind, OrderKey,
-    SelectStmt, SetBranch, SetOp, SqlType, Table, UnaryOp,
+    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, Join, JoinKind, Literal,
+    OrderKey, SelectStmt, SetBranch, SetOp, SqlType, Table, UnaryOp,
 };
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
@@ -103,6 +103,21 @@ pub fn generate_query(
     // `OR` would let the other side of the disjunction return rows on its own, which is
     // exactly what would mask the trap: the whole signal here is a predicate that returns
     // *nothing* when it should return something.
+    // The literal-list membership test. Needs no second table, so it fires in single-table
+    // schemas too — and is conjoined with `AND` for the same reason as the subquery form: `OR`
+    // would let the other side return rows and mask a predicate that should return none.
+    if bounds.not_in_list && rng.random_range(0..100) < 45 {
+        let membership = generate_in_list(rng, table);
+        filter = Some(match filter {
+            Some(existing) => Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(existing),
+                right: Box::new(membership),
+            },
+            None => membership,
+        });
+    }
+
     if bounds.not_in && tables.len() > 1 && rng.random_range(0..100) < 45 {
         let inner = tables
             .iter()
@@ -309,6 +324,47 @@ enum QueryShape {
 ///
 /// The correlation — `= outer.c` — is the point. Without it the subquery is a constant the
 /// optimizer can hoist, and both engines would compute it once and agree.
+/// `c IN (1, 2, NULL)` — or, mostly, `NOT IN`.
+///
+/// The constant-foldable sibling of [`generate_not_in`]. Three choices carry the design:
+///
+/// - **A `NULL` in the list at 70%.** Without one, `NOT IN` is perfectly well-behaved and the
+///   case tests nothing this axis was added for. The other 30% are the control: if something
+///   fires on a `NULL`-free list too, it is not the three-valued-logic trap.
+/// - **Values drawn from the column's own pool**, so a match is likely. `x NOT IN (…)` where
+///   `x` matches nothing is uninteresting whatever the `NULL` does — the trap is visible only
+///   when some rows *would* have been excluded and some *would not*.
+/// - **Two to four literals.** Long enough that an engine may switch strategy (a chain of `OR`s
+///   versus a hash set), short enough to read in a bug report.
+///
+/// Returns `Expr` rather than `Option<Expr>`, unlike [`generate_not_in`]: a literal list needs
+/// no compatible column *pair* across two tables, so there is no configuration in which it
+/// cannot be built. An `Option` here would be a `None` no caller could ever observe.
+fn generate_in_list(rng: &mut SeededRng, table: &Table) -> Expr {
+    let column = &table.columns[rng.random_range(0..table.columns.len())];
+
+    let length = rng.random_range(2..=4);
+    let mut list: Vec<Literal> = (0..length)
+        // The same value pool the *data* is drawn from — which is what makes a match likely.
+        // `generate_literal` favours boundaries and repeats over uniform sampling, so a list
+        // built from it collides with the seeded rows far more often than random values would.
+        .map(|_| crate::gen_schema::generate_literal(rng, column.sql_type))
+        .collect();
+
+    // The `NULL` goes at a random position rather than always last: an engine that folds the
+    // list may treat the first element specially, and a fixed position would never find out.
+    if rng.random_range(0..100) < 70 {
+        let at = rng.random_range(0..list.len());
+        list[at] = Literal::Null;
+    }
+
+    Expr::InList {
+        not: rng.random_range(0..100) < 80,
+        left: Box::new(Expr::Column(reference(table, &column.name))),
+        list,
+    }
+}
+
 /// `outer.c IN (SELECT inner.d FROM inner)` — or, mostly, `NOT IN`.
 ///
 /// **Uncorrelated, deliberately.** The subquery has no `WHERE` referencing the outer row, so
@@ -757,6 +813,74 @@ mod tests {
         (tables, data, query)
     }
 
+    /// The `not_in_list` axis must fire, must favour the negated form, and must usually put a
+    /// `NULL` in the list — without which the construct tests nothing it was added for.
+    #[test]
+    fn the_not_in_list_axis_generates_null_holding_negated_lists() {
+        fn count(expression: &Expr, negated: &mut usize, plain: &mut usize, with_null: &mut usize) {
+            match expression {
+                Expr::InList { not, list, .. } => {
+                    if *not {
+                        *negated += 1;
+                    } else {
+                        *plain += 1;
+                    }
+                    if list.contains(&Literal::Null) {
+                        *with_null += 1;
+                    }
+                    assert!(
+                        list.len() >= 2,
+                        "a one-element list is a disguised equality"
+                    );
+                }
+                Expr::Unary { operand, .. } => count(operand, negated, plain, with_null),
+                Expr::Binary { left, right, .. } => {
+                    count(left, negated, plain, with_null);
+                    count(right, negated, plain, with_null);
+                }
+                _ => {}
+            }
+        }
+
+        let (mut negated, mut plain, mut with_null) = (0usize, 0usize, 0usize);
+        for seed in 0..2_000 {
+            let mut rng = SeededRng::from_seed(seed);
+            let tables = generate_schema(&mut rng, Bounds::V1_NOT_IN_LIST);
+            let data = generate_data(&mut rng, &tables, Bounds::V1_NOT_IN_LIST);
+            let query = generate_query(&mut rng, &tables, &data, Bounds::V1_NOT_IN_LIST);
+            if let Some(filter) = &query.filter {
+                count(filter, &mut negated, &mut plain, &mut with_null);
+            }
+        }
+
+        assert!(negated > 200, "only {negated} negated lists in 2000 cases");
+        assert!(
+            plain > 0,
+            "the positive control form must also be generated"
+        );
+        assert!(negated > plain * 2, "{negated} negated vs {plain} plain");
+
+        // **The rate that decides whether this axis tests anything.** A list with no `NULL`
+        // exercises ordinary membership; only a `NULL` reaches the trap.
+        let total = negated + plain;
+        assert!(
+            with_null * 2 > total,
+            "only {with_null} of {total} lists held a NULL — most must, or the axis is testing \
+             ordinary membership under the name of a three-valued-logic probe"
+        );
+
+        // Off by default, or every earlier measurement changes meaning.
+        let mut rng = SeededRng::from_seed(0);
+        let tables = generate_schema(&mut rng, Bounds::V1);
+        let data = generate_data(&mut rng, &tables, Bounds::V1);
+        let query = generate_query(&mut rng, &tables, &data, Bounds::V1);
+        let (mut a, mut b, mut c) = (0, 0, 0);
+        if let Some(filter) = &query.filter {
+            count(filter, &mut a, &mut b, &mut c);
+        }
+        assert_eq!((a, b), (0, 0), "V1 must not generate membership lists");
+    }
+
     /// The `not_in` axis must actually produce the construct, and must produce the **negated**
     /// form most of the time — the positive form cannot exhibit the trap at all.
     ///
@@ -953,6 +1077,25 @@ mod tests {
             // truth value, so `None` is right for it in the same way it is for `EXISTS`.
             Expr::ScalarSubquery { left, .. } | Expr::InSubquery { left, .. } => {
                 assert_types_agree(left, table, seed);
+                None
+            }
+            // The one arm here that **asserts** rather than merely descends: a literal list is
+            // the easiest place to accidentally compare text against an integer, which is a
+            // documented engine difference this subset keeps unrepresentable.
+            Expr::InList { left, list, .. } => {
+                let operand = assert_types_agree(left, table, seed);
+                assert!(!list.is_empty(), "seed {seed}: `IN ()` is a syntax error");
+                if let Some(operand) = operand {
+                    for literal in list {
+                        // `NULL` has no type and fits anywhere, which is the whole point of it.
+                        if let Some(literal_type) = literal.sql_type() {
+                            assert!(
+                                operand.accepts(literal_type),
+                                "seed {seed}: {operand:?} list contains {literal_type:?}"
+                            );
+                        }
+                    }
+                }
                 None
             }
             Expr::Aggregate { func, arg } => {

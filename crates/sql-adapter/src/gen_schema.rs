@@ -113,6 +113,19 @@ pub struct Bounds {
     ///
     /// Needs two tables, like joins and correlated subqueries.
     pub not_in: bool,
+    /// Whether the generator may emit `x IN (1, 2, NULL)` / `x NOT IN (…)` over a **literal
+    /// list**.
+    ///
+    /// Separate from [`Bounds::not_in`] because it reaches different engine code for the same
+    /// logic. A subquery must be executed; a literal list can be **constant-folded** at plan
+    /// time and rewritten — to a chain of `OR`s, a hash probe, a precomputed set — and each
+    /// rewrite has to preserve `NULL` semantics on its own. The subquery form came back clean
+    /// over 30,000 cases on both oracles, which is precisely why the folded path is worth its
+    /// own axis rather than being assumed to behave the same.
+    ///
+    /// **Needs no second table**, unlike `not_in` — a list is self-contained. So this axis is
+    /// reachable in single-table schemas where the subquery form is not.
+    pub not_in_list: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -176,6 +189,7 @@ impl Bounds {
         joins: false,
         subqueries: false,
         not_in: false,
+        not_in_list: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -188,6 +202,12 @@ impl Bounds {
     /// against the others rather than confounded with them.
     pub const V1_NOT_IN: Bounds = Bounds {
         not_in: true,
+        ..Bounds::V1
+    };
+
+    /// V1 plus `IN`/`NOT IN` over a literal list. One axis, as always.
+    pub const V1_NOT_IN_LIST: Bounds = Bounds {
+        not_in_list: true,
         ..Bounds::V1
     };
 
@@ -228,6 +248,7 @@ impl Bounds {
         joins: true,
         subqueries: true,
         not_in: true,
+        not_in_list: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -298,6 +319,7 @@ impl GenerationAxes for Bounds {
             ("joins", self.joins),
             ("subqueries", self.subqueries),
             ("not-in", self.not_in),
+            ("not-in-list", self.not_in_list),
         ]
     }
 

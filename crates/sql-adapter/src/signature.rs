@@ -215,6 +215,16 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
         // for our purposes: the three-valued-logic trap is asymmetric and lives entirely on
         // the negated side. Collapsing them would group a finding with cases that cannot
         // exhibit it.
+        Expr::InList { not, left, list } => {
+            // Tagged apart from the subquery form as well as by polarity: the two reach
+            // different engine code (a list can be constant-folded, a subquery must be run), so
+            // a finding in one should not be grouped with a finding in the other.
+            tags.insert(if *not { "not-in-list" } else { "in-list" });
+            if list.contains(&crate::schema::Literal::Null) {
+                tags.insert("null-in-list");
+            }
+            collect_expr_tags(left, tags);
+        }
         Expr::InSubquery { not, left, query } => {
             tags.insert(if *not {
                 "not-in-subquery"

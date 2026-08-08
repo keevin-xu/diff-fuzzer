@@ -258,6 +258,11 @@ fn mentions_null_test(expression: &Expr) -> bool {
         Expr::ScalarSubquery { left, query, .. } | Expr::InSubquery { left, query, .. } => {
             mentions_null_test(left) || query.filter.as_ref().is_some_and(mentions_null_test)
         }
+        // A membership test against a list is **not** a `NULL` test, even when the list holds a
+        // `NULL`. It asks about equality; the `NULL` changes the answer without being asked
+        // about. Reporting otherwise would conflate the two features a predicate rule most
+        // needs to tell apart.
+        Expr::InList { left, .. } => mentions_null_test(left),
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

@@ -802,6 +802,95 @@ mod tests {
         }
     }
 
+    /// The `NOT IN` trap over a **literal list**, on both engines.
+    ///
+    /// The subquery form is verified above; this is the constant-foldable route to the same
+    /// logic, and it is checked separately **because a shared answer is not a shared code
+    /// path**. An engine may execute a subquery and fold a list, so getting one right says
+    /// nothing about the other.
+    ///
+    /// As before: if both engines return rows for the negated form, that is not a broken test —
+    /// it is the shared bug this project exists to find.
+    #[test]
+    fn not_in_a_list_holding_null_returns_nothing_on_both_engines() {
+        use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
+
+        let membership = |not: bool, list: Vec<Literal>| SqlCase {
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![Column {
+                    name: "c0".to_string(),
+                    sql_type: SqlType::Integer,
+                }],
+            }],
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                rows: vec![
+                    vec![Literal::Integer(1)],
+                    vec![Literal::Integer(2)],
+                    vec![Literal::Integer(3)],
+                ],
+            }],
+            query: SelectStmt {
+                projection: vec![Expr::Column(ColumnRef {
+                    table: "t0".to_string(),
+                    column: "c0".to_string(),
+                })],
+                from: "t0".to_string(),
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: Some(Expr::InList {
+                    not,
+                    left: Box::new(Expr::Column(ColumnRef {
+                        table: "t0".to_string(),
+                        column: "c0".to_string(),
+                    })),
+                    list,
+                }),
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        let with_null = || vec![Literal::Integer(2), Literal::Null];
+        let without_null = || vec![Literal::Integer(2)];
+
+        for engine in ["sqlite", "duckdb"] {
+            let run = |case: &SqlCase| -> SqlOutcome {
+                if engine == "sqlite" {
+                    SqliteImpl.run(case).expect("sqlite runs the case")
+                } else {
+                    DuckDbImpl.run(case).expect("duckdb runs the case")
+                }
+            };
+
+            // `1 NOT IN (2, NULL)` is `1 <> 2 AND 1 <> NULL` = `true AND unknown` = unknown.
+            // Every row is unknown, so none survive — even 1 and 3, which are plainly absent.
+            assert_eq!(
+                run(&membership(true, with_null())),
+                SqlOutcome::Rows(vec![]),
+                "{engine}: NOT IN a NULL-holding list must return nothing"
+            );
+
+            // **The control that makes the above meaningful.** Drop the `NULL` and the same
+            // query returns 1 and 3. Without this, "returned nothing" could equally mean the
+            // predicate was broken in some way having nothing to do with three-valued logic.
+            assert_eq!(
+                run(&membership(true, without_null())),
+                SqlOutcome::Rows(vec![vec![Cell::Integer(1)], vec![Cell::Integer(3)]]),
+                "{engine}: without the NULL, NOT IN must exclude only the listed value"
+            );
+
+            // And the positive form is unaffected by the `NULL`: `true OR unknown` is true.
+            assert_eq!(
+                run(&membership(false, with_null())),
+                SqlOutcome::Rows(vec![vec![Cell::Integer(2)]]),
+                "{engine}: IN is not affected by a NULL in the list"
+            );
+        }
+    }
+
     /// Build a grouped result: each entry is a group key followed by its aggregate values,
     /// where `None` renders as `NULL`.
     fn groups(values: &[(i64, &[Option<i64>])]) -> SqlOutcome {
