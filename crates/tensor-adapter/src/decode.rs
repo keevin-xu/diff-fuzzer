@@ -313,14 +313,46 @@ fn size(u: &mut Unstructured<'_>, max: usize) -> usize {
 /// onto a grid across the magnitude range. The grid is coarse — 224 distinct magnitudes —
 /// and that is not a defect: fewer distinct values means fewer inputs that are equivalent
 /// for our purposes, so the fuzzer wastes less time distinguishing between them.
+/// Largest magnitude whose square is still finite in `f32`.
+///
+/// `sqrt(f32::MAX)` ≈ 1.84e19. A product of two values at or below this cannot overflow, so
+/// an accumulating operation fed only such values cannot reach infinity by multiplication.
+const NON_OVERFLOWING: f32 = 1.8e19;
+
+/// Whether a special value may be drawn while domains are restricted.
+///
+/// **`restrict_domains` promises more than "stay in the domain".** Its documented contract is
+/// that *no operation produces `NaN` or infinity* — and the decoder was violating that
+/// outright, by injecting `NaN`, `±inf` and `±1e30` straight into operands whose domain is
+/// `Any`. A two-hour convolution campaign launched specifically to avoid the overflow class
+/// produced 20 findings, **every one of them containing `NaN` or `inf`**, because of this.
+///
+/// So restriction now excludes three groups:
+///
+/// - the non-finite values, which violate the contract directly;
+/// - `±1e30`, which is finite but whose *square* is not — a convolution summing such products
+///   reaches infinity without any input being infinite;
+/// - nothing else. Zeros, `±1`, and both subnormal magnitudes stay, because they are in
+///   domain, cannot overflow, and are among the most valuable values to test.
+///
+/// **Subnormals staying has a visible cost:** a subnormal input makes a GPU pair licensed
+/// (`SPECS.md` §4.1), so such cases are reported as *skipped* rather than agreeing. That is
+/// correct accounting rather than a loss — a divergence between the two CPU backends is still
+/// reported, since the licensed-pair rule only decides the verdict when nothing disagreed.
+fn permitted_when_restricted(value: f32) -> bool {
+    value.is_finite() && value.abs() <= NON_OVERFLOWING
+}
+
 fn value(u: &mut Unstructured<'_>, domain: Domain) -> f32 {
     let selector = byte(u);
+    let restricted = decode_bounds().restrict_domains;
 
     // Roughly one in eight, matching the seeded generator's rate.
     if selector < 32 {
         let allowed: Vec<f32> = SPECIAL_VALUES
             .iter()
             .copied()
+            .filter(|v| !restricted || permitted_when_restricted(*v))
             .filter(|v| match domain {
                 Domain::Any => true,
                 Domain::NonNegative => *v >= 0.0,
@@ -586,6 +618,39 @@ impl<'a> Arbitrary<'a> for TensorOp {
 
 #[cfg(test)]
 mod tests {
+    /// **The bug a two-hour campaign was lost to.** `restrict_domains` promises that no
+    /// operation produces `NaN` or infinity, and the decoder was injecting both directly as
+    /// input values regardless. A conv2d campaign run specifically to exclude the overflow
+    /// class produced 20 findings, every one containing `NaN` or `inf`.
+    #[test]
+    fn restricted_domains_admit_no_value_that_can_reach_infinity() {
+        for value in crate::ops::SPECIAL_VALUES {
+            let permitted = permitted_when_restricted(value);
+            if value.is_nan() || value.is_infinite() {
+                assert!(!permitted, "{value} is not finite and must be excluded");
+            } else if value.abs() > NON_OVERFLOWING {
+                assert!(
+                    !permitted,
+                    "{value} squared overflows f32 and must be excluded"
+                );
+            } else {
+                assert!(permitted, "{value} is in domain and should still be tested");
+            }
+        }
+    }
+
+    /// The valuable specials must survive restriction, or the setting trades one blind spot
+    /// for another: zeros and subnormals are exactly where the absolute floor is tested.
+    #[test]
+    fn restriction_keeps_zeros_units_and_subnormals() {
+        for value in [0.0f32, -0.0, 1.0, -1.0, f32::MIN_POSITIVE, 1e-45, -1e-45] {
+            assert!(permitted_when_restricted(value), "{value} was excluded");
+        }
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e30, -1e30] {
+            assert!(!permitted_when_restricted(value), "{value} was admitted");
+        }
+    }
+
     /// The domain knob parses, defaults to the historical behaviour, and rejects typos.
     ///
     /// Tested on the parsing rather than through `decode_bounds`, which caches in a

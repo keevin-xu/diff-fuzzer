@@ -114,7 +114,8 @@ pub struct Bounds {
     /// Whether arguments are confined to each operation's defined domain.
     ///
     /// When `true` (the default), `sqrt` receives only non-negatives and `div` only
-    /// non-zero divisors, so no operation produces `NaN` or infinity. When `false`,
+    /// non-zero divisors, **and no `NaN`, infinity or overflow-capable magnitude is injected
+    /// as an input value** — so no operation produces `NaN` or infinity. When `false`,
     /// those restrictions lift and undefined results occur — which is the point: those
     /// are the numerically interesting cases, and the comparison now has an explicit
     /// policy for them.

@@ -592,7 +592,28 @@ fn bound(terms: usize, largest: f64) -> Tolerance {
     // the scale that a relative tolerance would need. `terms * largest` bounds the sum
     // of magnitudes.
     let atol = 2.0 * terms * EPSILON * (terms * largest);
-    Tolerance::new(rtol, atol)
+
+    // **The subnormal floor, and this is the fourth operation class to need it.**
+    //
+    // When every input is tiny, `terms * largest` is tiny too, and the derived absolute term
+    // collapses *below the subnormal quantum*: a `conv2d` over values around `1e-45` produced
+    // `atol = 1.3e-50`. Two implementations that round a subnormal result differently then
+    // differ by `1.4e-45` — one representable step — and are reported as diverging.
+    //
+    // That is a defect in this tool, not in either backend. Below `f32::MIN_POSITIVE` the
+    // gap between representable values stops shrinking, so relative precision is a couple of
+    // bits no matter what the implementation does, and **no bound narrower than one subnormal
+    // step can be honest**.
+    //
+    // The same omission was fixed in `exp`, then in `prod`, then in `cumprod` — each time in
+    // the operation, never in the shared helper — so `conv2d` inherited it the moment it
+    // started using `bound`. Putting the floor *here* is what stops a fifth occurrence:
+    // `sum`, `mean`, `matmul` and `cumsum` all route through this function and were all
+    // carrying the same latent bug, unseen only because their values are usually large.
+    //
+    // It costs nothing where it does not apply: `matmul`'s measured worst absolute error is
+    // `3.05e-5` (`POLICY.md` §10), seven orders of magnitude above this floor.
+    Tolerance::new(rtol, atol.max(f32::MIN_POSITIVE as f64))
 }
 
 /// Tolerance for `softmax`, derived from the parts it is built out of.
@@ -690,9 +711,16 @@ fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
                 // shared. Relative errors add through a quotient, so one `EPSILON` is added
                 // to the relative term. The absolute term is scaled down by the same divisor
                 // the values are.
-                ReduceOp::Mean => {
-                    Tolerance::new(summed.rtol + 2.0 * EPSILON, summed.atol / terms as f64)
-                }
+                ReduceOp::Mean => Tolerance::new(
+                    summed.rtol + 2.0 * EPSILON,
+                    // **Re-floored after the division.** Scaling the absolute term down by
+                    // the same divisor the values are is right in general — a mean's error is
+                    // `1/n` of its sum's — but the division can push it back under one
+                    // subnormal step, undoing the floor `bound` just applied. `mean` was the
+                    // one case that still failed the regression test after the floor moved
+                    // into the shared helper.
+                    (summed.atol / terms as f64).max(f32::MIN_POSITIVE as f64),
+                ),
                 // **A product's relative errors multiply out to a sum.** Each of `n`
                 // roundings contributes at most one `EPSILON` relatively, and
                 // `(1+e1)(1+e2)...(1+en) ≈ 1 + Σe`, so the relative bound is `n · EPSILON`
@@ -1081,11 +1109,26 @@ mod tests {
         use crate::input::{ReduceOp, ScanOp};
 
         let decaying = value(&[1, 8], 1e-30);
+        let tiny = value(&[1, 8], 1e-44);
         let cases = [
             TensorOp::unary(UnaryOp::Exp, value(&[1, 8], -90.0)),
             TensorOp::unary(UnaryOp::Erf, decaying.clone()),
             TensorOp::reduce(ReduceOp::Prod, decaying.clone(), 1),
             TensorOp::scan(ScanOp::CumProd, decaying.clone(), 1),
+            // **Every accumulating operation too**, which is the gap a conv2d campaign
+            // found: `bound` derives its absolute term from the values, so tiny inputs
+            // collapsed it below one subnormal step. These four all route through it and
+            // were all carrying the same latent defect.
+            TensorOp::reduce(ReduceOp::Sum, tiny.clone(), 1),
+            TensorOp::reduce(ReduceOp::Mean, tiny.clone(), 1),
+            TensorOp::scan(ScanOp::CumSum, tiny.clone(), 1),
+            TensorOp::matmul(value(&[2, 2], 1e-44), value(&[2, 2], 1e-44)),
+            TensorOp::conv2d(
+                value(&[1, 2, 1, 8], 1e-44),
+                value(&[3, 2, 1, 1], 1e-44),
+                None,
+                crate::input::Conv2dParams::default(),
+            ),
         ];
 
         for case in cases {
