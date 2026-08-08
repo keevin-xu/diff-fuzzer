@@ -52,7 +52,7 @@
 //! relative while its absolute error stays at `7.6e-6`: the error did not grow, the
 //! denominator shrank.
 
-use crate::input::{BinaryOp, TensorOp, UnaryOp};
+use crate::input::{BinaryOp, ReduceOp, ScanOp, TensorOp, UnaryOp};
 use diff_fuzzer_core::{Tolerance, TolerancePolicy};
 
 /// One rounding step for `f32`, as a `f64` so the arithmetic below does not itself
@@ -191,6 +191,74 @@ fn has_subnormal_input(case: &TensorOp) -> bool {
     })
 }
 
+/// Whether a product's **exact** running value leaves what `f32` can represent.
+///
+/// Returns the offending prefix, or `None` if every intermediate stayed representable.
+///
+/// # Why `f64` is the right instrument
+///
+/// The question is not what any backend computed — it is what the *mathematically exact*
+/// partial product is, and whether `f32` can hold it. `f64` carries the products of `f32`
+/// inputs far past `f32`'s range (down to `1e-308`, up to `1e308`), so a value that is
+/// finite and nonzero in `f64` yet outside `f32`'s normal range is precisely one that `f32`
+/// arithmetic must destroy — by underflowing to zero or overflowing to infinity — with the
+/// choice depending on the order the factors were multiplied in.
+///
+/// Cases where the exact value is genuinely `0`, `inf` or `NaN` — because an *input* was —
+/// are **not** flagged: there the answer is representable and every grouping agrees on it.
+fn product_leaves_representable_range(case: &TensorOp) -> Option<String> {
+    let (arg, dim) = match case {
+        TensorOp::Scan {
+            kind: ScanOp::CumProd,
+            arg,
+            dim,
+        } => (arg, *dim),
+        // A full `prod` is the same composition with only its last value kept.
+        TensorOp::Reduce {
+            kind: ReduceOp::Prod,
+            arg,
+            axis,
+        } => (arg, *axis),
+        _ => return None,
+    };
+
+    let shape = arg.shape();
+    let data = arg.data();
+    let length = shape[dim];
+    // How far apart consecutive elements along `dim` sit in the flat row-major buffer.
+    let stride: usize = shape[dim + 1..].iter().product();
+    // How many independent scans there are: everything outside `dim`.
+    let lanes = data.len() / length.max(1);
+
+    for lane in 0..lanes {
+        // Rebuild the flat offset of this lane's first element from its position in the
+        // dimensions before and after `dim`.
+        let outer = lane / stride.max(1);
+        let inner = lane % stride.max(1);
+        let start = outer * length * stride + inner;
+
+        let mut accumulator = 1.0f64;
+        for step in 0..length {
+            accumulator *= data[start + step * stride] as f64;
+            if accumulator == 0.0 || !accumulator.is_finite() {
+                // Exactly representable: every grouping produces this same value.
+                continue;
+            }
+            let magnitude = accumulator.abs();
+            if magnitude < f32::MIN_POSITIVE as f64 || magnitude > f32::MAX as f64 {
+                return Some(format!(
+                    "the exact product of the first {} elements along dimension {dim} is \
+                     {accumulator:e}, which f32 cannot represent as a normal number; the \
+                     saturation that follows is absorbing, so the result depends on an \
+                     association order no specification fixes (SPECS.md §3.3)",
+                    step + 1
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Whether a comparison involves a GPU backend.
 ///
 /// Matched on the name because that is what the policy is handed. Crude, and deliberately
@@ -276,6 +344,31 @@ impl TensorTolerancePolicy {
                  either Table 8.1 or Table 8.2, so no bound can be derived for this pair"
                     .to_string(),
             ));
+        }
+
+        // **A product whose exact intermediate leaves `f32` cannot be adjudicated at all.**
+        //
+        // A cumulative product is a *composition* of multiplications, not one IEEE-754
+        // operation, and nothing retrieved fixes its grouping. PyTorch says so outright
+        // (`SPECS.md` §3.3): "finite inputs near the limits of a dtype may produce finite
+        // results on one backend and non-finite results, such as `inf` or `NaN`, on another".
+        //
+        // What makes it unjudgeable rather than merely imprecise is that **saturation is
+        // absorbing**: `0 * x = 0` and `inf * 0 = NaN`. Once a partial product underflows or
+        // overflows, every later element is decided by that fact rather than by the
+        // arithmetic, so two legal groupings differ without bound.
+        //
+        // **This is why the subnormal floor was not enough.** A tolerance can only suppress a
+        // *numeric* difference, and the oracle deliberately routes structural ones — `0`
+        // against a nonzero, `NaN` against a number — around the tolerance check, so that no
+        // bound however wide can manufacture agreement. The decision therefore has to be made
+        // here, before any comparison, or not at all.
+        //
+        // Applied to **every pair, not just libtorch's**, which is the inference recorded in
+        // `SPECS.md` §5: the retrieved clause licenses PyTorch, and extending it to the other
+        // two rests on multiplication having no specified association anywhere.
+        if let Some(detail) = product_leaves_representable_range(input) {
+            return Some(("product saturates an intermediate".to_string(), detail));
         }
 
         if involves_gpu(implementations) && has_subnormal_input(input) {
@@ -609,11 +702,16 @@ fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
                 // `(1+e1)(1+e2)...(1+en) ≈ 1 + Σe`, so the relative bound is `n · EPSILON`
                 // — the same shape as a sum's, and for a different reason.
                 //
-                // **No absolute term**, which is where it differs from a sum. `bound`'s
-                // `atol` exists because cancellation destroys the scale a relative bound
-                // needs; a product cannot cancel. It can reach zero, but only by containing
-                // a zero — and that answer is exact on every implementation.
-                ReduceOp::Prod => Tolerance::new(2.0 * terms as f64 * EPSILON, 0.0),
+                // **The absolute floor is for subnormals, not for cancellation.** It was
+                // omitted here on the reasoning that a product cannot cancel, which is true
+                // and beside the point: a product *decays*, and once it falls below
+                // `f32::MIN_POSITIVE` relative precision is a few bits whatever the
+                // implementation does. A two-hour campaign was stopped 30 seconds in after
+                // producing 12 findings that were all this — the identical omission fixed in
+                // `exp` earlier the same day, repeated in the operation added after it.
+                ReduceOp::Prod => {
+                    Tolerance::new(2.0 * terms as f64 * EPSILON, f32::MIN_POSITIVE as f64)
+                }
                 // Classified `CorrectlyRounded`; never routed here.
                 ReduceOp::Max | ReduceOp::Min => {
                     unreachable!("{} does not accumulate", input.name())
@@ -637,10 +735,14 @@ fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
             let terms = arg.shape()[*dim];
             match kind {
                 ScanOp::CumSum => bound(terms, largest_magnitude(arg.data())),
-                // **A running product compounds relatively, like `prod`, and needs no
-                // absolute term** — a product cannot cancel. The worst element accumulates
-                // the whole axis, so the bound is `prod`'s at full length.
-                ScanOp::CumProd => Tolerance::new(2.0 * terms as f64 * EPSILON, 0.0),
+                // **A running product compounds relatively, like `prod`** — and carries the
+                // same absolute floor, for the same reason: a running product decays into the
+                // subnormal range far faster than a running sum does, and every element of
+                // the scan is an output, so the decayed tail is compared rather than
+                // discarded. The worst element accumulates the whole axis.
+                ScanOp::CumProd => {
+                    Tolerance::new(2.0 * terms as f64 * EPSILON, f32::MIN_POSITIVE as f64)
+                }
             }
         }
         TensorOp::Matmul { lhs, rhs } => {
@@ -675,6 +777,147 @@ mod tests {
     use crate::backends::{FLEX_NAME, LIBTORCH_NAME, WGPU_NAME};
     use crate::input::{BinaryOp, ReduceOp, TensorValue, UnaryOp};
 
+    /// The exact case from `fuzz-cumprod-eeefcf7a81528bd`, row 4: multiplying left to right
+    /// underflows to zero at step 2, while grouping the tiny factors against the huge ones
+    /// gives `1.8935074e-29` — which is what libtorch returned, to the bit.
+    #[test]
+    fn a_cumprod_whose_exact_intermediate_underflows_is_declined() {
+        let case = TensorOp::scan(
+            ScanOp::CumProd,
+            TensorValue::new(vec![1, 5], vec![1.4e-45, -1.4e-45, 1e30, -1e30, 9.642857]),
+            1,
+        );
+
+        let declined = TensorTolerancePolicy.known_legal(&case, (FLEX_NAME, LIBTORCH_NAME));
+        let (class, _) = declined.expect(
+            "the exact partial product reaches ~2e-90, far below f32::MIN_POSITIVE, so no \
+             grouping-independent answer exists",
+        );
+        assert_eq!(class, "product saturates an intermediate");
+    }
+
+    /// The other end of the same mechanism, from `fuzz-cumprod-d5b4bb05ad997a55`: the partial
+    /// product overflows to `inf`, and the later `× -0` turns it into `NaN` on one backend.
+    #[test]
+    fn a_cumprod_whose_exact_intermediate_overflows_is_declined() {
+        let case = TensorOp::scan(
+            ScanOp::CumProd,
+            TensorValue::new(vec![1, 3], vec![1e30, 1e30, -0.0]),
+            1,
+        );
+
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&case, (FLEX_NAME, LIBTORCH_NAME))
+                .is_some(),
+            "1e30 * 1e30 = 1e60 exceeds f32::MAX, so what the -0.0 does next is decided by \
+             association order"
+        );
+    }
+
+    /// **The rule has to be narrow or it excuses the whole operation.** A `cumprod` that stays
+    /// inside `f32` throughout is judged normally, which is what keeps this from being a
+    /// policy that declares its awkward cases legal and finds nothing.
+    #[test]
+    fn a_cumprod_that_stays_representable_is_still_judged() {
+        let case = TensorOp::scan(
+            ScanOp::CumProd,
+            TensorValue::new(vec![1, 4], vec![2.0, 3.0, 4.0, 5.0]),
+            1,
+        );
+
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&case, (FLEX_NAME, LIBTORCH_NAME))
+                .is_none(),
+            "every partial product here is exactly representable; a disagreement would be a \
+             real finding"
+        );
+    }
+
+    /// A value reaching `0` or `inf` because an *input* was `0` or `inf` is representable, and
+    /// every grouping agrees on it. Declining those would discard judgeable evidence.
+    #[test]
+    fn an_exactly_representable_zero_or_infinity_is_not_treated_as_saturation() {
+        for data in [vec![2.0, 0.0, 5.0], vec![2.0, f32::INFINITY, 5.0]] {
+            let case = TensorOp::scan(ScanOp::CumProd, TensorValue::new(vec![1, 3], data), 1);
+            assert!(
+                TensorTolerancePolicy
+                    .known_legal(&case, (FLEX_NAME, LIBTORCH_NAME))
+                    .is_none(),
+                "the exact answer is representable, so grouping cannot change it"
+            );
+        }
+    }
+
+    /// The scan runs along one axis, so the walk must follow that axis's stride rather than
+    /// the flat buffer. A saturating lane in a multi-row tensor is only found if it does.
+    #[test]
+    fn saturation_is_detected_along_the_scanned_axis_not_the_flat_buffer() {
+        // Row 0 is harmless; row 1 saturates. Scanning along dim 1 must still find it.
+        let case = TensorOp::scan(
+            ScanOp::CumProd,
+            TensorValue::new(vec![2, 3], vec![1.0, 2.0, 3.0, 1e30, 1e30, 1.0]),
+            1,
+        );
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&case, (FLEX_NAME, LIBTORCH_NAME))
+                .is_some()
+        );
+
+        // The same six values scanned along dim 0 never multiply 1e30 by 1e30, so nothing
+        // saturates and the case stays judgeable.
+        let across = TensorOp::scan(
+            ScanOp::CumProd,
+            TensorValue::new(vec![2, 3], vec![1.0, 2.0, 3.0, 1e30, 1e30, 1.0]),
+            0,
+        );
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&across, (FLEX_NAME, LIBTORCH_NAME))
+                .is_none(),
+            "along dim 0 the columns are 1*1e30, 2*1e30, 3*1 — all representable"
+        );
+    }
+
+    /// A full `prod` is the same composition with only the final value kept, so it inherits
+    /// the same unjudgeability.
+    #[test]
+    fn a_saturating_prod_is_declined_for_the_same_reason() {
+        let case = TensorOp::reduce(
+            ReduceOp::Prod,
+            TensorValue::new(vec![1, 3], vec![1e30, 1e30, 1e-30]),
+            1,
+        );
+        assert!(
+            TensorTolerancePolicy
+                .known_legal(&case, (FLEX_NAME, LIBTORCH_NAME))
+                .is_some()
+        );
+    }
+
+    /// The clause is about representability, not about hardware, so it applies to the two CPU
+    /// backends exactly as it does to the GPU. This is the inference recorded in `SPECS.md` §5.
+    #[test]
+    fn the_product_rule_applies_to_every_pair_including_two_cpus() {
+        let case = TensorOp::scan(
+            ScanOp::CumProd,
+            TensorValue::new(vec![1, 3], vec![1e30, 1e30, 1.0]),
+            1,
+        );
+        for pair in [
+            (FLEX_NAME, LIBTORCH_NAME),
+            (FLEX_NAME, WGPU_NAME),
+            (LIBTORCH_NAME, WGPU_NAME),
+        ] {
+            assert!(
+                TensorTolerancePolicy.known_legal(&case, pair).is_some(),
+                "{pair:?} should decline too"
+            );
+        }
+    }
+
     fn value(shape: &[usize], fill: f32) -> TensorValue {
         let count = shape.iter().product();
         TensorValue::new(shape.to_vec(), vec![fill; count])
@@ -694,6 +937,44 @@ mod tests {
 
     fn gpu_tolerance(op: &TensorOp) -> Tolerance {
         TensorTolerancePolicy.tolerance_for(op, (FLEX_NAME, WGPU_NAME))
+    }
+
+    /// **Every operation that can produce a subnormal result needs an absolute floor.**
+    ///
+    /// This omission has now been made twice: `exp` shipped without one and rejected a
+    /// measured 1.633e-4 relative error that was really a subnormal comparison, and `prod`
+    /// and `cumprod` shipped without one hours later — producing 12 false findings in the
+    /// first 30 seconds of a campaign, every one a subnormal tail.
+    ///
+    /// The reasoning that justified omitting it — "a product cannot cancel, so no absolute
+    /// term is needed" — is true about cancellation and irrelevant to subnormals. Relative
+    /// precision below `f32::MIN_POSITIVE` is a few bits whatever the implementation does,
+    /// and a bound without a floor there is a false-positive generator.
+    ///
+    /// Asserted as a property over the operations rather than one at a time, so an operation
+    /// added later inherits the check.
+    #[test]
+    fn every_approximate_class_has_a_subnormal_floor() {
+        use crate::input::{ReduceOp, ScanOp};
+
+        let decaying = value(&[1, 8], 1e-30);
+        let cases = [
+            TensorOp::unary(UnaryOp::Exp, value(&[1, 8], -90.0)),
+            TensorOp::unary(UnaryOp::Erf, decaying.clone()),
+            TensorOp::reduce(ReduceOp::Prod, decaying.clone(), 1),
+            TensorOp::scan(ScanOp::CumProd, decaying.clone(), 1),
+        ];
+
+        for case in cases {
+            let tolerance = tolerance_for(&case);
+            assert!(
+                tolerance.atol >= f32::MIN_POSITIVE as f64,
+                "{} has atol {:e}, so a subnormal result would be judged by a relative \
+                 bound that means nothing there",
+                case.name(),
+                tolerance.atol
+            );
+        }
     }
 
     /// **The filed bug must still be reportable after the vacuity rule.**

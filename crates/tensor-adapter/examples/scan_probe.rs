@@ -156,6 +156,50 @@ fn main() {
         );
     }
 
+    println!("\nF — underflow then recovery: does a flushed intermediate come back?\n");
+    {
+        use tensor_adapter::input::ScanOp as S;
+        let show_prod = |label: &str, data: Vec<f32>| {
+            let n = data.len();
+            let case = TensorOp::scan(S::CumProd, TensorValue::new(vec![1, n], data), 1);
+            let backends: Vec<
+                Box<dyn Implementation<In = TensorOp, Out = burn::tensor::TensorData>>,
+            > = vec![Box::new(flex()), Box::new(libtorch()), Box::new(wgpu())];
+            let outs: Vec<String> = backends
+                .iter()
+                .filter_map(|b| {
+                    b.run(&case)
+                        .ok()
+                        .and_then(|o| o.to_vec::<f32>().ok())
+                        .map(|v| {
+                            format!(
+                                "{}=[{}]",
+                                b.name(),
+                                v.iter()
+                                    .map(|x| format!("{x:e}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        })
+                })
+                .collect();
+            println!("  {label}");
+            for o in outs {
+                println!("      {o}");
+            }
+        };
+
+        // Decay well into the subnormal range, then multiply back up. If an intermediate is
+        // flushed to zero, zero is absorbing and the recovery never happens.
+        show_prod(
+            "1e-20 x4 then 1e20 x2",
+            vec![1e-20, 1e-20, 1e-20, 1e-20, 1e20, 1e20],
+        );
+        show_prod("1e-30 x2 then 1e30", vec![1e-30, 1e-30, 1e30]);
+        // Just below the smallest normal, then straight back up.
+        show_prod("1e-38 x2 then 1e30", vec![1e-38, 1e-38, 1e30]);
+    }
+
     println!("\nA — cancellation, where association order becomes visible\n");
     // (a + -a) + b is b; a + (-a + b) can lose b entirely to rounding first.
     for n in [4usize, 16, 64, 256] {
