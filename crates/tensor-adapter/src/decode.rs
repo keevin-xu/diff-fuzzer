@@ -86,6 +86,7 @@ pub const DEFAULT_DECODE_BOUNDS: Bounds = Bounds {
     matmul: true,
     activations: true,
     scans: true,
+    convolution: true,
     // Unused here — special values are selected by the byte layout below rather than by
     // a probability — but the struct requires them.
     special_value_rate: 0.0,
@@ -127,6 +128,7 @@ pub fn decode_bounds() -> &'static Bounds {
             matmul: false,
             activations: false,
             scans: false,
+            convolution: false,
             ..DEFAULT_DECODE_BOUNDS
         };
 
@@ -143,9 +145,11 @@ pub fn decode_bounds() -> &'static Bounds {
                 "matmul" => bounds.matmul = true,
                 "activations" => bounds.activations = true,
                 "scans" => bounds.scans = true,
+                "convolution" => bounds.convolution = true,
                 other => panic!(
                     "DIFF_FUZZER_OPS: unknown axis {other:?}. Known: unary, binary, \
-                     accumulating_reductions, selecting_reductions, matmul, activations, scans"
+                     accumulating_reductions, selecting_reductions, matmul, activations, \
+                     scans, convolution"
                 ),
             }
         }
@@ -191,6 +195,9 @@ fn enabled_slots() -> Vec<Slot> {
     }
     if b.matmul {
         slots.push(Slot::Matmul);
+    }
+    if b.convolution {
+        slots.push(Slot::Conv2d);
     }
     assert!(
         !slots.is_empty(),
@@ -243,6 +250,7 @@ enum Slot {
     CumSum,
     CumProd,
     Matmul,
+    Conv2d,
 }
 
 /// One byte, or zero if the input is exhausted.
@@ -501,6 +509,39 @@ impl<'a> Arbitrary<'a> for TensorOp {
                     tensor(u, rhs_shape, Domain::Any),
                 )
             }
+            Slot::Conv2d => {
+                // **The shape rules are not restated here.** `ops::conv::layout` folds any
+                // eleven numbers into a valid convolution, so this arm only has to *supply*
+                // numbers — one byte each — and the generator front-end draws the same eleven
+                // from an RNG. That is deliberate: every other operation in this decoder
+                // reimplements its shape rules, and four of them silently drifted out of step
+                // with the generator for a whole phase.
+                //
+                // One byte per field, so a single-byte libFuzzer mutation moves exactly one
+                // parameter. Feeding a hash of the whole input into a seeded RNG would have
+                // been shorter and would have destroyed that: every mutation would rebuild
+                // the case from scratch, and coverage feedback could not steer.
+                let choices = crate::ops::conv::Choices {
+                    profile_ticket: byte(u) as u32,
+                    groups: byte(u) as u32,
+                    in_per_group: byte(u) as u32,
+                    out_per_group: byte(u) as u32,
+                    kernel: [byte(u) as u32, byte(u) as u32],
+                    padding: [byte(u) as u32, byte(u) as u32],
+                    dilation: [byte(u) as u32, byte(u) as u32],
+                    stride: [byte(u) as u32, byte(u) as u32],
+                    spatial: [byte(u) as u32, byte(u) as u32],
+                    batch: byte(u) as u32,
+                    bias: byte(u) % 2 == 0,
+                };
+                let plan = crate::ops::conv::layout(&choices, &decode_bounds());
+                TensorOp::conv2d(
+                    tensor(u, plan.image, Domain::Any),
+                    tensor(u, plan.weight, Domain::Any),
+                    plan.bias.map(|shape| tensor(u, shape, Domain::Any)),
+                    plan.params,
+                )
+            }
         })
     }
 }
@@ -752,7 +793,7 @@ mod tests {
         // immediately — so this one now does the same.
         let expected = [
             "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "erf", "sum", "mean",
-            "prod", "max", "min", "matmul", "softmax", "cumsum", "cumprod",
+            "prod", "max", "min", "matmul", "softmax", "cumsum", "cumprod", "conv2d",
         ];
         for name in expected {
             assert!(seen.contains(name), "{name} was never decoded");

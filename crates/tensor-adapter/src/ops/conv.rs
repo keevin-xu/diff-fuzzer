@@ -23,10 +23,20 @@
 //! a finding: burn panics on one, and under `cargo-fuzz` a panic is reported as a crash,
 //! which would bury every real divergence under our own noise.
 //!
-//! So this module never generates-then-checks. It picks padding and the dilated kernel width
-//! *first*, then chooses a spatial extent that cannot be too small. [`TensorOp::conv2d`]
-//! asserts the same constraints independently, and `the_generator_only_emits_valid_cases`
-//! runs the pair against many seeds.
+//! So this module never generates-then-checks. [`layout`] picks padding and the dilated
+//! kernel span *first*, then a spatial extent that cannot be too small.
+//!
+//! # One layout function, two front-ends
+//!
+//! There are two ways a case is born: the seeded generator, and the fuzzer's byte decoder.
+//! Everywhere else in this crate those are **separate implementations of the same shape
+//! rules**, and they have drifted — four operations were reachable from one and not the other
+//! for an entire phase, and nothing failed.
+//!
+//! So the rules live once, in [`layout`], which turns [`Choices`] — eleven raw numbers — into
+//! shapes and parameters. The generator draws those numbers from an RNG and the decoder reads
+//! them from the fuzzer's bytes. Only the tensor *data* differs between the two, which is the
+//! part that genuinely must.
 
 use crate::input::{Conv2dParams, TensorOp, TensorValue, conv2d_output_size};
 use crate::ops::{Bounds, Domain, values};
@@ -35,7 +45,7 @@ use rand::RngExt;
 
 /// Which of `burn-flex`'s code paths a case is built to reach.
 ///
-/// Named after the *guard* rather than the algorithm, because the guard is what the generator
+/// Named after the *guard* rather than the algorithm, because the guard is what a generator
 /// can control and what a predicate would later be written over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Profile {
@@ -51,7 +61,7 @@ pub enum Profile {
     General,
 }
 
-/// Every profile, in a fixed order so the sampling is reproducible from a seed.
+/// Every profile, in a fixed order so sampling is reproducible.
 pub const ALL_PROFILES: [Profile; 5] = [
     Profile::GroupedAndPadded,
     Profile::Pointwise,
@@ -63,147 +73,207 @@ pub const ALL_PROFILES: [Profile; 5] = [
 /// Sampling weights, deliberately non-uniform.
 ///
 /// `General` is the best-tested path and gets the smallest share; the two profiles with a
-/// *documented* upstream bug get the largest. These are a judgement about where to spend a
-/// budget, not a claim about where bugs are — and they are stated here rather than buried in
-/// a `match` so that changing them is a visible decision.
+/// *documented* upstream bug get the largest. A judgement about where to spend a budget, not
+/// a claim about where bugs are — stated here rather than buried in a `match` so that
+/// changing it is a visible decision.
 const WEIGHTS: [u32; 5] = [30, 25, 20, 15, 10];
 
 /// Ceiling on multiply-accumulates per case.
 ///
 /// A convolution's cost is `batch × out_channels × out_h × out_w × (in_channels/groups) ×
-/// kh × kw`, which is a product of seven bounded quantities — so bounding each one
-/// individually does not bound the case. This is the only cap that bounds the work itself,
-/// and it exists for the same reason [`Bounds::max_elements`] does.
-const MAX_MULTIPLY_ACCUMULATES: usize = 200_000;
+/// kh × kw` — a product of seven bounded quantities, so bounding each one individually does
+/// not bound the case. This is the only cap that bounds the work itself, and it exists for
+/// the same reason [`Bounds::max_elements`] does.
+pub const MAX_MULTIPLY_ACCUMULATES: usize = 200_000;
 
-/// How often a convolution carries a bias.
+/// The raw numbers a convolution is built from, before any profile-specific folding.
 ///
-/// Not a tuning knob but a divergence surface: a backend folding the bias into its
-/// accumulator rounds differently from one adding it in a separate pass, so both must occur.
-const BIAS_SHARE: f64 = 0.5;
-
-/// Build a valid convolution.
-pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
-    // Retry rather than clamp: a case can be rejected only for exceeding the cost ceiling,
-    // and shrinking it in place would bias every profile toward its smallest shape — which
-    // is exactly the region where a tiled algorithm does *not* take its interesting path.
-    // The loop terminates because `Pointwise` at minimum size is always affordable.
-    for _ in 0..16 {
-        let profile = pick_profile(rng);
-        let case = build(rng, bounds, profile);
-        if cost(&case) <= MAX_MULTIPLY_ACCUMULATES {
-            return case;
-        }
-    }
-    build(rng, bounds, Profile::Pointwise)
+/// Deliberately unvalidated: every field is folded into a legal range by [`layout`]. That is
+/// what lets the fuzzer supply arbitrary bytes and the RNG supply arbitrary draws, without
+/// either needing to know the constraints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Choices {
+    /// Selects the profile, taken modulo the total of [`WEIGHTS`].
+    pub profile_ticket: u32,
+    pub groups: u32,
+    pub in_per_group: u32,
+    pub out_per_group: u32,
+    pub kernel: [u32; 2],
+    pub padding: [u32; 2],
+    pub dilation: [u32; 2],
+    pub stride: [u32; 2],
+    pub spatial: [u32; 2],
+    pub batch: u32,
+    pub bias: bool,
 }
 
-/// Draw a profile according to [`WEIGHTS`].
-fn pick_profile(rng: &mut SeededRng) -> Profile {
-    let total: u32 = WEIGHTS.iter().sum();
-    let mut ticket = rng.random_range(0..total);
-    for (profile, weight) in ALL_PROFILES.iter().zip(WEIGHTS) {
-        if ticket < weight {
-            return *profile;
+impl Choices {
+    /// Draw every field from a seeded RNG.
+    pub fn from_rng(rng: &mut SeededRng) -> Self {
+        Choices {
+            profile_ticket: rng.random_range(0..WEIGHTS.iter().sum::<u32>()),
+            groups: rng.random_range(0..64),
+            in_per_group: rng.random_range(0..64),
+            out_per_group: rng.random_range(0..64),
+            kernel: [rng.random_range(0..64), rng.random_range(0..64)],
+            padding: [rng.random_range(0..64), rng.random_range(0..64)],
+            dilation: [rng.random_range(0..64), rng.random_range(0..64)],
+            stride: [rng.random_range(0..64), rng.random_range(0..64)],
+            spatial: [rng.random_range(0..64), rng.random_range(0..64)],
+            batch: rng.random_range(0..64),
+            // Not a tuning knob but a divergence surface: a backend folding the bias into
+            // its accumulator rounds differently from one adding it in a separate pass, so
+            // both must occur.
+            bias: rng.random_bool(0.5),
         }
-        ticket -= weight;
     }
-    Profile::General
 }
 
-/// Build one case for a chosen profile.
+/// The shapes and parameters a set of [`Choices`] describes.
 ///
-/// Every path through this function produces a dimensionally valid convolution. The order
-/// matters: `groups` and the per-group channel counts are chosen first so divisibility holds
-/// by construction, then padding and the dilated kernel, then a spatial extent large enough
-/// for the window to fit.
-fn build(rng: &mut SeededRng, bounds: &Bounds, profile: Profile) -> TensorOp {
-    let max_channel = bounds.max_dim.clamp(1, 8);
-    let max_spatial = bounds.max_dim.clamp(1, 16);
+/// Every field is guaranteed to satisfy [`TensorOp::conv2d`]'s constraints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub image: Vec<usize>,
+    pub weight: Vec<usize>,
+    /// `Some([out_channels])` when the convolution carries a bias.
+    pub bias: Option<Vec<usize>>,
+    pub params: Conv2dParams,
+}
 
-    // `groups`, and the channels *per group*. Deriving the totals from these rather than
-    // picking totals and testing divisibility is what makes the constraint unrepresentable.
+/// Fold raw choices into a dimensionally valid convolution.
+///
+/// **The single definition of the shape rules**, shared by the seeded generator and the byte
+/// decoder. The order of operations is what makes validity structural rather than checked:
+/// groups and per-group channel counts first, so divisibility cannot be violated; then
+/// padding and the dilated kernel span; then a spatial extent at least large enough for the
+/// window to fit.
+pub fn layout(choices: &Choices, bounds: &Bounds) -> Layout {
+    let max_channel = bounds.max_dim.clamp(1, 8) as u32;
+    let max_spatial = bounds.max_dim.clamp(1, 16) as u32;
+    let profile = profile_for(choices.profile_ticket);
+
+    // Maps any number into `low..=high`, so no field of `Choices` can be invalid.
+    let fold = |value: u32, low: u32, high: u32| low + value % (high.saturating_sub(low) + 1);
+
     let (groups, in_per_group, out_per_group) = match profile {
-        Profile::Depthwise => {
-            // groups == in_channels == out_channels means exactly one channel per group.
-            (rng.random_range(1..=max_channel), 1, 1)
-        }
+        // groups == in_channels == out_channels means exactly one channel per group.
+        Profile::Depthwise => (fold(choices.groups, 2, max_channel.max(2)), 1, 1),
         Profile::FewChannels => (
             1,
-            rng.random_range(1..=2),
-            rng.random_range(1..=max_channel),
+            fold(choices.in_per_group, 1, 2),
+            fold(choices.out_per_group, 1, max_channel),
         ),
         Profile::GroupedAndPadded => (
-            rng.random_range(2..=max_channel.max(2)),
-            rng.random_range(1..=max_channel.min(3)),
-            rng.random_range(1..=max_channel.min(3)),
+            fold(choices.groups, 2, max_channel.max(2)),
+            fold(choices.in_per_group, 1, max_channel.min(3)),
+            fold(choices.out_per_group, 1, max_channel.min(3)),
         ),
         Profile::Pointwise | Profile::General => (
-            rng.random_range(1..=max_channel.min(3)),
-            rng.random_range(1..=max_channel.min(4)),
-            rng.random_range(1..=max_channel.min(4)),
+            fold(choices.groups, 1, max_channel.min(3)),
+            fold(choices.in_per_group, 1, max_channel.min(4)),
+            fold(choices.out_per_group, 1, max_channel.min(4)),
         ),
     };
-    let in_channels = groups * in_per_group;
-    let out_channels = groups * out_per_group;
+    let in_channels = (groups * in_per_group) as usize;
+    let out_channels = (groups * out_per_group) as usize;
 
-    let kernel: [usize; 2] = match profile {
-        Profile::Pointwise => [1, 1],
-        _ => [rng.random_range(1..=3), rng.random_range(1..=3)],
-    };
-
-    let padding: [usize; 2] = match profile {
-        // The defining condition of this profile, so it is drawn strictly positive.
-        Profile::GroupedAndPadded => [rng.random_range(1..=2), rng.random_range(1..=2)],
-        Profile::Pointwise => [0, 0],
-        _ => [rng.random_range(0..=1), rng.random_range(0..=1)],
-    };
-
-    let dilation: [usize; 2] = match profile {
-        // Dilating a 1×1 kernel changes nothing, so it stays dense and the profile keeps its
-        // meaning.
-        Profile::Pointwise => [1, 1],
-        _ => [rng.random_range(1..=2), rng.random_range(1..=2)],
-    };
-    let stride: [usize; 2] = [rng.random_range(1..=2), rng.random_range(1..=2)];
+    let kernel: [usize; 2] = std::array::from_fn(|axis| match profile {
+        Profile::Pointwise => 1,
+        _ => fold(choices.kernel[axis], 1, 3) as usize,
+    });
+    let padding: [usize; 2] = std::array::from_fn(|axis| match profile {
+        // The defining condition of this profile, so it is folded strictly positive.
+        Profile::GroupedAndPadded => fold(choices.padding[axis], 1, 2) as usize,
+        Profile::Pointwise => 0,
+        _ => fold(choices.padding[axis], 0, 1) as usize,
+    });
+    let dilation: [usize; 2] = std::array::from_fn(|axis| match profile {
+        // Dilating a 1×1 kernel changes nothing, so it stays dense and the profile keeps
+        // its meaning.
+        Profile::Pointwise => 1,
+        _ => fold(choices.dilation[axis], 1, 2) as usize,
+    });
+    let stride: [usize; 2] = std::array::from_fn(|axis| fold(choices.stride[axis], 1, 2) as usize);
 
     // **The step that makes validity structural.** A dilated kernel spans
     // `dilation * (kernel - 1) + 1`; padding contributes `2 * padding`. Choosing the spatial
-    // extent to be at least the difference means the window always fits, so no case is ever
-    // generated and then rejected.
-    let spatial: [usize; 2] = std::array::from_fn(|axis| {
+    // extent to be at least their difference means the window always fits.
+    let minimum: [usize; 2] = std::array::from_fn(|axis| {
         let span = dilation[axis] * (kernel[axis] - 1) + 1;
-        let minimum = span.saturating_sub(2 * padding[axis]).max(1);
-        rng.random_range(minimum..=minimum.max(max_spatial))
+        span.saturating_sub(2 * padding[axis]).max(1)
+    });
+    let mut spatial: [usize; 2] = std::array::from_fn(|axis| {
+        let high = (max_spatial as usize).max(minimum[axis]);
+        minimum[axis] + choices.spatial[axis] as usize % (high - minimum[axis] + 1)
     });
 
-    let batch = rng.random_range(1..=2);
+    let mut batch = fold(choices.batch, 1, 2) as usize;
     let params = Conv2dParams {
         stride,
         padding,
         dilation,
-        groups,
+        groups: groups as usize,
     };
 
-    let image_shape = vec![batch, in_channels, spatial[0], spatial[1]];
-    let weight_shape = vec![out_channels, in_per_group, kernel[0], kernel[1]];
-    let image = tensor(rng, image_shape, bounds);
-    let weight = tensor(rng, weight_shape, bounds);
-    let bias = rng
-        .random_bool(BIAS_SHARE)
-        .then(|| tensor(rng, vec![out_channels], bounds));
+    // **Trim rather than reject.** The decoder cannot retry — a byte string must always
+    // decode to *some* case, or the fuzzer learns nothing from it — so an over-budget case is
+    // shrunk deterministically instead. Batch first, since its size says least about which
+    // algorithm runs; then the spatial extents, never below the minimum that keeps the window
+    // fitting. Channels are left alone because reducing them changes the profile, which would
+    // defeat the point of having chosen one.
+    while cost_of(batch, in_channels, out_channels, &spatial, kernel, &params)
+        > MAX_MULTIPLY_ACCUMULATES
+    {
+        if batch > 1 {
+            batch -= 1;
+        } else if spatial[0] > minimum[0] || spatial[1] > minimum[1] {
+            for axis in 0..2 {
+                if spatial[axis] > minimum[axis] {
+                    spatial[axis] = (spatial[axis] / 2).max(minimum[axis]);
+                }
+            }
+        } else {
+            break;
+        }
+    }
 
-    TensorOp::conv2d(image, weight, bias, params)
+    Layout {
+        image: vec![batch, in_channels, spatial[0], spatial[1]],
+        weight: vec![out_channels, in_per_group as usize, kernel[0], kernel[1]],
+        bias: choices.bias.then(|| vec![out_channels]),
+        params,
+    }
 }
 
-/// A tensor of the given shape filled from the shared value generator.
-fn tensor(rng: &mut SeededRng, shape: Vec<usize>, bounds: &Bounds) -> TensorValue {
+/// Which profile a ticket selects, according to [`WEIGHTS`].
+fn profile_for(ticket: u32) -> Profile {
+    let mut remaining = ticket % WEIGHTS.iter().sum::<u32>();
+    for (profile, weight) in ALL_PROFILES.iter().zip(WEIGHTS) {
+        if remaining < weight {
+            return *profile;
+        }
+        remaining -= weight;
+    }
+    Profile::General
+}
+
+/// Build a valid convolution from a seeded RNG.
+pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
+    let plan = layout(&Choices::from_rng(rng), bounds);
+    let image = filled(rng, plan.image, bounds);
+    let weight = filled(rng, plan.weight, bounds);
+    let bias = plan.bias.map(|shape| filled(rng, shape, bounds));
+    TensorOp::conv2d(image, weight, bias, plan.params)
+}
+
+/// A tensor of the given shape, filled from the shared value generator.
+fn filled(rng: &mut SeededRng, shape: Vec<usize>, bounds: &Bounds) -> TensorValue {
     let count = shape.iter().product();
-    let data = values(rng, count, Domain::Any, bounds);
-    TensorValue::new(shape, data)
+    TensorValue::new(shape, values(rng, count, Domain::Any, bounds))
 }
 
-/// Multiply-accumulates this case will perform, as the cost ceiling measures it.
+/// Multiply-accumulates a case performs, as the cost ceiling measures it.
 ///
 /// Public because 7G.7's shrinker needs the same number to know whether a candidate is
 /// actually smaller, and two definitions of "cost" would drift.
@@ -217,31 +287,43 @@ pub fn cost(case: &TensorOp) -> usize {
     else {
         return 0;
     };
-    let (batch, in_channels) = (input.shape()[0], input.shape()[1]);
-    let out_channels = weight.shape()[0];
-    let (kh, kw) = (weight.shape()[2], weight.shape()[3]);
+    cost_of(
+        input.shape()[0],
+        input.shape()[1],
+        weight.shape()[0],
+        &[input.shape()[2], input.shape()[3]],
+        [weight.shape()[2], weight.shape()[3]],
+        params,
+    )
+}
 
-    let out: Vec<usize> = (0..2)
-        .map(|axis| {
-            conv2d_output_size(
-                input.shape()[2 + axis],
-                weight.shape()[2 + axis],
-                params.stride[axis],
-                params.padding[axis],
-                params.dilation[axis],
-            )
-            .unwrap_or(0)
-        })
-        .collect();
-
-    batch * out_channels * out[0] * out[1] * (in_channels / params.groups) * kh * kw
+/// The cost formula, over loose parts so [`layout`] can call it before a case exists.
+fn cost_of(
+    batch: usize,
+    in_channels: usize,
+    out_channels: usize,
+    spatial: &[usize; 2],
+    kernel: [usize; 2],
+    params: &Conv2dParams,
+) -> usize {
+    let out: [usize; 2] = std::array::from_fn(|axis| {
+        conv2d_output_size(
+            spatial[axis],
+            kernel[axis],
+            params.stride[axis],
+            params.padding[axis],
+            params.dilation[axis],
+        )
+        .unwrap_or(0)
+    });
+    batch * out_channels * out[0] * out[1] * (in_channels / params.groups) * kernel[0] * kernel[1]
 }
 
 /// Which profile a case satisfies, for tests and for the feature vocabulary.
 ///
 /// **Classification is by guard, not by how the case was built**, so a `General` case that
 /// happens to be depthwise is reported as depthwise — which is what the backend will act on.
-/// Checked in the order flex checks them, since the guards overlap.
+/// Checked in the order the guards overlap.
 pub fn classify(case: &TensorOp) -> Profile {
     let TensorOp::Conv2d {
         input,
@@ -287,39 +369,58 @@ mod tests {
         for seed in 0..600 {
             let mut rng = SeededRng::from_seed(seed);
             let case = generate(&mut rng, &bounds());
+            assert_eq!(case.name(), "conv2d", "seed {seed}");
+        }
+    }
 
-            let TensorOp::Conv2d {
-                input,
-                weight,
-                bias,
-                params,
-            } = &case
-            else {
-                panic!("conv generator produced {}", case.name());
+    /// **The decoder shares the layout rules, so arbitrary numbers must also be valid.**
+    /// This is the property free-form fuzzer bytes rely on: every field of [`Choices`] is
+    /// folded into range rather than checked, so no byte string can produce a case that
+    /// panics.
+    #[test]
+    fn arbitrary_choices_always_produce_a_valid_layout() {
+        let b = bounds();
+        for seed in 0..3_000u64 {
+            // Deliberately wild values, far outside any range the RNG front-end would draw.
+            let raw = seed.wrapping_mul(2_654_435_761).wrapping_add(seed << 17);
+            let n = |shift: u32| (raw >> (shift % 48)) as u32;
+            let choices = Choices {
+                profile_ticket: n(0),
+                groups: n(3),
+                in_per_group: n(6),
+                out_per_group: n(9),
+                kernel: [n(12), n(15)],
+                padding: [n(18), n(21)],
+                dilation: [n(24), n(27)],
+                stride: [n(30), n(33)],
+                spatial: [n(36), n(39)],
+                batch: n(5),
+                bias: raw % 2 == 0,
             };
+            let plan = layout(&choices, &b);
 
-            let in_channels = input.shape()[1];
-            let out_channels = weight.shape()[0];
-            assert_eq!(in_channels % params.groups, 0, "seed {seed}");
-            assert_eq!(out_channels % params.groups, 0, "seed {seed}");
+            let in_channels = plan.image[1];
+            let out_channels = plan.weight[0];
+            assert_eq!(in_channels % plan.params.groups, 0, "seed {seed}");
+            assert_eq!(out_channels % plan.params.groups, 0, "seed {seed}");
             assert_eq!(
-                weight.shape()[1],
-                in_channels / params.groups,
+                plan.weight[1],
+                in_channels / plan.params.groups,
                 "seed {seed}"
             );
-            if let Some(bias) = bias {
-                assert_eq!(bias.shape(), [out_channels], "seed {seed}");
+            if let Some(bias) = &plan.bias {
+                assert_eq!(bias, &[out_channels], "seed {seed}");
             }
             for axis in 0..2 {
-                let size = conv2d_output_size(
-                    input.shape()[2 + axis],
-                    weight.shape()[2 + axis],
-                    params.stride[axis],
-                    params.padding[axis],
-                    params.dilation[axis],
-                );
                 assert!(
-                    size.is_some_and(|s| s > 0),
+                    conv2d_output_size(
+                        plan.image[2 + axis],
+                        plan.weight[2 + axis],
+                        plan.params.stride[axis],
+                        plan.params.padding[axis],
+                        plan.params.dilation[axis],
+                    )
+                    .is_some_and(|s| s > 0),
                     "seed {seed} axis {axis}: window does not fit"
                 );
             }

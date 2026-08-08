@@ -104,6 +104,12 @@ pub struct Bounds {
     /// whose backends may legitimately *associate differently*, and a campaign hunting a
     /// numeric disagreement wants it alone.
     pub scans: bool,
+    /// `conv2d`.
+    ///
+    /// Its own axis because it is the only operation whose three backends run genuinely
+    /// different *algorithms* rather than the same arithmetic in a different order, and a
+    /// campaign hunting an algorithmic disagreement wants it alone.
+    pub convolution: bool,
 
     /// Whether arguments are confined to each operation's defined domain.
     ///
@@ -136,6 +142,7 @@ impl Default for Bounds {
             matmul: true,
             activations: true,
             scans: true,
+            convolution: true,
             restrict_domains: true,
         }
     }
@@ -334,6 +341,7 @@ impl diff_fuzzer_core::GenerationAxes for Bounds {
             ("matmul", self.matmul),
             ("activations", self.activations),
             ("scans", self.scans),
+            ("convolution", self.convolution),
             ("unrestricted_domains", !self.restrict_domains),
         ]
     }
@@ -360,6 +368,7 @@ impl Bounds {
         matmul: true,
         activations: true,
         scans: true,
+        convolution: true,
         ..Self::DEFAULT
     };
 
@@ -386,6 +395,9 @@ impl Bounds {
         matmul: false,
         activations: true,
         scans: true,
+        // The strongest candidate for an algorithmic disagreement, so it belongs in the
+        // narrowest interesting configuration rather than only in the widest.
+        convolution: true,
         ..Self::DEFAULT
     };
 
@@ -403,6 +415,7 @@ impl Bounds {
         matmul: true,
         activations: true,
         scans: true,
+        convolution: true,
         restrict_domains: true,
     };
 }
