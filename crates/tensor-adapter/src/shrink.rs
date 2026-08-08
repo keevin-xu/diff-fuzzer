@@ -18,7 +18,7 @@
 //! may put its axis out of range. Generic shrinkers produce invalid cases and waste the
 //! search on them.
 
-use crate::input::{ActivationOp, BinaryOp, ScanOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, Conv2dParams, ScanOp, TensorOp, TensorValue, UnaryOp};
 use diff_fuzzer_core::Shrink;
 
 impl Shrink for TensorOp {
@@ -30,16 +30,12 @@ impl Shrink for TensorOp {
             TensorOp::Matmul { lhs, rhs } => matmul_candidates(lhs, rhs),
             TensorOp::Activation { kind, arg, dim } => activation_candidates(*kind, arg, *dim),
             TensorOp::Scan { kind, arg, dim } => scan_candidates(*kind, arg, *dim),
-            // **7G.7 owns this.** Shrinking a convolution is harder than anything here so
-            // far, because every candidate must stay dimensionally valid: reducing
-            // `in_channels` has to keep it divisible by `groups`, and reducing a spatial
-            // extent has to keep the window fitting. An invalid candidate would turn a real
-            // finding into a panic during minimisation.
-            //
-            // Returning no candidates is the safe interim: minimisation reports the case as
-            // already minimal, which is honest — this shrinker cannot currently improve it —
-            // rather than emitting candidates that might crash.
-            TensorOp::Conv2d { .. } => Vec::new(),
+            TensorOp::Conv2d {
+                input,
+                weight,
+                bias,
+                params,
+            } => conv2d_candidates(input, weight, bias.as_ref(), *params),
         }
     }
 }
@@ -275,6 +271,198 @@ fn matmul_candidates(lhs: &TensorValue, rhs: &TensorValue) -> Vec<TensorOp> {
             lhs.clone(),
             TensorValue::new(rs.to_vec(), data),
         ));
+    }
+
+    out
+}
+
+/// Candidates for a convolution.
+///
+/// **The hardest shrinker here, because a candidate can be *invalid* rather than merely
+/// larger.** Everywhere else a bad candidate is just a worse case; here it panics inside
+/// `TensorOp::conv2d` during minimisation, turning a real finding into a crash. Three
+/// constraints have to survive every move:
+///
+/// - `in_channels` and `out_channels` stay divisible by `groups`;
+/// - the weight's second dimension stays `in_channels / groups`;
+/// - the window still fits along both spatial axes.
+///
+/// # The ordering is a claim about what makes a finding readable
+///
+/// Batch first: it is the dimension whose size says least about which algorithm runs.
+/// Then output channels, then the spatial extents, then the kernel — each drives the term
+/// count in `POLICY.md` §4d, so shrinking them is what turns "these disagree" into "these
+/// disagree while summing four terms".
+///
+/// **`groups` is offered last, and deliberately so.** Reducing it moves the case out of the
+/// very path that may have caused the divergence — `burn-flex` runs entirely different code
+/// for a grouped convolution, and burn#4727 lived there. A shrinker that collapsed `groups`
+/// eagerly would routinely report a minimised case in the *general* path and lose the
+/// finding's actual subject. Offering it last means minimisation only takes it when nothing
+/// else works, and if the divergence survives, that is itself informative.
+fn conv2d_candidates(
+    input: &TensorValue,
+    weight: &TensorValue,
+    bias: Option<&TensorValue>,
+    params: Conv2dParams,
+) -> Vec<TensorOp> {
+    let mut out = Vec::new();
+    let image = input.shape().to_vec();
+    let filter = weight.shape().to_vec();
+    let (batch, in_channels) = (image[0], image[1]);
+    let out_channels = filter[0];
+    let per_group = in_channels / params.groups;
+
+    // Builds a candidate only if it is dimensionally valid, so no caller has to check.
+    let offer = |image: Vec<usize>,
+                 filter: Vec<usize>,
+                 params: Conv2dParams,
+                 keep_bias: bool,
+                 out: &mut Vec<TensorOp>| {
+        let in_channels = image[1];
+        let out_channels = filter[0];
+        if params.groups == 0
+            || !in_channels.is_multiple_of(params.groups)
+            || !out_channels.is_multiple_of(params.groups)
+            || filter[1] != in_channels / params.groups
+        {
+            return;
+        }
+        // **Neither operand may grow.** `resized` asserts this and would panic; checking it
+        // here turns "this move is inapplicable" into a skip rather than a crash. It bites
+        // on the grouping moves specifically: the weight's second dimension *is*
+        // `in_channels / groups`, so reducing `groups` alone multiplies the weight by exactly
+        // the factor removed.
+        if image.iter().product::<usize>() > input.len()
+            || filter.iter().product::<usize>() > weight.len()
+        {
+            return;
+        }
+        for axis in 0..2 {
+            if crate::input::conv2d_output_size(
+                image[2 + axis],
+                filter[2 + axis],
+                params.stride[axis],
+                params.padding[axis],
+                params.dilation[axis],
+            )
+            .is_none_or(|size| size == 0)
+            {
+                return;
+            }
+        }
+        let bias = match (keep_bias, bias) {
+            (true, Some(bias)) => Some(bias.resized(&[out_channels])),
+            _ => None,
+        };
+        out.push(TensorOp::conv2d(
+            input.resized(&image),
+            weight.resized(&filter),
+            bias,
+            params,
+        ));
+    };
+
+    // Drop the bias — the only move that removes a whole operand.
+    if bias.is_some() {
+        offer(image.clone(), filter.clone(), params, false, &mut out);
+    }
+
+    // Batch: says least about which path runs, so it goes first.
+    if batch > 1 {
+        let mut smaller = image.clone();
+        smaller[0] = 1;
+        offer(smaller, filter.clone(), params, true, &mut out);
+    }
+
+    // Output channels, in whole groups so divisibility survives.
+    if out_channels > params.groups {
+        let mut smaller = filter.clone();
+        smaller[0] = params.groups;
+        offer(image.clone(), smaller, params, true, &mut out);
+    }
+
+    // Input channels, again in whole groups — and the weight's second dimension has to
+    // follow, which is the constraint that makes this operation's shrinker unlike the others.
+    if per_group > 1 {
+        let mut smaller_image = image.clone();
+        smaller_image[1] = params.groups;
+        let mut smaller_filter = filter.clone();
+        smaller_filter[1] = 1;
+        offer(smaller_image, smaller_filter, params, true, &mut out);
+    }
+
+    // Spatial extents, most aggressive first.
+    for axis in 0..2 {
+        for target in [1, image[2 + axis] / 2] {
+            if target < image[2 + axis] && target > 0 {
+                let mut smaller = image.clone();
+                smaller[2 + axis] = target;
+                offer(smaller, filter.clone(), params, true, &mut out);
+            }
+        }
+    }
+
+    // Kernel extents. Shrinking to 1 reaches the pointwise path, which is both the smallest
+    // case and a genuinely different algorithm — so if the divergence survives it, the
+    // finding has moved somewhere more interesting rather than merely smaller.
+    for axis in 0..2 {
+        if filter[2 + axis] > 1 {
+            let mut smaller = filter.clone();
+            smaller[2 + axis] = 1;
+            offer(image.clone(), smaller, params, true, &mut out);
+        }
+    }
+
+    // Simplify the parameters that only select a path, cheapest first.
+    for simpler in [
+        Conv2dParams {
+            dilation: [1, 1],
+            ..params
+        },
+        Conv2dParams {
+            stride: [1, 1],
+            ..params
+        },
+        Conv2dParams {
+            padding: [0, 0],
+            ..params
+        },
+    ] {
+        if simpler != params {
+            offer(image.clone(), filter.clone(), simpler, true, &mut out);
+        }
+    }
+
+    // **Last, and it halves grouping rather than removing it outright.**
+    //
+    // Reducing `groups` while holding `in_channels` fixed *cannot shrink*: the weight's
+    // second dimension **is** `in_channels / groups`, so dividing `groups` by `g` multiplies
+    // the weight by exactly `g`. The first version of this shrinker did that and tripped
+    // `resized`'s shrink-only assertion — 144 elements wanted from 72 available.
+    //
+    // Halving `groups` *and* `in_channels` together keeps channels-per-group fixed, so the
+    // weight is unchanged while the image strictly shrinks. From two groups that does land on
+    // `groups = 1`, which is fine because the weight has not grown; what is never offered is
+    // ungrouping a case whose channel count stays put.
+    //
+    // It goes last regardless, because `burn-flex` runs entirely different code for a grouped
+    // convolution and burn#4727 lived there — a shrinker that ungrouped eagerly would
+    // routinely minimise a finding out of the path it was about.
+    if params.groups > 1 && params.groups.is_multiple_of(2) && per_group > 0 {
+        let halved = params.groups / 2;
+        let mut smaller_image = image.clone();
+        smaller_image[1] = halved * per_group;
+        offer(
+            smaller_image,
+            filter.clone(),
+            Conv2dParams {
+                groups: halved,
+                ..params
+            },
+            true,
+            &mut out,
+        );
     }
 
     out
@@ -761,6 +949,144 @@ mod tests {
             unreachable!()
         };
         lhs.data().len() + rhs.data().len()
+    }
+
+    fn conv_case(
+        image: &[usize],
+        filter: &[usize],
+        groups: usize,
+        padding: [usize; 2],
+        bias: bool,
+    ) -> TensorOp {
+        TensorOp::conv2d(
+            value(image),
+            value(filter),
+            bias.then(|| value(&[filter[0]])),
+            Conv2dParams {
+                groups,
+                padding,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// **The property that keeps minimisation from crashing.** Every candidate is passed
+    /// straight back into `TensorOp::conv2d`, which asserts each constraint — so an invalid
+    /// candidate panics here rather than mid-campaign, on a real finding.
+    ///
+    /// Then applied recursively: a shrinker is called over and over, so it is not enough for
+    /// the first generation of candidates to be valid.
+    #[test]
+    fn every_convolution_candidate_is_valid_however_deep() {
+        let mut frontier = vec![
+            conv_case(&[2, 4, 6, 6], &[4, 2, 3, 3], 2, [1, 1], true),
+            conv_case(&[1, 8, 5, 5], &[8, 1, 3, 3], 8, [0, 0], false),
+            conv_case(&[2, 2, 7, 4], &[3, 2, 1, 1], 1, [0, 0], true),
+            conv_case(&[1, 6, 4, 9], &[6, 2, 2, 2], 3, [2, 1], false),
+        ];
+
+        // Four generations is well past the point a real minimisation reaches, and each
+        // generation re-asserts validity through the constructor.
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for case in &frontier {
+                for candidate in case.candidates() {
+                    assert_eq!(candidate.name(), "conv2d");
+                    next.push(candidate);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            next.truncate(60);
+            frontier = next;
+        }
+    }
+
+    /// **Every candidate must be strictly simpler, which is not the same as smaller.**
+    ///
+    /// `Shrink`'s contract is simplicity, and the engine leans on it for termination — a
+    /// candidate equal to its parent would loop forever. Three of this shrinker's moves
+    /// (dropping padding, dilation and stride to their identity values) leave the element
+    /// count untouched while genuinely simplifying the case, exactly as `activation`'s
+    /// dimension-move does.
+    ///
+    /// So the measure is lexicographic: elements first, then the parameters that only select
+    /// a code path. Both components are monotone, so no sequence of moves can cycle.
+    #[test]
+    fn convolution_candidates_are_strictly_simpler() {
+        fn complexity(case: &TensorOp) -> (usize, usize) {
+            let TensorOp::Conv2d { params, .. } = case else {
+                unreachable!()
+            };
+            let knobs: usize = params.padding.iter().sum::<usize>()
+                + params.dilation.iter().sum::<usize>()
+                + params.stride.iter().sum::<usize>()
+                + params.groups;
+            (case.element_count(), knobs)
+        }
+
+        for case in [
+            conv_case(&[2, 4, 6, 6], &[4, 2, 3, 3], 2, [1, 1], true),
+            conv_case(&[1, 8, 5, 5], &[8, 1, 3, 3], 8, [0, 0], false),
+        ] {
+            let before = complexity(&case);
+            for candidate in case.candidates() {
+                assert!(
+                    complexity(&candidate) < before,
+                    "{:?} at {:?} is not simpler than the original at {before:?}",
+                    candidate.name(),
+                    complexity(&candidate)
+                );
+            }
+        }
+    }
+
+    /// **Grouping is reduced last, and never by growing the weight.**
+    ///
+    /// The weight's second dimension is `in_channels / groups`, so reducing `groups` alone
+    /// multiplies the weight by the factor removed — the first version of this shrinker did
+    /// exactly that and tripped `resized`'s shrink-only assertion. The move that is offered
+    /// halves `groups` and `in_channels` together, leaving the weight untouched.
+    #[test]
+    fn grouping_is_reduced_last_and_never_by_growing_the_weight() {
+        for case in [
+            conv_case(&[1, 4, 6, 6], &[4, 2, 3, 3], 2, [1, 1], false),
+            conv_case(&[1, 8, 6, 6], &[8, 2, 3, 3], 4, [1, 1], false),
+            conv_case(&[2, 6, 5, 5], &[6, 2, 3, 3], 3, [0, 1], true),
+        ] {
+            let TensorOp::Conv2d { weight, .. } = &case else {
+                unreachable!()
+            };
+            let original = weight.len();
+            let candidates = case.candidates();
+
+            for candidate in &candidates {
+                let TensorOp::Conv2d { weight, .. } = candidate else {
+                    unreachable!()
+                };
+                assert!(
+                    weight.len() <= original,
+                    "a candidate grew the weight from {original} to {}",
+                    weight.len()
+                );
+            }
+
+            // Whatever grouping move exists must be the final candidate offered.
+            let TensorOp::Conv2d { params, .. } = &case else {
+                unreachable!()
+            };
+            let groups = params.groups;
+            if let Some(position) = candidates.iter().position(
+                |c| matches!(c, TensorOp::Conv2d { params, .. } if params.groups < groups),
+            ) {
+                assert_eq!(
+                    position,
+                    candidates.len() - 1,
+                    "reducing grouping must be the last resort, not an early move"
+                );
+            }
+        }
     }
 
     /// Matrix multiplication's shared inner dimension must stay shared.
