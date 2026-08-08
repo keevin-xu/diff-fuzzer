@@ -149,6 +149,17 @@ pub enum UnaryOp {
     /// that restriction is its own experiment, once there is a policy for what two
     /// backends both returning NaN should mean.
     Sqrt,
+    /// The error function — **no closed form, so every implementation picks its own
+    /// approximation.**
+    ///
+    /// `burn-flex` delegates to `libm::erff`, a piecewise-rational approximation derived from
+    /// fdlibm whose formula switches near `|x| = 0.84375`; `burn-tch` uses libtorch's own.
+    /// **A switch point is a property of the input that selects between code paths** — the
+    /// same shape as the tile remainder that explained the one bug filed upstream, and the
+    /// reason this operation is worth more than its arithmetic suggests.
+    ///
+    /// Bounded in `[-1, 1]` and monotone, so it has none of `exp`'s overflow behaviour.
+    Erf,
     /// Undefined below zero, `-inf` at zero — and, unlike `exp`, **its error is worst near
     /// `x = 1`**, not at large arguments.
     ///
@@ -223,6 +234,13 @@ pub enum ReduceOp {
 pub enum ScanOp {
     /// Running sum along the axis.
     CumSum,
+    /// Running product along the axis.
+    ///
+    /// The same association question as [`ScanOp::CumSum`], plus one of its own: a running
+    /// product reaches `inf` far faster than a running sum reaches anything, and **where it
+    /// overflows depends on the order the multiplications are grouped in**. A tree scan can
+    /// overflow at a position a sequential one does not, and vice versa.
+    CumProd,
 }
 
 /// Operations normalising a tensor along one axis.
@@ -390,6 +408,7 @@ impl TensorOp {
                 UnaryOp::Exp => "exp",
                 UnaryOp::Sqrt => "sqrt",
                 UnaryOp::Log => "log",
+                UnaryOp::Erf => "erf",
             },
             TensorOp::Binary { kind, .. } => match kind {
                 BinaryOp::Add => "add",
@@ -410,6 +429,7 @@ impl TensorOp {
             },
             TensorOp::Scan { kind, .. } => match kind {
                 ScanOp::CumSum => "cumsum",
+                ScanOp::CumProd => "cumprod",
             },
         }
     }

@@ -433,7 +433,7 @@ fn value_rules(kind: UnaryOp) -> ValueRules {
             allow_zero: false,
             allow_negative: false,
         },
-        UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Exp => ValueRules::unrestricted(),
+        UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Exp | UnaryOp::Erf => ValueRules::unrestricted(),
     }
 }
 

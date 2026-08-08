@@ -36,7 +36,7 @@
 //! Running out of bytes is handled the same way: exhausted data reads as zero rather than
 //! failing, so a short input still yields a valid, if minimal, case.
 
-use crate::input::{ActivationOp, BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, ReduceOp, ScanOp, TensorOp, TensorValue, UnaryOp};
 use crate::ops::{Bounds, DIVISOR_FLOOR, Domain, SPECIAL_VALUES};
 use arbitrary::{Arbitrary, Result, Unstructured};
 
@@ -85,6 +85,7 @@ pub const DEFAULT_DECODE_BOUNDS: Bounds = Bounds {
     selecting_reductions: true,
     matmul: true,
     activations: true,
+    scans: true,
     // Unused here — special values are selected by the byte layout below rather than by
     // a probability — but the struct requires them.
     special_value_rate: 0.0,
@@ -125,6 +126,7 @@ pub fn decode_bounds() -> &'static Bounds {
             selecting_reductions: false,
             matmul: false,
             activations: false,
+            scans: false,
             ..DEFAULT_DECODE_BOUNDS
         };
 
@@ -140,9 +142,10 @@ pub fn decode_bounds() -> &'static Bounds {
                 "selecting_reductions" => bounds.selecting_reductions = true,
                 "matmul" => bounds.matmul = true,
                 "activations" => bounds.activations = true,
+                "scans" => bounds.scans = true,
                 other => panic!(
                     "DIFF_FUZZER_OPS: unknown axis {other:?}. Known: unary, binary, \
-                     accumulating_reductions, selecting_reductions, matmul, activations"
+                     accumulating_reductions, selecting_reductions, matmul, activations, scans"
                 ),
             }
         }
@@ -162,19 +165,29 @@ fn enabled_slots() -> Vec<Slot> {
     let b = decode_bounds();
     let mut slots = Vec::new();
     if b.unary_ops {
-        slots.extend([Slot::Neg, Slot::Abs, Slot::Exp, Slot::Sqrt, Slot::Log]);
+        slots.extend([
+            Slot::Neg,
+            Slot::Abs,
+            Slot::Exp,
+            Slot::Sqrt,
+            Slot::Log,
+            Slot::Erf,
+        ]);
     }
     if b.binary_ops {
         slots.extend([Slot::Add, Slot::Sub, Slot::Mul, Slot::Div]);
     }
     if b.accumulating_reductions {
-        slots.extend([Slot::Sum, Slot::Mean]);
+        slots.extend([Slot::Sum, Slot::Mean, Slot::Prod]);
     }
     if b.selecting_reductions {
         slots.extend([Slot::Max, Slot::Min]);
     }
     if b.activations {
         slots.push(Slot::Softmax);
+    }
+    if b.scans {
+        slots.extend([Slot::CumSum, Slot::CumProd]);
     }
     if b.matmul {
         slots.push(Slot::Matmul);
@@ -216,15 +229,19 @@ enum Slot {
     Exp,
     Sqrt,
     Log,
+    Erf,
     Add,
     Sub,
     Mul,
     Div,
     Sum,
     Mean,
+    Prod,
     Max,
     Min,
     Softmax,
+    CumSum,
+    CumProd,
     Matmul,
 }
 
@@ -382,13 +399,14 @@ impl<'a> Arbitrary<'a> for TensorOp {
         let slot = slots[byte(u) as usize % slots.len()];
 
         Ok(match slot {
-            Slot::Neg | Slot::Abs | Slot::Exp | Slot::Sqrt | Slot::Log => {
+            Slot::Neg | Slot::Abs | Slot::Exp | Slot::Sqrt | Slot::Log | Slot::Erf => {
                 let kind = match slot {
                     Slot::Neg => UnaryOp::Neg,
                     Slot::Abs => UnaryOp::Abs,
                     Slot::Exp => UnaryOp::Exp,
                     Slot::Sqrt => UnaryOp::Sqrt,
-                    _ => UnaryOp::Log,
+                    Slot::Log => UnaryOp::Log,
+                    _ => UnaryOp::Erf,
                 };
                 let domain = unary_domain(kind);
                 // Sequential bindings rather than nesting: the order bytes are consumed
@@ -421,6 +439,19 @@ impl<'a> Arbitrary<'a> for TensorOp {
                     tensor(u, rhs_shape, right_domain),
                 )
             }
+            Slot::CumSum | Slot::CumProd => {
+                // Same layout as a reduction: shape, then the axis. A scan preserves shape,
+                // but the *bytes* describing it are identical, which keeps the layout simple.
+                let kind = if slot == Slot::CumSum {
+                    ScanOp::CumSum
+                } else {
+                    ScanOp::CumProd
+                };
+                let rank = size(u, decode_bounds().max_rank);
+                let shape = shape(u, rank);
+                let dim = (byte(u) as usize) % shape.len();
+                TensorOp::scan(kind, tensor(u, shape, Domain::Any), dim)
+            }
             Slot::Softmax => {
                 // `softmax`, whose dimension is drawn *after* the shape so that the shape
                 // bytes keep their positions and a mutation of one does not shift the other.
@@ -430,10 +461,11 @@ impl<'a> Arbitrary<'a> for TensorOp {
                 let dim = (byte(u) as usize) % shape.len();
                 TensorOp::activation(ActivationOp::Softmax, tensor(u, shape, Domain::Any), dim)
             }
-            Slot::Sum | Slot::Mean | Slot::Max | Slot::Min => {
+            Slot::Sum | Slot::Mean | Slot::Prod | Slot::Max | Slot::Min => {
                 let kind = match slot {
                     Slot::Sum => ReduceOp::Sum,
                     Slot::Mean => ReduceOp::Mean,
+                    Slot::Prod => ReduceOp::Prod,
                     Slot::Max => ReduceOp::Max,
                     _ => ReduceOp::Min,
                 };
@@ -719,8 +751,8 @@ mod tests {
         // generator's equivalent asserts the *count* matches and caught the same omission
         // immediately — so this one now does the same.
         let expected = [
-            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "sum", "mean", "max",
-            "min", "matmul", "softmax",
+            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "erf", "sum", "mean",
+            "prod", "max", "min", "matmul", "softmax", "cumsum", "cumprod",
         ];
         for name in expected {
             assert!(seen.contains(name), "{name} was never decoded");

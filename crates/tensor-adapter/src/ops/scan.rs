@@ -27,7 +27,7 @@ use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
 /// Every scan the generator may pick.
-pub const ALL: [ScanOp; 1] = [ScanOp::CumSum];
+pub const ALL: [ScanOp; 2] = [ScanOp::CumSum, ScanOp::CumProd];
 
 /// How often the values are built to cancel against each other.
 ///

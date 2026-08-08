@@ -92,6 +92,10 @@ impl TensorOp {
                 // Neither is required to be correctly rounded, and their error grows in
                 // opposite directions — see `approximated_tolerance`.
                 UnaryOp::Exp | UnaryOp::Log => OpClass::Approximated,
+                // `erf` has no closed form, so every implementation approximates it — and
+                // unlike `exp` and `log`, its error does not scale with its argument. See
+                // `approximated_tolerance`.
+                UnaryOp::Erf => OpClass::Approximated,
                 // `sqrt` is correctly rounded by IEEE-754; `neg` and `abs` only touch
                 // the sign bit.
                 UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Sqrt => OpClass::CorrectlyRounded,
@@ -247,6 +251,33 @@ impl TensorTolerancePolicy {
         input: &TensorOp,
         implementations: (&str, &str),
     ) -> Option<(String, String)> {
+        // **`erf` against a GPU cannot be judged, because nothing specifies it there.**
+        //
+        // Metal's §8 omits `erf` from both accuracy tables (`SPECS.md` §4.1b), so there is no
+        // figure to derive a bound from — and this project's rule is that a failed retrieval
+        // yields no number rather than a plausible one. Holding it to the CPU bound would
+        // manufacture false positives from a difference no specification forbids.
+        //
+        // Skipping discards evidence, which is why it is confined to this exact pair rather
+        // than to the operation: `erf` between the two CPU backends is judged normally, and
+        // that is where its independent implementations actually are.
+        if involves_gpu(implementations)
+            && matches!(
+                input,
+                TensorOp::Unary {
+                    kind: UnaryOp::Erf,
+                    ..
+                }
+            )
+        {
+            return Some((
+                "erf on a GPU".to_string(),
+                "the Metal Shading Language Specification §8 gives no accuracy for erf in \
+                 either Table 8.1 or Table 8.2, so no bound can be derived for this pair"
+                    .to_string(),
+            ));
+        }
+
         if involves_gpu(implementations) && has_subnormal_input(input) {
             return Some((
                 "subnormal input on a GPU".to_string(),
@@ -346,6 +377,14 @@ fn approximated_tolerance(input: &TensorOp) -> Tolerance {
     let amplification = match kind {
         UnaryOp::Exp => largest_magnitude(arg.data()).min(EXP_SATURATION),
         UnaryOp::Log => log_amplification(arg.data()),
+        // **`erf` does not amplify.** Its derivative is `2/√π · e^(−x²)`, peaking at about
+        // 1.128 at `x = 0` and decaying to nothing — so a relative perturbation of the
+        // argument is *damped*, not magnified. The condition-number term `exp` and `log`
+        // need is simply absent, and either of their models would bound the wrong thing.
+        //
+        // What remains is the approximation error itself, and no specification bounds it on
+        // any backend. See `ERF_ULPS`.
+        UnaryOp::Erf => ERF_ULPS,
         other => unreachable!("{other:?} is not approximated"),
     };
 
@@ -433,6 +472,22 @@ const LOG_MAX_AMPLIFICATION: f64 = 64.0;
 ///
 /// 104 is where the *smaller* of the two saturations occurs, so it bounds both.
 const EXP_SATURATION: f64 = 104.0;
+
+/// Units in the last place allowed between two `erf` implementations.
+///
+/// **Not from a standard — there isn't one.** IEEE-754 does not cover `erf`, and the *Metal
+/// Shading Language Specification* omits it from **both** Table 8.1 and Table 8.2
+/// (retrieved 2026-08-08; see `SPECS.md` §4.1b). So no specification bounds it on any
+/// backend, and this figure is a **judgment**, labelled as such.
+///
+/// The reasoning: `burn-flex` delegates to `libm::erff`, whose own source comment claims it
+/// "lands within a few ulps" (`SPECS.md` §2b.5). Eight is a few, with room for libtorch's
+/// undocumented approximation to differ in the same direction. It is *not* fitted to
+/// measurement — nothing has been measured yet, which is the point of adding the operation.
+///
+/// **If this proves too tight it will show up as false positives**, which is the recoverable
+/// direction; too loose and the operation tests nothing, which is not.
+const ERF_ULPS: f64 = 8.0;
 
 /// Tolerance for an operation that sums `terms` values of magnitude up to `largest`.
 ///
@@ -530,7 +585,7 @@ fn value_range(data: &[f32]) -> f64 {
 }
 
 fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
-    use crate::input::ReduceOp;
+    use crate::input::{ReduceOp, ScanOp};
 
     match input {
         TensorOp::Reduce { kind, arg, axis } => {
@@ -578,9 +633,15 @@ fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
         // construction. Floating-point addition is not associative, so both can be correct
         // and differ. Every other operation tested has all three backends performing the
         // *same* additions in the same order.
-        TensorOp::Scan { arg, dim, .. } => {
+        TensorOp::Scan { kind, arg, dim } => {
             let terms = arg.shape()[*dim];
-            bound(terms, largest_magnitude(arg.data()))
+            match kind {
+                ScanOp::CumSum => bound(terms, largest_magnitude(arg.data())),
+                // **A running product compounds relatively, like `prod`, and needs no
+                // absolute term** — a product cannot cancel. The worst element accumulates
+                // the whole axis, so the bound is `prod`'s at full length.
+                ScanOp::CumProd => Tolerance::new(2.0 * terms as f64 * EPSILON, 0.0),
+            }
         }
         TensorOp::Matmul { lhs, rhs } => {
             // Each output element sums `k` products, where `k` is the shared inner

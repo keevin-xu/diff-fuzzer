@@ -107,7 +107,56 @@ fn show(label: &str, data: Vec<f32>) {
 }
 
 fn main() {
-    println!("A — cancellation, where association order becomes visible\n");
+    println!("E — cumprod: where a running product overflows depends on grouping\n");
+    {
+        use tensor_adapter::input::ScanOp as S;
+        let run_prod = |data: Vec<f32>| -> String {
+            let n = data.len();
+            let case = TensorOp::scan(S::CumProd, TensorValue::new(vec![1, n], data), 1);
+            let backends: Vec<
+                Box<dyn Implementation<In = TensorOp, Out = burn::tensor::TensorData>>,
+            > = vec![Box::new(flex()), Box::new(libtorch()), Box::new(wgpu())];
+            let outs: Vec<(String, Vec<f32>)> = backends
+                .iter()
+                .filter_map(|b| {
+                    b.run(&case)
+                        .ok()
+                        .and_then(|o| o.to_vec::<f32>().ok())
+                        .map(|v| (b.name().to_string(), v))
+                })
+                .collect();
+            let (gap, who) = worst(&outs);
+            format!("rel {gap:.2e}  {who}")
+        };
+
+        // Overflow then recovery: 1e20 * 1e20 is inf, but * 1e-20 afterwards would recover
+        // it only if the product had not already saturated. Grouping decides.
+        println!(
+            "  overflow then divide back   {}",
+            run_prod(vec![1e20, 1e20, 1e-20, 1e-20])
+        );
+        // A zero mid-sequence annihilates everything after it.
+        println!(
+            "  zero mid-sequence           {}",
+            run_prod(vec![2.0, 0.0, 1e30, 1e30])
+        );
+        // Alternating magnitudes: the running value swings across the representable range.
+        println!(
+            "  alternating 1e18 / 1e-18    {}",
+            run_prod(
+                (0..32)
+                    .map(|i| if i % 2 == 0 { 1e18 } else { 1e-18 })
+                    .collect()
+            )
+        );
+        // Long run of values just above 1: overflow arrives gradually.
+        println!(
+            "  1.5 repeated (overflows)    {}",
+            run_prod(vec![1.5f32; 256])
+        );
+    }
+
+    println!("\nA — cancellation, where association order becomes visible\n");
     // (a + -a) + b is b; a + (-a + b) can lose b entirely to rounding first.
     for n in [4usize, 16, 64, 256] {
         let data: Vec<f32> = (0..n)

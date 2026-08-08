@@ -226,8 +226,8 @@ mod tests {
         }
 
         let expected = [
-            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "sum", "mean", "max",
-            "min", "prod", "matmul", "softmax", "cumsum",
+            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "erf", "sum", "mean",
+            "max", "min", "prod", "matmul", "softmax", "cumsum", "cumprod",
         ];
         for name in expected {
             assert!(counts.contains_key(name), "{name} was never generated");

@@ -77,6 +77,7 @@ impl<B: Backend> BurnBackend<B> {
                     UnaryOp::Exp => t.exp(),
                     UnaryOp::Sqrt => t.sqrt(),
                     UnaryOp::Log => t.log(),
+                    UnaryOp::Erf => t.erf(),
                 }
             }
             TensorOp::Binary { kind, lhs, rhs } => {
@@ -95,6 +96,7 @@ impl<B: Backend> BurnBackend<B> {
                     // The rank is therefore unchanged, which is what lets this share the
                     // single return type of `run_at_rank`.
                     ScanOp::CumSum => t.cumsum(*dim),
+                    ScanOp::CumProd => t.cumprod(*dim),
                 }
             }
             TensorOp::Activation { kind, arg, dim } => {

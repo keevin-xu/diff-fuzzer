@@ -10,12 +10,13 @@ use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
 /// Every unary operation the generator may pick.
-pub const ALL: [UnaryOp; 5] = [
+pub const ALL: [UnaryOp; 6] = [
     UnaryOp::Neg,
     UnaryOp::Abs,
     UnaryOp::Exp,
     UnaryOp::Sqrt,
     UnaryOp::Log,
+    UnaryOp::Erf,
 ];
 
 /// The values an operation is defined on.
@@ -34,15 +35,57 @@ fn domain(kind: UnaryOp, bounds: &Bounds) -> Domain {
         // `exp` is defined everywhere; it overflows to infinity for large arguments,
         // but the magnitude bound keeps generated inputs well short of that. Removing
         // the bound is one of the interesting things to try later.
-        UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Exp => Domain::Any,
+        // `erf` is defined on the whole real line and bounded in [-1, 1]; nothing to
+        // restrict.
+        UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Exp | UnaryOp::Erf => Domain::Any,
     }
+}
+
+/// Where `libm`'s `erff` switches between rational approximations.
+///
+/// **A switch point is a property of the input that selects a code path** — the same shape as
+/// the tile remainder behind the one bug filed upstream. Two implementations choosing
+/// different boundaries disagree most sharply just either side of one, so the generator aims
+/// there rather than waiting to land nearby by chance.
+///
+/// Read from `burn-flex`'s source, not guessed: `SPECS.md` §2b.5.
+const ERF_SWITCH_POINT: f32 = 0.84375;
+
+/// How often an `erf` case is placed right at that boundary.
+const ERF_AT_SWITCH_SHARE: f64 = 0.35;
+
+/// Values straddling `libm`'s switch point, within a few ULP either side.
+fn erf_switch_values(rng: &mut SeededRng, count: usize) -> Vec<f32> {
+    (0..count)
+        .map(|_| {
+            let sign = if rng.random_bool(0.5) { 1.0 } else { -1.0 };
+            // A handful of ULP either side, so both branches are exercised and the pairing is
+            // as close as the format allows.
+            let steps = rng.random_range(0..8i32) - 4;
+            let mut value = ERF_SWITCH_POINT;
+            for _ in 0..steps.abs() {
+                value = if steps > 0 {
+                    f32::from_bits(value.to_bits() + 1)
+                } else {
+                    f32::from_bits(value.to_bits() - 1)
+                };
+            }
+            sign * value
+        })
+        .collect()
 }
 
 /// Build a valid unary case.
 pub fn generate(rng: &mut SeededRng, bounds: &Bounds) -> TensorOp {
     let kind = ALL[rng.random_range(0..ALL.len())];
     let shape = shape(rng, bounds);
-    let data = values(rng, element_count(&shape), domain(kind, bounds), bounds);
+    let count = element_count(&shape);
+    // **`erf` is aimed at its switch point**; everything else is drawn from its domain.
+    let data = if kind == UnaryOp::Erf && rng.random_bool(ERF_AT_SWITCH_SHARE) {
+        erf_switch_values(rng, count)
+    } else {
+        values(rng, count, domain(kind, bounds), bounds)
+    };
 
     TensorOp::unary(kind, TensorValue::new(shape, data))
 }

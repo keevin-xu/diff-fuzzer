@@ -31,16 +31,20 @@ mod op {
     pub const EXP: u8 = 2;
     pub const SQRT: u8 = 3;
     pub const LOG: u8 = 4;
-    pub const ADD: u8 = 5;
-    pub const SUB: u8 = 6;
-    pub const MUL: u8 = 7;
-    pub const DIV: u8 = 8;
-    pub const SUM: u8 = 9;
-    pub const MEAN: u8 = 10;
-    pub const MAX: u8 = 11;
-    pub const MIN: u8 = 12;
-    pub const SOFTMAX: u8 = 13;
-    pub const MATMUL: u8 = 14;
+    pub const ERF: u8 = 5;
+    pub const ADD: u8 = 6;
+    pub const SUB: u8 = 7;
+    pub const MUL: u8 = 8;
+    pub const DIV: u8 = 9;
+    pub const SUM: u8 = 10;
+    pub const MEAN: u8 = 11;
+    pub const PROD: u8 = 12;
+    pub const MAX: u8 = 13;
+    pub const MIN: u8 = 14;
+    pub const SOFTMAX: u8 = 15;
+    pub const CUMSUM: u8 = 16;
+    pub const CUMPROD: u8 = 17;
+    pub const MATMUL: u8 = 18;
 }
 
 /// The byte that decodes to a dimension or rank of `n`.
@@ -135,7 +139,7 @@ fn matmul(batch: &[usize], m: usize, k: usize, n: usize) -> Vec<u8> {
 pub fn seed_corpus() -> Vec<Vec<u8>> {
     let mut seeds = Vec::new();
 
-    let unary_ops = [op::NEG, op::ABS, op::EXP, op::SQRT, op::LOG];
+    let unary_ops = [op::NEG, op::ABS, op::EXP, op::SQRT, op::LOG, op::ERF];
     let binary_ops = [op::ADD, op::SUB, op::MUL, op::DIV];
 
     // The smallest form of every operation. A minimal case is both the fastest to
@@ -146,10 +150,15 @@ pub fn seed_corpus() -> Vec<Vec<u8>> {
     for operation in binary_ops {
         seeds.push(binary(operation, &[1]));
     }
-    for operation in [op::SUM, op::MEAN, op::MAX, op::MIN] {
+    for operation in [op::SUM, op::MEAN, op::PROD, op::MAX, op::MIN] {
         seeds.push(reduce_of(operation, &[1], 0));
     }
     seeds.push(softmax(&[1], 0));
+    // Scans get a long axis from the outset: a two-element scan cannot express an
+    // association difference, which is the whole reason they were added.
+    seeds.push(reduce_of(op::CUMSUM, &[1], 0));
+    seeds.push(reduce_of(op::CUMPROD, &[1], 0));
+    seeds.push(reduce_of(op::CUMSUM, &[64], 0));
     seeds.push(matmul(&[], 1, 1, 1));
 
     // `softmax` off the last axis: the path where `burn-flex` transposes rather than
@@ -218,15 +227,20 @@ mod tests {
             ("exp", vec![1]),
             ("sqrt", vec![1]),
             ("log", vec![1]),
+            ("erf", vec![1]),
             ("add", vec![1]),
             ("sub", vec![1]),
             ("mul", vec![1]),
             ("div", vec![1]),
             ("sum", vec![1]),
             ("mean", vec![1]),
+            ("prod", vec![1]),
             ("max", vec![1]),
             ("min", vec![1]),
             ("softmax", vec![1]),
+            ("cumsum", vec![1]),
+            ("cumprod", vec![1]),
+            ("cumsum", vec![64]),
             ("matmul", vec![1, 1]),
         ];
 
@@ -242,8 +256,8 @@ mod tests {
         let names: HashSet<&str> = seed_corpus().iter().map(|s| decode(s).name()).collect();
 
         let expected = [
-            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "sum", "mean", "max",
-            "min", "matmul", "softmax",
+            "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "erf", "sum", "mean",
+            "prod", "max", "min", "matmul", "softmax", "cumsum", "cumprod",
         ];
         for name in expected {
             assert!(names.contains(name), "{name} is not seeded");
