@@ -14,7 +14,7 @@
 //! in [`BurnBackend::run`] is where those meet, and confining it here is what lets
 //! everything else treat rank as an ordinary value.
 
-use crate::input::{ActivationOp, BinaryOp, ReduceOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, ReduceOp, ScanOp, TensorOp, TensorValue, UnaryOp};
 use burn::backend::{Flex, LibTorch, Wgpu};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
@@ -88,6 +88,15 @@ impl<B: Backend> BurnBackend<B> {
                     BinaryOp::Div => a.div(b),
                 }
             }
+            TensorOp::Scan { kind, arg, dim } => {
+                let t = self.tensor::<D>(arg);
+                match kind {
+                    // **Shape-preserving**, unlike every reduction: one output per element.
+                    // The rank is therefore unchanged, which is what lets this share the
+                    // single return type of `run_at_rank`.
+                    ScanOp::CumSum => t.cumsum(*dim),
+                }
+            }
             TensorOp::Activation { kind, arg, dim } => {
                 let t = self.tensor::<D>(arg);
                 match kind {
@@ -107,6 +116,7 @@ impl<B: Backend> BurnBackend<B> {
                     ReduceOp::Mean => t.mean_dim(*axis),
                     ReduceOp::Max => t.max_dim(*axis),
                     ReduceOp::Min => t.min_dim(*axis),
+                    ReduceOp::Prod => t.prod_dim(*axis),
                 }
             }
             TensorOp::Matmul { lhs, rhs } => {
@@ -252,6 +262,73 @@ mod tests {
                     backend.name()
                 );
             }
+        }
+    }
+
+    /// `prod` and `cumsum` run everywhere and give the exact answers they must.
+    ///
+    /// `prod([1,2,3,4])` is 24 and `cumsum([1,2,3,4])` is `[1,3,6,10]` — all exactly
+    /// representable, so a backend disagreeing here is simply wrong rather than imprecise.
+    #[test]
+    fn prod_and_cumsum_run_on_every_backend_and_give_exact_answers() {
+        use crate::input::{ReduceOp, ScanOp};
+
+        let data = [1.0, 2.0, 3.0, 4.0];
+        let cases: Vec<(TensorOp, Vec<f32>)> = vec![
+            (
+                TensorOp::reduce(ReduceOp::Prod, value(&[1, 4], &data), 1),
+                vec![24.0],
+            ),
+            (
+                TensorOp::scan(ScanOp::CumSum, value(&[1, 4], &data), 1),
+                vec![1.0, 3.0, 6.0, 10.0],
+            ),
+        ];
+
+        for (case, expected) in cases {
+            for backend in [
+                &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+                &libtorch(),
+                &wgpu(),
+            ] {
+                let out =
+                    values(backend.run(&case).unwrap_or_else(|e| {
+                        panic!("{} on {}: {e:?}", backend.name(), case.name())
+                    }));
+                assert_eq!(
+                    out,
+                    expected,
+                    "{} got {out:?} for {}, expected {expected:?}",
+                    backend.name(),
+                    case.name()
+                );
+            }
+        }
+    }
+
+    /// **`prod`'s sharp edges**, recorded rather than asserted equal — this is the same
+    /// sentinel-and-identity territory where `max`/`min` were found to disagree.
+    #[test]
+    fn what_the_backends_do_with_prods_edge_cases() {
+        use crate::input::ReduceOp;
+
+        for (label, data) in [
+            ("inf times zero", vec![f32::INFINITY, 0.0]),
+            ("zero annihilates", vec![0.0, 5.0, 7.0]),
+            ("overflow", vec![1e30, 1e30]),
+            ("all ones", vec![1.0, 1.0, 1.0]),
+        ] {
+            let n = data.len();
+            let case = TensorOp::reduce(ReduceOp::Prod, value(&[1, n], &data), 1);
+            let answers: Vec<String> = [
+                &flex() as &dyn Implementation<In = TensorOp, Out = TensorData>,
+                &libtorch(),
+                &wgpu(),
+            ]
+            .iter()
+            .map(|b| format!("{}={:?}", b.name(), values(b.run(&case).expect("runs"))))
+            .collect();
+            println!("  prod {label:<18} {}", answers.join("  "));
         }
     }
 

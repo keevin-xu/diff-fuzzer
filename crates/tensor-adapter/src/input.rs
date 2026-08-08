@@ -194,6 +194,35 @@ pub enum ReduceOp {
     /// The mirror of [`ReduceOp::Max`], and it can differ independently: an implementation
     /// may handle `NaN` one way in one and another way in the other.
     Min,
+    /// A product across the axis.
+    ///
+    /// **Chosen because it is the closest sibling to the one clear bug found so far.** A
+    /// parallel reduction seeds an accumulator with an identity — `1` here, where `max` seeds
+    /// `-f32::MAX` — and `burn-wgpu` was found returning that sentinel instead of `-inf`.
+    /// Whether the multiplicative identity is handled better is a question with the same
+    /// shape and a different answer available.
+    ///
+    /// Its edges are also sharper than a sum's: `prod([inf, 0])` is `NaN`, overflow arrives
+    /// far faster, and a single zero annihilates the whole axis.
+    Prod,
+}
+
+/// Operations producing one output **per element**, scanning along an axis.
+///
+/// **Structurally unlike everything else tested.** A reduction collapses an axis to one
+/// value; a scan produces a running result at every position. That difference is not
+/// cosmetic — a sequential implementation keeps a running total, while a parallel one uses a
+/// prefix-scan algorithm (Hillis–Steele or Blelloch) that **associates the additions
+/// differently by construction**.
+///
+/// Floating-point addition is not associative, so two correct implementations of the same
+/// scan can return different last bits *by design*. That makes this the strongest remaining
+/// candidate for a **numeric** disagreement — the class 3.9 million cases of ordinary
+/// arithmetic failed to produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ScanOp {
+    /// Running sum along the axis.
+    CumSum,
 }
 
 /// Operations normalising a tensor along one axis.
@@ -253,6 +282,13 @@ pub enum TensorOp {
         /// Which axis is normalised over. Always less than the argument's rank.
         dim: usize,
     },
+    /// A running result along one axis, one output per element. See [`ScanOp`].
+    Scan {
+        kind: ScanOp,
+        arg: TensorValue,
+        /// Which axis is scanned along. Always less than the argument's rank.
+        dim: usize,
+    },
 }
 
 impl TensorOp {
@@ -288,6 +324,18 @@ impl TensorOp {
             arg.rank()
         );
         TensorOp::Activation { kind, arg, dim }
+    }
+
+    /// # Panics
+    ///
+    /// If `dim` is not a dimension of `arg`.
+    pub fn scan(kind: ScanOp, arg: TensorValue, dim: usize) -> Self {
+        assert!(
+            dim < arg.rank(),
+            "dim {dim} is out of range for a rank-{} tensor",
+            arg.rank()
+        );
+        TensorOp::Scan { kind, arg, dim }
     }
 
     /// # Panics
@@ -354,10 +402,14 @@ impl TensorOp {
                 ReduceOp::Mean => "mean",
                 ReduceOp::Max => "max",
                 ReduceOp::Min => "min",
+                ReduceOp::Prod => "prod",
             },
             TensorOp::Matmul { .. } => "matmul",
             TensorOp::Activation { kind, .. } => match kind {
                 ActivationOp::Softmax => "softmax",
+            },
+            TensorOp::Scan { kind, .. } => match kind {
+                ScanOp::CumSum => "cumsum",
             },
         }
     }
@@ -367,7 +419,8 @@ impl TensorOp {
         match self {
             TensorOp::Unary { arg, .. }
             | TensorOp::Reduce { arg, .. }
-            | TensorOp::Activation { arg, .. } => arg.rank(),
+            | TensorOp::Activation { arg, .. }
+            | TensorOp::Scan { arg, .. } => arg.rank(),
             TensorOp::Binary { lhs, .. } | TensorOp::Matmul { lhs, .. } => lhs.rank(),
         }
     }

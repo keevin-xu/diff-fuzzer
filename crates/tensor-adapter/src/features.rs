@@ -471,7 +471,8 @@ fn operands(case: &TensorOp) -> Vec<&TensorValue> {
     match case {
         TensorOp::Unary { arg, .. }
         | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. } => vec![arg],
+        | TensorOp::Activation { arg, .. }
+        | TensorOp::Scan { arg, .. } => vec![arg],
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => vec![lhs, rhs],
     }
 }

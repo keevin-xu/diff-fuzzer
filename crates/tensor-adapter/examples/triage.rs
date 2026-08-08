@@ -135,7 +135,8 @@ fn largest_argument(case: &TensorOp) -> f64 {
     match case {
         TensorOp::Unary { arg, .. }
         | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. } => largest(arg.data()),
+        | TensorOp::Activation { arg, .. }
+        | TensorOp::Scan { arg, .. } => largest(arg.data()),
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => {
             largest(lhs.data()).max(largest(rhs.data()))
         }

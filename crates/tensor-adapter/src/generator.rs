@@ -9,7 +9,7 @@
 //! the search for real divergences uses the varied one.
 
 use crate::input::{BinaryOp, TensorOp, TensorValue};
-use crate::ops::{Bounds, activation, binary, matmul, reduce, unary};
+use crate::ops::{Bounds, activation, binary, matmul, reduce, scan, unary};
 use diff_fuzzer_core::{Generator, SeededRng};
 use rand::RngExt;
 
@@ -19,12 +19,13 @@ use rand::RngExt;
 /// Choosing uniformly between the four classes would hand `matmul` — one operation —
 /// as many cases as all four elementwise binary operations put together, so a quarter
 /// of the entire budget would go to one kernel while `sub` got a sixteenth.
-const CLASS_WEIGHTS: [(Class, usize); 5] = [
+const CLASS_WEIGHTS: [(Class, usize); 6] = [
     (Class::Unary, unary::ALL.len()),
     (Class::Binary, binary::ALL.len()),
     (Class::Reduce, reduce::ALL.len()),
     (Class::Matmul, 1),
     (Class::Activation, activation::ALL.len()),
+    (Class::Scan, scan::ALL.len()),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,7 @@ enum Class {
     Reduce,
     Matmul,
     Activation,
+    Scan,
 }
 
 impl Class {
@@ -49,6 +51,7 @@ impl Class {
             Class::Reduce => bounds.accumulating_reductions || bounds.selecting_reductions,
             Class::Matmul => bounds.matmul,
             Class::Activation => bounds.activations,
+            Class::Scan => bounds.scans,
         }
     }
 }
@@ -108,6 +111,7 @@ impl Generator for TensorOpGenerator {
             Class::Reduce => reduce::generate(rng, &self.bounds),
             Class::Matmul => matmul::generate(rng, &self.bounds),
             Class::Activation => activation::generate(rng, &self.bounds),
+            Class::Scan => scan::generate(rng, &self.bounds),
         }
     }
 }
@@ -223,7 +227,7 @@ mod tests {
 
         let expected = [
             "add", "sub", "mul", "div", "neg", "abs", "exp", "sqrt", "log", "sum", "mean", "max",
-            "min", "matmul", "softmax",
+            "min", "prod", "matmul", "softmax", "cumsum",
         ];
         for name in expected {
             assert!(counts.contains_key(name), "{name} was never generated");
@@ -242,10 +246,19 @@ mod tests {
             *counts.entry(case.name()).or_default() += 1;
         }
 
-        // A tenth of the budget each would be exactly even; require at least half that.
-        let floor = total as usize / 10 / 2;
+        // **The even share is derived from how many operations there are**, not from a
+        // hardcoded fraction. This said "a tenth of the budget each", which was right when
+        // there were ten operations and wrong the moment there were seventeen — a test that
+        // fails on growth rather than on regression.
+        let even_share = total as usize / counts.len();
+        let floor = even_share / 2;
         for (name, count) in &counts {
-            assert!(*count >= floor, "{name} got only {count} of {total}");
+            assert!(
+                *count >= floor,
+                "{name} got only {count} of {total}; an even share across {} operations \
+                 would be {even_share}",
+                counts.len()
+            );
         }
     }
 

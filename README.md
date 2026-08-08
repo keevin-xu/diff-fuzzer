@@ -35,7 +35,7 @@ call**. That is a library disagreeing with *itself*, which needs no second backe
 observe.
 
 Scale so far: a four-hour campaign at ~3,500 executions/second (**50,491,268 cases**), plus
-seeded campaigns. All findings collapse to two distinct problems.
+the two 2026-08-07 campaigns below and several seeded runs.
 
 Those campaigns ran against `burn-ndarray`, which `burn` has since stopped listing among its
 first-party CPU backends; it was replaced by `burn-flex`. **810 of the 814 recorded findings
@@ -43,14 +43,43 @@ no longer reproduce** on the new pair — a fact the tool reports about *itself*
 recorded problem that can no longer be produced is a claim the repository can no longer
 support.
 
+### What three independent implementations actually disagree about
+
+Two campaigns on 2026-08-07, fifteen operations across `burn-flex`, `burn-tch` and
+`burn-wgpu`:
+
+| | |
+|---|---|
+| full operation set, 6 h | 4.2 M cases, **1,834 findings**, 8 signatures — all `max`/`min` |
+| eight arithmetic operations, 2.5 h | **3.9 M cases, 0 findings**, 12,709 non-diverging cases recorded |
+
+**Every divergence this project has found is structural**, not numeric — a disagreement about
+what the operation produced, rather than about how precisely:
+
+- `matmul` returning `inf` against `NaN` when intermediate products overflow (filed as
+  burn#5284)
+- `max([1, NaN, 3])` — both CPU backends propagate the `NaN`, the GPU ignores it and returns
+  `3.0`. IEEE-754 defines *both* conventions, so this is recorded as an observation rather
+  than adjudicated
+- `max([-inf, -inf])` returning **`-3.4028235e38`** on the GPU — exactly `-f32::MAX`, the
+  sentinel a parallel reduction seeds its accumulator with. No convention permits this, and it
+  corrupts silently: an infinity becomes a large finite number and downstream arithmetic
+  carries on
+
+**The 3.9 million clean cases are the other half of that claim**, and they only count because
+the tolerances were audited first: `softmax` and `exp` had been carrying bounds so loose that
+65% and 81% of their cases *could not fail*, while being reported as agreement. Fixing that —
+and making the oracle report an unusable bound as **unjudged** rather than as a pass — is what
+turned "we found nothing there" into evidence.
+
 ### Grouping findings by cause, not by symptom
 
 Two findings sharing a *signature* look alike; that is not evidence they share a bug. So the
 tool also proposes a **predicate**: a claim about the *input*, of the form
-`overflow_product ∧ magnitude_ratio_extreme`, built from 17 boolean properties of a case.
+`overflow_product ∧ magnitude_ratio_extreme`, built from 28 boolean properties of a case.
 
 The difference is that a signature can only describe the past, while a predicate makes a
-falsifiable claim about inputs nobody has run. It is tested that way: enumerate all 6,018
+falsifiable claim about inputs nobody has run. It is tested that way: enumerate all 27,776
 rules over at most three properties, discard any that fires on a case that did **not**
 diverge, then generate fresh cases the rule matches and measure how often *those* diverge.
 
@@ -93,10 +122,16 @@ full statement, including what the comparison is blind to.
 - **No predicate has been ratified.** The trigger-grouping machinery is built and every
   candidate it has produced so far failed validation. It is a mechanism that makes
   falsifiable claims, not a validated classifier, and the sample is far too small to be one.
-- **The negative pool contains no near-misses.** Those are cases one edit away from
-  diverging, and they are the only negatives strong enough to make a surviving rule mean
-  much. Every candidate report says so on its own face.
-- **No broadcasting**, and seven planned operations are unimplemented.
+- **`matmul` cases with extreme values are reported as unjudged, not passed.** Products of
+  `1e30` genuinely cancel to anything, so no comparison distinguishes a defect from
+  arithmetic. 96% of `matmul` cases fall here — correct rather than fixed, and now visible
+  rather than counted as agreement.
+- **Ten operations remain unimplemented**, including convolution, pooling and attention —
+  the ones whose implementations differ most in *algorithm* and where a numeric disagreement
+  would be most likely.
+- **`reshape` is deferred for an architectural reason**: it is the first operation whose
+  output rank differs from its input rank, which the rank-dispatch cannot express without
+  quadrupling its instantiations.
 - **One `SPECS.md` claim is still uncited** — the IEEE-754 correctly-rounded requirement
   that the strictest tolerance tier rests on. Listed explicitly in that file's §5.
 

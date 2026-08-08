@@ -18,7 +18,7 @@
 //! may put its axis out of range. Generic shrinkers produce invalid cases and waste the
 //! search on them.
 
-use crate::input::{ActivationOp, BinaryOp, TensorOp, TensorValue, UnaryOp};
+use crate::input::{ActivationOp, BinaryOp, ScanOp, TensorOp, TensorValue, UnaryOp};
 use diff_fuzzer_core::Shrink;
 
 impl Shrink for TensorOp {
@@ -29,6 +29,7 @@ impl Shrink for TensorOp {
             TensorOp::Reduce { kind, arg, axis } => reduce_candidates(*kind, arg, *axis),
             TensorOp::Matmul { lhs, rhs } => matmul_candidates(lhs, rhs),
             TensorOp::Activation { kind, arg, dim } => activation_candidates(*kind, arg, *dim),
+            TensorOp::Scan { kind, arg, dim } => scan_candidates(*kind, arg, *dim),
         }
     }
 }
@@ -137,6 +138,35 @@ fn activation_candidates(kind: ActivationOp, arg: &TensorValue, dim: usize) -> V
 
     for data in simpler_values(arg.data(), ValueRules::unrestricted()) {
         out.push(TensorOp::activation(
+            kind,
+            TensorValue::new(arg.shape().to_vec(), data),
+            dim,
+        ));
+    }
+
+    out
+}
+
+/// Candidates for a scan.
+///
+/// Mirrors the reduction shrinkers, with one difference that matters: **shortening the
+/// scanned axis is the highest-value move**, because the bound and the accumulated error
+/// both scale with it. A scan whose disagreement survives down to two elements is a very
+/// different claim from one that needs sixty-four.
+fn scan_candidates(kind: ScanOp, arg: &TensorValue, dim: usize) -> Vec<TensorOp> {
+    let mut out = Vec::new();
+
+    for shape in smaller_shapes(arg.shape()) {
+        let clamped = dim.min(shape.len() - 1);
+        out.push(TensorOp::scan(kind, arg.resized(&shape), clamped));
+    }
+
+    if dim != 0 {
+        out.push(TensorOp::scan(kind, arg.clone(), 0));
+    }
+
+    for data in simpler_values(arg.data(), ValueRules::unrestricted()) {
+        out.push(TensorOp::scan(
             kind,
             TensorValue::new(arg.shape().to_vec(), data),
             dim,
@@ -555,7 +585,8 @@ mod tests {
         match op {
             TensorOp::Unary { arg, .. }
             | TensorOp::Reduce { arg, .. }
-            | TensorOp::Activation { arg, .. } => arg.len(),
+            | TensorOp::Activation { arg, .. }
+            | TensorOp::Scan { arg, .. } => arg.len(),
             TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => {
                 lhs.len() + rhs.len()
             }

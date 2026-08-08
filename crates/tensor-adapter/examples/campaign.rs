@@ -413,7 +413,8 @@ fn element_count(case: &TensorOp) -> usize {
     match case {
         TensorOp::Unary { arg, .. }
         | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. } => arg.len(),
+        | TensorOp::Activation { arg, .. }
+        | TensorOp::Scan { arg, .. } => arg.len(),
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
     }
 }
@@ -426,7 +427,9 @@ fn shapes_of(case: &TensorOp) -> String {
             format!("{:?} x {:?}", lhs.shape(), rhs.shape())
         }
         TensorOp::Reduce { arg, axis, .. } => format!("{:?} axis {axis}", arg.shape()),
-        TensorOp::Activation { arg, dim, .. } => format!("{:?} dim {dim}", arg.shape()),
+        TensorOp::Activation { arg, dim, .. } | TensorOp::Scan { arg, dim, .. } => {
+            format!("{:?} dim {dim}", arg.shape())
+        }
     }
 }
 

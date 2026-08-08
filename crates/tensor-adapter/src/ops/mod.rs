@@ -21,6 +21,7 @@ pub mod binary;
 pub mod broadcast;
 pub mod matmul;
 pub mod reduce;
+pub mod scan;
 pub mod unary;
 
 use diff_fuzzer_core::SeededRng;
@@ -96,6 +97,12 @@ pub struct Bounds {
     pub matmul: bool,
     /// `softmax`.
     pub activations: bool,
+    /// `cumsum` — running results along an axis.
+    ///
+    /// Its own axis rather than folded into the reductions, because it is the only operation
+    /// whose backends may legitimately *associate differently*, and a campaign hunting a
+    /// numeric disagreement wants it alone.
+    pub scans: bool,
 
     /// Whether arguments are confined to each operation's defined domain.
     ///
@@ -127,6 +134,7 @@ impl Default for Bounds {
             selecting_reductions: true,
             matmul: true,
             activations: true,
+            scans: true,
             restrict_domains: true,
         }
     }
@@ -324,6 +332,7 @@ impl diff_fuzzer_core::GenerationAxes for Bounds {
             ("selecting_reductions", self.selecting_reductions),
             ("matmul", self.matmul),
             ("activations", self.activations),
+            ("scans", self.scans),
             ("unrestricted_domains", !self.restrict_domains),
         ]
     }
@@ -349,6 +358,7 @@ impl Bounds {
         selecting_reductions: true,
         matmul: true,
         activations: true,
+        scans: true,
         ..Self::DEFAULT
     };
 
@@ -374,6 +384,7 @@ impl Bounds {
         selecting_reductions: false,
         matmul: false,
         activations: true,
+        scans: true,
         ..Self::DEFAULT
     };
 
@@ -390,6 +401,7 @@ impl Bounds {
         selecting_reductions: true,
         matmul: true,
         activations: true,
+        scans: true,
         restrict_domains: true,
     };
 }

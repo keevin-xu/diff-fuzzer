@@ -73,7 +73,8 @@ fn element_count(case: &TensorOp) -> usize {
     match case {
         TensorOp::Unary { arg, .. }
         | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. } => arg.len(),
+        | TensorOp::Activation { arg, .. }
+        | TensorOp::Scan { arg, .. } => arg.len(),
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => lhs.len() + rhs.len(),
     }
 }

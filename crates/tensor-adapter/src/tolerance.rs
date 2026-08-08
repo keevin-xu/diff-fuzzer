@@ -114,10 +114,15 @@ impl TensorOp {
                 // and which implementations genuinely handle differently — and that is a
                 // finding, not noise.
                 ReduceOp::Max | ReduceOp::Min => OpClass::CorrectlyRounded,
+                // A product accumulates like a sum, but its errors compose differently —
+                // see `accumulating_tolerance`.
+                ReduceOp::Prod => OpClass::Accumulating,
             },
             TensorOp::Matmul { .. } => OpClass::Accumulating,
             // See `composed_tolerance`: `exp` over a sum, then a division.
             TensorOp::Activation { .. } => OpClass::Composed,
+            // A scan is a sum per element; the last one accumulates the whole axis.
+            TensorOp::Scan { .. } => OpClass::Accumulating,
         }
     }
 }
@@ -169,7 +174,8 @@ fn has_subnormal_input(case: &TensorOp) -> bool {
     let operands: [&crate::input::TensorValue; 2] = match case {
         TensorOp::Unary { arg, .. }
         | TensorOp::Reduce { arg, .. }
-        | TensorOp::Activation { arg, .. } => [arg, arg],
+        | TensorOp::Activation { arg, .. }
+        | TensorOp::Scan { arg, .. } => [arg, arg],
         TensorOp::Binary { lhs, rhs, .. } | TensorOp::Matmul { lhs, rhs } => [lhs, rhs],
     };
 
@@ -543,11 +549,38 @@ fn accumulating_tolerance(input: &TensorOp) -> Tolerance {
                 ReduceOp::Mean => {
                     Tolerance::new(summed.rtol + 2.0 * EPSILON, summed.atol / terms as f64)
                 }
+                // **A product's relative errors multiply out to a sum.** Each of `n`
+                // roundings contributes at most one `EPSILON` relatively, and
+                // `(1+e1)(1+e2)...(1+en) ≈ 1 + Σe`, so the relative bound is `n · EPSILON`
+                // — the same shape as a sum's, and for a different reason.
+                //
+                // **No absolute term**, which is where it differs from a sum. `bound`'s
+                // `atol` exists because cancellation destroys the scale a relative bound
+                // needs; a product cannot cancel. It can reach zero, but only by containing
+                // a zero — and that answer is exact on every implementation.
+                ReduceOp::Prod => Tolerance::new(2.0 * terms as f64 * EPSILON, 0.0),
                 // Classified `CorrectlyRounded`; never routed here.
                 ReduceOp::Max | ReduceOp::Min => {
                     unreachable!("{} does not accumulate", input.name())
                 }
             }
+        }
+        // **A scan is `n` sums, and the last one is the whole axis.**
+        //
+        // Element `i` accumulates `i+1` terms, so the worst case is the final element and
+        // the bound is a sum's over the full axis length. Using the axis length rather than
+        // an average is deliberate: the tolerance applies to every element, and the loosest
+        // element is the one it must cover.
+        //
+        // **This is the operation most likely to disagree numerically**, and the reason is
+        // structural rather than incidental: a sequential scan keeps a running total, while
+        // a parallel one (Hillis–Steele, Blelloch) associates the additions differently by
+        // construction. Floating-point addition is not associative, so both can be correct
+        // and differ. Every other operation tested has all three backends performing the
+        // *same* additions in the same order.
+        TensorOp::Scan { arg, dim, .. } => {
+            let terms = arg.shape()[*dim];
+            bound(terms, largest_magnitude(arg.data()))
         }
         TensorOp::Matmul { lhs, rhs } => {
             // Each output element sums `k` products, where `k` is the shared inner
