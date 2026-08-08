@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 /// a feature absent from both is simply not mentioned by the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Predicate {
-    pub required: u32,
-    pub forbidden: u32,
+    pub required: u64,
+    pub forbidden: u64,
 }
 
 impl Predicate {
@@ -93,11 +93,11 @@ impl Predicate {
     }
 }
 
-fn mask(names: &[&str]) -> u32 {
+fn mask(names: &[&str]) -> u64 {
     names
         .iter()
         .filter_map(|name| FEATURES.iter().position(|f| f == name))
-        .fold(0u32, |acc, bit| acc | (1 << bit))
+        .fold(0u64, |acc, bit| acc | (1u64 << bit))
 }
 
 #[cfg(test)]

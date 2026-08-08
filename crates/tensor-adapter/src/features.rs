@@ -28,7 +28,7 @@ use crate::input::{TensorOp, TensorValue};
 /// Seventeen features: eight describing *values*, nine describing *shape*. The split
 /// matters because they answer different questions — what the numbers are, versus which
 /// kernel the shape will select.
-pub const FEATURES: [&str; 28] = [
+pub const FEATURES: [&str; 36] = [
     // --- value features: standard floating-point failure modes ---
     "overflow_product",
     "mixed_sign_overflow",
@@ -65,17 +65,39 @@ pub const FEATURES: [&str; 28] = [
     "nan_in_reduced_axis",
     "log_input_near_one",
     "log_input_nonpositive",
+    // --- PHASE-7G: convolution. **The first vocabulary whose terms name a code path rather
+    //     than a property of the values.** Every feature above describes the numbers a case
+    //     carries; these describe which of a backend's five algorithms will run, because that
+    //     is what a convolution's known bugs are conditioned on. burn#4727 triggered on
+    //     `conv_grouped` and `conv_padded` *together*, which is a conjunction this vocabulary
+    //     can express and the previous one could not.
+    //
+    //     Added before any convolution finding exists, so they cannot be fitted to one.
+    "conv_grouped",
+    "conv_padded",
+    "conv_pointwise",
+    "conv_depthwise",
+    "conv_dilated",
+    "conv_strided",
+    "conv_few_input_channels",
+    "conv_output_spatial_is_one",
 ];
 
 /// A compile-time guard on the vocabulary size.
 ///
-/// `FeatureVec` is a `u32`, so bit 32 would silently shift out and every predicate mentioning
-/// it would match nothing while looking perfectly reasonable. Widening to `u64` is a
-/// deliberate decision — the search space doubles per bit — and must be made on purpose
-/// rather than discovered from a rule that mysteriously never fires.
+/// **Widened from `u32` to `u64` at PHASE-7G, deliberately.** The previous guard existed to
+/// force exactly this moment: at 28 of 32 bits, `conv2d`'s eight new features would have
+/// overflowed, bit 32 would have shifted out silently, and every predicate mentioning it
+/// would have matched nothing while looking perfectly reasonable.
+///
+/// **The cost is real and is the reason it was not done earlier.** The predicate search
+/// enumerates every rule over at most three features, which is `O(n³)` in the vocabulary
+/// size: 28 features give 27,776 candidate rules and 36 give **59,712** — roughly 2.15× the
+/// work per search. That is the price of being able to express a convolution's trigger at
+/// all, and it is paid knowingly rather than discovered.
 const _: () = assert!(
-    FEATURES.len() <= 32,
-    "FEATURES exceeds the bits in FeatureVec; widen it to u64 deliberately"
+    FEATURES.len() <= 64,
+    "FEATURES exceeds the bits in FeatureVec; widen it to u128 deliberately"
 );
 
 /// One case's features, one bit each.
@@ -83,7 +105,7 @@ const _: () = assert!(
 /// A bitmask rather than a set, so matching a predicate is a single `AND` — chosen because
 /// it is trivially explainable, not because seventeen booleans need optimising.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FeatureVec(pub u32);
+pub struct FeatureVec(pub u64);
 
 impl FeatureVec {
     /// Whether the named feature holds. Returns `false` for an unknown name rather than
@@ -158,8 +180,78 @@ pub fn extract(case: &TensorOp) -> FeatureVec {
 
     value_features(case, &mut features);
     shape_features(case, &mut features);
+    convolution_features(case, &mut features);
 
     features
+}
+
+/// Which of a backend's convolution code paths this case will reach.
+///
+/// **The first features that name a code path rather than a property of the values.**
+/// Everything else in this vocabulary describes the numbers a case carries — whether they
+/// overflow, cancel, or span an extreme ratio. These describe which of `burn-flex`'s five
+/// algorithms will run, because that is what a convolution's known bugs are conditioned on:
+/// burn#4727 was a missing channel offset in the SIMD *remainder* path, triggered by
+/// `conv_grouped` and `conv_padded` **together**.
+///
+/// That conjunction is the point. The predicate search enumerates rules over at most three
+/// features and has never ratified one, because `matmul`'s real trigger needs a property the
+/// value-oriented vocabulary cannot express. `conv_grouped ∧ conv_padded` is a rule this
+/// vocabulary *can* state and a generator can be steered toward.
+///
+/// A non-convolution case sets none of these, so they are all `false` — which is correct
+/// rather than merely convenient: a rule mentioning `conv_padded` should never match an
+/// `exp` case.
+fn convolution_features(case: &TensorOp, features: &mut FeatureVec) {
+    let TensorOp::Conv2d {
+        input,
+        weight,
+        params,
+        ..
+    } = case
+    else {
+        return;
+    };
+
+    let in_channels = input.shape()[1];
+    let out_channels = weight.shape()[0];
+
+    if params.groups > 1 {
+        features.set("conv_grouped");
+    }
+    if params.padding.iter().any(|p| *p > 0) {
+        features.set("conv_padded");
+    }
+    if weight.shape()[2] == 1 && weight.shape()[3] == 1 {
+        features.set("conv_pointwise");
+    }
+    if params.groups > 1 && params.groups == in_channels && params.groups == out_channels {
+        features.set("conv_depthwise");
+    }
+    if params.dilation.iter().any(|d| *d > 1) {
+        features.set("conv_dilated");
+    }
+    if params.stride.iter().any(|s| *s > 1) {
+        features.set("conv_strided");
+    }
+    if in_channels <= 2 {
+        features.set("conv_few_input_channels");
+    }
+    // **A degenerate output is where a tiled algorithm's remainder path is all there is.**
+    // With one output position the main loop runs zero times, so any bug in the cleanup
+    // path is unmasked rather than averaged away.
+    let degenerate = (0..2).all(|axis| {
+        crate::input::conv2d_output_size(
+            input.shape()[2 + axis],
+            weight.shape()[2 + axis],
+            params.stride[axis],
+            params.padding[axis],
+            params.dilation[axis],
+        ) == Some(1)
+    });
+    if degenerate {
+        features.set("conv_output_spatial_is_one");
+    }
 }
 
 /// Properties of the numbers themselves.
@@ -574,6 +666,91 @@ mod tests {
     /// describe the symptom, which `signature.rs` already does. This cannot be asserted
     /// directly — `extract` takes only a case, so the type system enforces it — but the
     /// test states the intent so a future change has to break it deliberately.
+    /// **The conjunction burn#4727 triggered on**, and the reason the vocabulary was widened
+    /// at all: a rule over three features can now name it, which no previous vocabulary could.
+    #[test]
+    fn the_grouped_and_padded_conjunction_is_expressible() {
+        use crate::input::Conv2dParams;
+        let fill = |shape: &[usize]| {
+            crate::input::TensorValue::new(
+                shape.to_vec(),
+                vec![1.0; shape.iter().product::<usize>()],
+            )
+        };
+
+        let triggering = TensorOp::conv2d(
+            fill(&[1, 4, 6, 6]),
+            fill(&[2, 2, 3, 3]),
+            None,
+            Conv2dParams {
+                groups: 2,
+                padding: [1, 1],
+                ..Default::default()
+            },
+        );
+        let f = extract(&triggering);
+        assert!(f.has("conv_grouped") && f.has("conv_padded"));
+
+        // Either condition alone must *not* satisfy the conjunction, or the rule would be
+        // matching cases that never triggered the bug.
+        let grouped_only = TensorOp::conv2d(
+            fill(&[1, 4, 6, 6]),
+            fill(&[2, 2, 3, 3]),
+            None,
+            Conv2dParams {
+                groups: 2,
+                ..Default::default()
+            },
+        );
+        let g = extract(&grouped_only);
+        assert!(g.has("conv_grouped") && !g.has("conv_padded"));
+
+        let padded_only = TensorOp::conv2d(
+            fill(&[1, 4, 6, 6]),
+            fill(&[2, 4, 3, 3]),
+            None,
+            Conv2dParams {
+                padding: [1, 1],
+                ..Default::default()
+            },
+        );
+        let p = extract(&padded_only);
+        assert!(!p.has("conv_grouped") && p.has("conv_padded"));
+    }
+
+    /// A convolution feature must never fire on a case that is not a convolution — otherwise
+    /// a ratified rule would "explain" findings from an unrelated operation.
+    #[test]
+    fn convolution_features_are_silent_on_other_operations() {
+        let case = TensorOp::unary(
+            UnaryOp::Exp,
+            crate::input::TensorValue::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
+        );
+        let f = extract(&case);
+        for name in FEATURES.iter().filter(|n| n.starts_with("conv_")) {
+            assert!(!f.has(name), "{name} fired on an exp case");
+        }
+    }
+
+    /// The generator must actually reach every convolution feature, or the vocabulary is
+    /// wider than the search can use.
+    #[test]
+    fn the_generator_reaches_every_convolution_feature() {
+        use crate::ops::Bounds;
+        use diff_fuzzer_core::SeededRng;
+
+        let bounds = Bounds::default();
+        let mut union = FeatureVec::default();
+        for seed in 0..1_500 {
+            let mut rng = SeededRng::from_seed(seed);
+            let case = crate::ops::conv::generate(&mut rng, &bounds);
+            union.0 |= extract(&case).0;
+        }
+        for name in FEATURES.iter().filter(|n| n.starts_with("conv_")) {
+            assert!(union.has(name), "{name} was never generated");
+        }
+    }
+
     #[test]
     fn extraction_reads_only_the_case() {
         let case = unary(&[2], &[1.0, 2.0]);
@@ -594,7 +771,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), count, "a feature name appears twice");
-        assert!(count <= 32, "FeatureVec is a u32");
+        assert!(count <= 64, "FeatureVec is a u64");
     }
 
     // --- value features ---------------------------------------------------------------

@@ -8,7 +8,7 @@
 //!
 //! # Why brute force
 //!
-//! Twenty-eight features give 3682 feature combinations and 27776 signed predicates. That is
+//! Thirty-six features give 7770 feature combinations and 59,712 signed predicates. That is
 //! nothing — the search runs in milliseconds. Anything cleverer (greedy feature selection,
 //! a decision tree, an SAT encoding) would buy no speed that matters and would cost the one
 //! property that does: **the developer must be able to describe the algorithm without
@@ -288,21 +288,35 @@ mod tests {
         )
     }
 
-    /// Every combination of ≤3 of the 28 features, with every sign assignment.
+    /// The number of rules `enumerate` must produce, from the vocabulary size.
+    fn expected_rule_count() -> usize {
+        fn choose(n: usize, k: usize) -> usize {
+            (0..k).fold(1, |acc, i| acc * (n - i) / (i + 1))
+        }
+        (1..=MAX_FEATURES)
+            .map(|k| choose(FEATURES.len(), k) * 2usize.pow(k as u32))
+            .sum()
+    }
+
+    /// Every combination of ≤3 features, with every sign assignment.
     ///
-    /// C(28,1)·2 + C(28,2)·4 + C(28,3)·8 = 56 + 1512 + 26208 = 27776. Pinning the number keeps
-    /// the enumeration honest: silently dropping the three-feature tier would still produce
-    /// plausible-looking output.
+    /// `Σ_{k=1..3} C(n,k)·2^k` — 56 + 1512 + 26208 = 27,776 at 28 features, and
+    /// 72 + 2520 + 57120 = **59,712** at 36. Checking the count keeps the enumeration honest:
+    /// silently dropping the three-feature tier would still produce plausible-looking output.
     ///
-    /// **6,018 at 17 features, 9,920 at 20, 19,650 at 25, 27776 at 28.** The count grows as
-    /// the cube of the vocabulary, so this is the number to watch when adding features — not
-    /// the feature count. Still milliseconds, and **28 of the 32 bits in `FeatureVec` are now
-    /// spent**: the next four features are the last that fit without widening it to `u64`.
+    /// **Computed from `FEATURES.len()` rather than pinned to a literal.** It was a literal,
+    /// and adding `conv2d`'s eight features broke this test with a bare number mismatch that
+    /// said nothing about which tier had changed. The formula is the actual invariant; the
+    /// number is a consequence.
+    ///
+    /// **6,018 at 17 features, 9,920 at 20, 19,650 at 25, 27,776 at 28, 59,712 at 36.** The
+    /// count grows as the cube of the vocabulary, so this — not the feature count — is the
+    /// number to watch when adding features. Still milliseconds.
     #[test]
     fn the_enumeration_covers_every_signed_combination_of_at_most_three_features() {
         let all = enumerate();
 
-        assert_eq!(all.len(), 27776);
+        assert_eq!(all.len(), expected_rule_count());
         assert!(all.iter().all(|p| p.size() <= MAX_FEATURES as u32));
         assert!(
             all.iter().all(|p| !p.is_vacuous()),
@@ -385,7 +399,7 @@ mod tests {
         // Every finding is either covered exactly once or listed as unexplained.
         let covered: usize = result.classes.iter().map(|c| c.covered.len()).sum();
         assert_eq!(covered + result.unexplained.len(), findings.len());
-        assert_eq!(result.considered, 27776);
+        assert_eq!(result.considered, expected_rule_count());
     }
 
     /// Rules are committed in order of how much they explain, and no finding is claimed
