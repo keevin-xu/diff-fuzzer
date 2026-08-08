@@ -126,9 +126,20 @@ full statement, including what the comparison is blind to.
   `1e30` genuinely cancel to anything, so no comparison distinguishes a defect from
   arithmetic. 96% of `matmul` cases fall here — correct rather than fixed, and now visible
   rather than counted as agreement.
-- **Ten operations remain unimplemented**, including convolution, pooling and attention —
-  the ones whose implementations differ most in *algorithm* and where a numeric disagreement
-  would be most likely.
+- **`conv2d` is implemented and has found nothing.** It was added because it is the one
+  operation whose three backends run genuinely different *algorithms* — `burn-flex` selects
+  among five shape-dependent code paths, `burn-tch` delegates to libtorch, `burn-wgpu` runs
+  its own kernel — and because burn has repeatedly shipped bugs in exactly those paths
+  (#4727 fixed a missing channel offset triggered by `groups > 1` **and** `padding > 0`).
+  A 42-configuration sweep of every path boundary agrees, with the bound 32x wider than the
+  worst observed error; so does a campaign over ordinary values. **The two defects the work
+  did surface were both in this tool**, not in `burn`: a tolerance that fell below one
+  subnormal step, and a domain restriction that never excluded the values it claimed to.
+- **Nine operations remain unimplemented**, including pooling and attention. Pooling looks
+  unpromising — its tracker shows feature requests rather than correctness bugs, and it has
+  no accumulation to disagree about. **The backward pass is the more interesting gap**: most
+  of burn's historical convolution bugs are gradient bugs, which a forward-only differential
+  oracle cannot see at all.
 - **`reshape` is deferred for an architectural reason**: it is the first operation whose
   output rank differs from its input rank, which the rank-dispatch cannot express without
   quadrupling its instantiations.
