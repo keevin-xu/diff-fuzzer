@@ -323,6 +323,27 @@ pub enum Expr {
     ///
     /// The list holds [`Literal`]s rather than [`Expr`]s deliberately: an expression list would
     /// defeat constant folding and so would test the path this variant was added to reach.
+    /// `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ELSE v3 END`.
+    ///
+    /// **Two `NULL` traps in one construct, and they are different from each other.**
+    ///
+    /// 1. **An omitted `ELSE` yields `NULL`.** A row matching no branch does not error and does
+    ///    not return the last value — it returns `NULL`. The absence of a clause produces a
+    ///    value, which is unusual enough that an engine can get it wrong by simply not
+    ///    implementing the case.
+    /// 2. **An UNKNOWN condition is not taken.** `WHEN NULL THEN x` behaves as `WHEN FALSE`, so
+    ///    a branch whose condition involves a `NULL` falls through. Combined with (1), a row can
+    ///    silently reach `NULL` through two independent routes.
+    ///
+    /// All branch results carry the **same type**, chosen once at generation. Mixing them would
+    /// reintroduce the text-versus-integer comparison the subset keeps unrepresentable — the
+    /// mistake the `HAVING` axis made at S9.5 and paid 825 spurious findings for.
+    Case {
+        /// `(condition, value)` pairs, in order. Never empty — `CASE END` is not valid SQL.
+        branches: Vec<(Expr, Expr)>,
+        /// The `ELSE`. `None` is the interesting case: it means `NULL` for unmatched rows.
+        otherwise: Option<Box<Expr>>,
+    },
     InList {
         not: bool,
         left: Box<Expr>,
@@ -353,6 +374,18 @@ impl Expr {
             // Each literal counts, so minimization can see that shortening the list is a
             // genuine reduction — which it is, and often the one that isolates the `NULL`.
             Expr::InList { left, list, .. } => 1 + left.node_count() + list.len(),
+            // Every condition and value counts, so removing a branch reads as a real reduction
+            // to minimization — which it is, and often the one that isolates the `NULL` route.
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                1 + branches
+                    .iter()
+                    .map(|(when, then)| when.node_count() + then.node_count())
+                    .sum::<usize>()
+                    + otherwise.as_ref().map_or(0, |e| e.node_count())
+            }
         }
     }
 
@@ -392,6 +425,18 @@ impl Expr {
             }
             // The list is literals, so only the left operand can reference a column.
             Expr::InList { left, .. } => left.collect_columns(found),
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                for (when, then) in branches {
+                    when.collect_columns(found);
+                    then.collect_columns(found);
+                }
+                if let Some(otherwise) = otherwise {
+                    otherwise.collect_columns(found);
+                }
+            }
         }
     }
 
@@ -415,6 +460,15 @@ impl Expr {
             // Unlike the subquery forms, there is no inner scope here — an aggregate in the
             // left operand would belong to *this* query, so it is reported rather than hidden.
             Expr::InList { left, .. } => left.contains_aggregate(),
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                branches
+                    .iter()
+                    .any(|(when, then)| when.contains_aggregate() || then.contains_aggregate())
+                    || otherwise.as_ref().is_some_and(|e| e.contains_aggregate())
+            }
         }
     }
 
@@ -451,6 +505,18 @@ impl Expr {
                 left.collect_columns_here(found)
             }
             Expr::InList { left, .. } => left.collect_columns_here(found),
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                for (when, then) in branches {
+                    when.collect_columns_here(found);
+                    then.collect_columns_here(found);
+                }
+                if let Some(otherwise) = otherwise {
+                    otherwise.collect_columns_here(found);
+                }
+            }
         }
     }
 
@@ -469,6 +535,18 @@ impl Expr {
                 found.push(query);
             }
             Expr::InList { left, .. } => left.collect_subqueries(found),
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                for (when, then) in branches {
+                    when.collect_subqueries(found);
+                    then.collect_subqueries(found);
+                }
+                if let Some(otherwise) = otherwise {
+                    otherwise.collect_subqueries(found);
+                }
+            }
             Expr::Column(_) | Expr::Literal(_) => {}
             Expr::Unary { operand, .. } => operand.collect_subqueries(found),
             Expr::Binary { left, right, .. } => {
@@ -490,6 +568,15 @@ impl Expr {
             Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => true,
             // A literal list is not a subquery, whatever it superficially resembles.
             Expr::InList { left, .. } => left.contains_subquery(),
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                branches
+                    .iter()
+                    .any(|(when, then)| when.contains_subquery() || then.contains_subquery())
+                    || otherwise.as_ref().is_some_and(|e| e.contains_subquery())
+            }
             Expr::Column(_) | Expr::Literal(_) => false,
             Expr::Unary { operand, .. } => operand.contains_subquery(),
             Expr::Binary { left, right, .. } => {
@@ -514,6 +601,11 @@ impl Expr {
             | Expr::ScalarSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::InList { .. } => true,
+            // **`Case` is NOT predicate-shaped** — it yields a value, not a truth value — and it
+            // is listed explicitly anyway. The `_ => false` arm below would give the right
+            // answer by accident; naming it means the next variant's author has to decide
+            // rather than inherit. Third time this wildcard has stayed silent on a new variant.
+            Expr::Case { .. } => false,
             Expr::Unary { op, .. } => {
                 matches!(op, UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull)
             }
@@ -547,6 +639,16 @@ impl Expr {
             // the feature this construct exists to exercise.
             Expr::InList { left, list, .. } => {
                 left.contains_null_literal() || list.contains(&Literal::Null)
+            }
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                branches.iter().any(|(when, then)| {
+                    when.contains_null_literal() || then.contains_null_literal()
+                }) || otherwise
+                    .as_ref()
+                    .is_some_and(|e| e.contains_null_literal())
             }
         }
     }

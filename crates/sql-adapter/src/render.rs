@@ -244,6 +244,28 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
         // engines. The generator never produces one, and the validity rules refuse it, so this
         // arm is belt and braces rather than a live path — but a panic here would be worse
         // than a query neither engine can parse.
+        // `CASE WHEN c THEN v ... [ELSE v] END`. An omitted `ELSE` is rendered as *nothing*,
+        // not as `ELSE NULL` — the two mean the same thing to SQL, and writing the explicit
+        // form would test our spelling of the default instead of the engine's handling of its
+        // absence, which is the whole point of the axis.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut sql = "(CASE".to_string();
+            for (when, then) in branches {
+                sql.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    render_expr(when, dialect),
+                    render_expr(then, dialect)
+                ));
+            }
+            if let Some(otherwise) = otherwise {
+                sql.push_str(&format!(" ELSE {}", render_expr(otherwise, dialect)));
+            }
+            sql.push_str(" END)");
+            sql
+        }
         Expr::InList { not, left, list } => {
             let values: Vec<String> = list.iter().map(render_literal).collect();
             format!(

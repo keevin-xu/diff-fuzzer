@@ -174,6 +174,14 @@ pub struct Bounds {
     /// key, so multi-key grouped queries were unjudgeable until this axis and the tuple-key
     /// support that came with it.
     pub multi_group_by: bool,
+    /// Whether the generator may emit `CASE WHEN … THEN … END` in a projection.
+    ///
+    /// Two `NULL` routes in one construct, and they are independent: an **omitted `ELSE`**
+    /// yields `NULL` for unmatched rows (a value produced by the *absence* of a clause), and an
+    /// **UNKNOWN condition is not taken**, so `WHEN NULL THEN x` behaves as `WHEN FALSE`. A row
+    /// can reach `NULL` through either, and the signature tags them apart so a finding in one
+    /// is not grouped with a finding in the other.
+    pub case_expressions: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -242,6 +250,7 @@ impl Bounds {
         having: false,
         not_in_correlated: false,
         multi_group_by: false,
+        case_expressions: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -293,6 +302,12 @@ impl Bounds {
         ..Bounds::V1
     };
 
+    /// V1 plus `CASE` expressions. Cleanly separable — needs no other axis.
+    pub const V1_CASE: Bounds = Bounds {
+        case_expressions: true,
+        ..Bounds::V1
+    };
+
     /// V1 plus joins. One axis, as always.
     pub const V1_JOINS: Bounds = Bounds {
         joins: true,
@@ -335,6 +350,7 @@ impl Bounds {
         having: true,
         not_in_correlated: true,
         multi_group_by: true,
+        case_expressions: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -410,6 +426,7 @@ impl GenerationAxes for Bounds {
             ("having", self.having),
             ("not-in-correlated", self.not_in_correlated),
             ("multi-group-by", self.multi_group_by),
+            ("case", self.case_expressions),
         ]
     }
 

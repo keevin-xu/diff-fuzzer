@@ -263,6 +263,17 @@ fn mentions_null_test(expression: &Expr) -> bool {
         // about. Reporting otherwise would conflate the two features a predicate rule most
         // needs to tell apart.
         Expr::InList { left, .. } => mentions_null_test(left),
+        // A `CASE` condition is an ordinary predicate, so an `IS NULL` inside one counts —
+        // unlike `InList`, where the `NULL` changes the answer without being asked about.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            branches
+                .iter()
+                .any(|(when, then)| mentions_null_test(when) || mentions_null_test(then))
+                || otherwise.as_ref().is_some_and(|e| mentions_null_test(e))
+        }
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }

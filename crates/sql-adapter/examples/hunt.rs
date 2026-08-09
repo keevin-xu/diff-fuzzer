@@ -78,6 +78,7 @@ fn main() {
         Some("having") => sql_adapter::gen_schema::Bounds::V1_HAVING,
         Some("not-in-correlated") => sql_adapter::gen_schema::Bounds::V1_NOT_IN_CORRELATED,
         Some("multi-group-by") => sql_adapter::gen_schema::Bounds::V1_MULTI_GROUP_BY,
+        Some("case") => sql_adapter::gen_schema::Bounds::V1_CASE,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
         _ => sql_adapter::gen_schema::Bounds::V1,

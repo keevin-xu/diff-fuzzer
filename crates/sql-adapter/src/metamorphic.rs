@@ -1567,6 +1567,99 @@ mod tests {
         );
     }
 
+    /// A `CASE` reaches `NULL` by **two independent routes**, on both engines.
+    ///
+    /// Both are checked in one case so the two mechanisms are visibly distinct rather than
+    /// conflated: an omitted `ELSE` yields `NULL` for a row matching nothing, and a branch whose
+    /// condition is UNKNOWN is *not taken* — so a `NULL` in the condition also falls through.
+    #[test]
+    fn a_case_reaches_null_by_a_missing_else_and_by_an_unknown_condition() {
+        use crate::schema::{BinaryOp, Column, InsertRows, Literal, SqlType, Table};
+
+        let v = ColumnRef {
+            table: "t0".to_string(),
+            column: "v".to_string(),
+        };
+        // WHEN v > 0 THEN 1  [ELSE 0]
+        let case_expr = |otherwise: Option<i64>| Expr::Case {
+            branches: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Greater,
+                    left: Box::new(Expr::Column(v.clone())),
+                    right: Box::new(Expr::Literal(Literal::Integer(0))),
+                },
+                Expr::Literal(Literal::Integer(1)),
+            )],
+            otherwise: otherwise.map(|n| Box::new(Expr::Literal(Literal::Integer(n)))),
+        };
+
+        let case = |otherwise: Option<i64>| SqlCase {
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![Column {
+                    name: "v".to_string(),
+                    sql_type: SqlType::Integer,
+                }],
+            }],
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                rows: vec![
+                    vec![Literal::Integer(5)],  // matches:      -> 1
+                    vec![Literal::Integer(-5)], // no match:     -> ELSE, or NULL
+                    vec![Literal::Null],        // UNKNOWN cond: -> ELSE, or NULL
+                ],
+            }],
+            query: SelectStmt {
+                having: None,
+                distinct: false,
+                projection: vec![case_expr(otherwise)],
+                from: "t0".to_string(),
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let run = |c: &SqlCase| -> Vec<Vec<Cell>> {
+                let outcome = if engine == "sqlite" {
+                    SqliteImpl.run(c).expect("sqlite runs the case")
+                } else {
+                    DuckDbImpl.run(c).expect("duckdb runs the case")
+                };
+                let SqlOutcome::Rows(mut rows) = outcome else {
+                    panic!("{engine}: expected rows")
+                };
+                rows.sort_by_key(|row| format!("{row:?}"));
+                rows
+            };
+
+            // **Without `ELSE`: two of three rows are `NULL`** — one for matching nothing, one
+            // because its condition was UNKNOWN rather than FALSE.
+            assert_eq!(
+                run(&case(None)),
+                vec![vec![Cell::Integer(1)], vec![Cell::Null], vec![Cell::Null]],
+                "{engine}: a missing ELSE must yield NULL for unmatched rows"
+            );
+
+            // **The control.** With `ELSE 0` the same three rows yield 1, 0, 0 — proving the
+            // `NULL`s above came from the absent clause and the untaken branch, not from the
+            // data being unreadable or the comparison failing outright.
+            assert_eq!(
+                run(&case(Some(0))),
+                vec![
+                    vec![Cell::Integer(0)],
+                    vec![Cell::Integer(0)],
+                    vec![Cell::Integer(1)]
+                ],
+                "{engine}: with an ELSE, no row should be NULL"
+            );
+        }
+    }
+
     /// Build a grouped result: each entry is a group key followed by its aggregate values,
     /// where `None` renders as `NULL`.
     fn groups(values: &[(i64, &[Option<i64>])]) -> SqlOutcome {

@@ -215,6 +215,25 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
         // for our purposes: the three-valued-logic trap is asymmetric and lives entirely on
         // the negated side. Collapsing them would group a finding with cases that cannot
         // exhibit it.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            tags.insert("case");
+            // Tagged separately, because the missing-`ELSE` route to `NULL` is a different
+            // mechanism from a branch condition being UNKNOWN, and a finding in one should not
+            // be grouped with a finding in the other.
+            if otherwise.is_none() {
+                tags.insert("case-without-else");
+            }
+            for (when, then) in branches {
+                collect_expr_tags(when, tags);
+                collect_expr_tags(then, tags);
+            }
+            if let Some(otherwise) = otherwise {
+                collect_expr_tags(otherwise, tags);
+            }
+        }
         Expr::InList { not, left, list } => {
             // Tagged apart from the subquery form as well as by polarity: the two reach
             // different engine code (a list can be constant-folded, a subquery must be run), so

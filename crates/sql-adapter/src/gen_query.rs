@@ -766,13 +766,54 @@ fn generate_projection(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Ve
             let column = &table.columns[rng.random_range(0..table.columns.len())];
             // Mostly bare columns: they keep minimized repros readable, and a divergence in
             // a projected column is easier to argue about than one inside an expression.
-            if rng.random_range(0..100) < 70 {
+            if bounds.case_expressions && rng.random_range(0..100) < 30 {
+                generate_case(rng, table, column.sql_type, bounds)
+            } else if rng.random_range(0..100) < 70 {
                 Expr::Column(reference(table, &column.name))
             } else {
                 generate_scalar(rng, table, column.sql_type, bounds, 0)
             }
         })
         .collect()
+}
+
+/// `CASE WHEN c THEN v ... [ELSE v] END`, with every branch at `result_type`.
+///
+/// **The `ELSE` is omitted 45% of the time, and that is the axis's whole point.** A row matching
+/// no branch then yields `NULL` — a value produced by the *absence* of a clause. The other 55%
+/// are the control: if something fires with an `ELSE` present too, it is not the missing-`ELSE`
+/// route.
+///
+/// Every branch value is generated at one type chosen by the caller. Mixing types would make the
+/// result column's type differ between engines — the text-versus-integer hazard the `HAVING`
+/// axis reintroduced at S9.5 and paid 825 spurious findings for. The type walk in the tests
+/// asserts this independently rather than trusting the comment.
+fn generate_case(rng: &mut SeededRng, table: &Table, result_type: SqlType, bounds: Bounds) -> Expr {
+    let count = rng.random_range(1..=2);
+    let branches: Vec<(Expr, Expr)> = (0..count)
+        .map(|_| {
+            // The condition is an ordinary predicate, so it can itself be UNKNOWN — the second
+            // `NULL` route, independent of the missing `ELSE`.
+            let when = generate_predicate(rng, table, bounds, bounds.max_expr_depth - 1);
+            let then = generate_scalar(rng, table, result_type, bounds, bounds.max_expr_depth - 1);
+            (when, then)
+        })
+        .collect();
+
+    let otherwise = (rng.random_range(0..100) >= 45).then(|| {
+        Box::new(generate_scalar(
+            rng,
+            table,
+            result_type,
+            bounds,
+            bounds.max_expr_depth - 1,
+        ))
+    });
+
+    Expr::Case {
+        branches,
+        otherwise,
+    }
 }
 
 /// A `WHERE` clause: comparisons and `IS NULL` tests, combined with `AND`/`OR`/`NOT`.
@@ -1008,6 +1049,85 @@ mod tests {
         let data = generate_data(&mut rng, &tables, Bounds::V1);
         let query = generate_query(&mut rng, &tables, &data, Bounds::V1);
         (tables, data, query)
+    }
+
+    /// The `case` axis must fire, must omit the `ELSE` often enough to test the route it was
+    /// added for, and must never mix branch types.
+    #[test]
+    fn the_case_axis_omits_the_else_often_enough_to_matter() {
+        fn walk(expression: &Expr, total: &mut usize, without_else: &mut usize) {
+            if let Expr::Case {
+                branches,
+                otherwise,
+            } = expression
+            {
+                *total += 1;
+                if otherwise.is_none() {
+                    *without_else += 1;
+                }
+                assert!(
+                    !branches.is_empty(),
+                    "`CASE END` with no branches is invalid SQL"
+                );
+            }
+            match expression {
+                Expr::Case {
+                    branches,
+                    otherwise,
+                } => {
+                    for (when, then) in branches {
+                        walk(when, total, without_else);
+                        walk(then, total, without_else);
+                    }
+                    if let Some(otherwise) = otherwise {
+                        walk(otherwise, total, without_else);
+                    }
+                }
+                Expr::Unary { operand, .. } => walk(operand, total, without_else),
+                Expr::Binary { left, right, .. } => {
+                    walk(left, total, without_else);
+                    walk(right, total, without_else);
+                }
+                _ => {}
+            }
+        }
+
+        let (mut total, mut without_else) = (0usize, 0usize);
+        for seed in 0..2_000 {
+            let mut rng = SeededRng::from_seed(seed);
+            let bounds = Bounds::V1_CASE;
+            let tables = generate_schema(&mut rng, bounds);
+            let data = generate_data(&mut rng, &tables, bounds);
+            let query = generate_query(&mut rng, &tables, &data, bounds);
+            for expression in &query.projection {
+                walk(expression, &mut total, &mut without_else);
+            }
+        }
+
+        assert!(total > 200, "only {total} CASE expressions in 2000 cases");
+        // **The rate that decides whether the axis tests its own premise.** A `CASE` with an
+        // `ELSE` cannot reach `NULL` by the missing-clause route at all.
+        assert!(
+            without_else * 4 > total,
+            "only {without_else} of {total} CASE expressions omitted ELSE — the missing-clause \
+             route to NULL is barely being generated"
+        );
+        // And the control form must exist too, or nothing distinguishes the two routes.
+        assert!(
+            without_else < total,
+            "every CASE omitted its ELSE; no control form"
+        );
+
+        // Off by default.
+        let mut rng = SeededRng::from_seed(0);
+        let tables = generate_schema(&mut rng, Bounds::V1);
+        let data = generate_data(&mut rng, &tables, Bounds::V1);
+        let query = generate_query(&mut rng, &tables, &data, Bounds::V1);
+        let (mut off, mut _e) = (0usize, 0usize);
+        for expression in &query.projection {
+            walk(expression, &mut off, &mut _e);
+        }
+        assert_eq!(off, 0, "V1 must not generate CASE expressions");
     }
 
     /// The correlated `NOT IN` axis must fire, must actually correlate, and must produce cases
@@ -1376,6 +1496,7 @@ mod tests {
             ("V1_HAVING", Bounds::V1_HAVING),
             ("V1_SUBQUERIES", Bounds::V1_SUBQUERIES),
             ("V1_NOT_IN_LIST", Bounds::V1_NOT_IN_LIST),
+            ("V1_CASE", Bounds::V1_CASE),
         ] {
             for seed in 0..500 {
                 let mut rng = SeededRng::from_seed(seed);
@@ -1463,6 +1584,38 @@ mod tests {
             Expr::ScalarSubquery { left, .. } | Expr::InSubquery { left, .. } => {
                 assert_types_agree(left, table, seed);
                 None
+            }
+            // The second arm that **asserts**: every branch of a `CASE` must yield the same
+            // type, or the engines disagree about the result column's type — the same
+            // text-versus-integer hazard the `HAVING` axis paid 825 spurious findings for.
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                let mut result_type = None;
+                for (when, then) in branches {
+                    assert_types_agree(when, table, seed);
+                    let branch = assert_types_agree(then, table, seed);
+                    match (result_type, branch) {
+                        (None, found) => result_type = found,
+                        // `NULL` fits any branch, so a `None` here is not a mismatch.
+                        (Some(_), None) => {}
+                        (Some(expected), Some(found)) => assert!(
+                            expected.accepts(found),
+                            "seed {seed}: CASE mixes {expected:?} and {found:?}"
+                        ),
+                    }
+                }
+                if let Some(otherwise) = otherwise
+                    && let (Some(expected), Some(found)) =
+                        (result_type, assert_types_agree(otherwise, table, seed))
+                {
+                    assert!(
+                        expected.accepts(found),
+                        "seed {seed}: CASE ELSE is {found:?}, branches are {expected:?}"
+                    );
+                }
+                result_type
             }
             // The one arm here that **asserts** rather than merely descends: a literal list is
             // the easiest place to accidentally compare text against an integer, which is a
