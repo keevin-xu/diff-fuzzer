@@ -592,6 +592,99 @@ pub fn partition_having(case: &SqlCase) -> Option<PartitionedHaving> {
     })
 }
 
+/// The same query, with its indexes and without them.
+///
+/// # The strongest relation in this crate, and the simplest
+///
+/// An index changes **how** an answer is reached, never **what** it is. That is not a
+/// convention or a tolerance — it is the definition of a secondary index. So if the two runs
+/// differ, an engine is wrong, and there is nothing to interpret: no legal-difference argument,
+/// no tolerance, no question of which side is right. Every other relation here needed a page of
+/// reasoning about `NULL`s to establish; this one needs a sentence.
+///
+/// It is also the only relation that reaches **plan choice**. TLP and NoREC both compare
+/// queries that an engine will plan similarly; this compares the *same* query under two plans,
+/// which is where an index bug can live and nothing else here can see.
+///
+/// Returns `None` when the case has no indexes — there is nothing to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedPair {
+    /// The case as generated, indexes and all.
+    pub with_indexes: SqlCase,
+    /// The identical case with every index dropped.
+    pub without_indexes: SqlCase,
+}
+
+/// Build the indexed/unindexed pair, or `None` if the case has no indexes.
+pub fn indexed_pair(case: &SqlCase) -> Option<IndexedPair> {
+    if case.indexes.is_empty() {
+        return None;
+    }
+    let mut without = case.clone();
+    without.indexes.clear();
+    Some(IndexedPair {
+        with_indexes: case.clone(),
+        without_indexes: without,
+    })
+}
+
+/// Do the two runs agree?
+///
+/// **Compared as multisets, not as ordered rows** — and that distinction is the one subtlety
+/// here. An index can legitimately change the *order* of an unordered query's results, because
+/// a query with no `ORDER BY` promises no order and an index scan returns rows in index order
+/// where a table scan returns them in insertion order. Comparing ordered would report that as a
+/// violation on a correct engine, which is the mistake `DISTINCT` taught at S9.4.
+///
+/// The caller must therefore pass `ordered = true` only when the query's `ORDER BY` totally
+/// orders its rows — the same rule the differential oracle uses.
+pub fn check_indexed(with: &SqlOutcome, without: &SqlOutcome, ordered: bool) -> Relation {
+    let (SqlOutcome::Rows(left), SqlOutcome::Rows(right)) = (with, without) else {
+        // One side erroring and the other not is a real signal but a different claim; an index
+        // should not change whether a query is *accepted* either, and folding the two together
+        // would make the counts meaningless.
+        return if std::mem::discriminant(with) == std::mem::discriminant(without) {
+            Relation::NotChecked("both sides returned an error")
+        } else {
+            Relation::Violated {
+                whole: 0,
+                partitions: 0,
+                only_in_whole: vec![format!("with indexes: {with:?}")],
+                only_in_partitions: vec![format!("without indexes: {without:?}")],
+            }
+        };
+    };
+
+    let render = |grid: &[Vec<Cell>]| {
+        let mut lines: Vec<String> = grid
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| format!("{cell:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        if !ordered {
+            lines.sort();
+        }
+        lines
+    };
+
+    let left = render(left);
+    let right = render(right);
+    if left == right {
+        return Relation::Holds;
+    }
+
+    Relation::Violated {
+        whole: left.len(),
+        partitions: right.len(),
+        only_in_whole: difference(&left, &right),
+        only_in_partitions: difference(&right, &left),
+    }
+}
+
 /// The NoREC pair: the same question asked in a way the optimizer can use, and a way it cannot.
 ///
 /// # A different failure mode from TLP, which is the point of having both
@@ -902,6 +995,7 @@ mod tests {
         };
 
         let membership = |not: bool| SqlCase {
+            indexes: Vec::new(),
             schema: vec![table("t0"), table("t1")],
             data: vec![
                 InsertRows {
@@ -990,6 +1084,7 @@ mod tests {
         use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
 
         let membership = |not: bool, list: Vec<Literal>| SqlCase {
+            indexes: Vec::new(),
             schema: vec![Table {
                 name: "t0".to_string(),
                 columns: vec![Column {
@@ -1078,6 +1173,7 @@ mod tests {
         use crate::schema::{Column, InsertRows, Literal, SqlType, Table};
 
         let query = |distinct: bool| SqlCase {
+            indexes: Vec::new(),
             schema: vec![Table {
                 name: "t0".to_string(),
                 columns: vec![Column {
@@ -1212,6 +1308,7 @@ mod tests {
         };
 
         let query = |having: Option<Expr>| SqlCase {
+            indexes: Vec::new(),
             schema: vec![Table {
                 name: "t0".to_string(),
                 columns: vec![
@@ -1381,6 +1478,7 @@ mod tests {
         };
 
         let case = SqlCase {
+            indexes: Vec::new(),
             schema: vec![table("t0"), table("t1")],
             data: vec![
                 InsertRows {
@@ -1465,6 +1563,7 @@ mod tests {
             column: name.to_string(),
         };
         let case = SqlCase {
+            indexes: Vec::new(),
             schema: vec![Table {
                 name: "t0".to_string(),
                 columns: vec![
@@ -1594,6 +1693,7 @@ mod tests {
         };
 
         let case = |otherwise: Option<i64>| SqlCase {
+            indexes: Vec::new(),
             schema: vec![Table {
                 name: "t0".to_string(),
                 columns: vec![Column {
@@ -1658,6 +1758,68 @@ mod tests {
                 "{engine}: with an ELSE, no row should be NULL"
             );
         }
+    }
+
+    /// An index changes nothing, on both engines, across generated cases.
+    ///
+    /// The relation is definitional, so this is really a check on **us**: that the generated
+    /// indexes are valid, that they are actually created, and that the comparison is unordered
+    /// where it must be. A violation at this stage is far likelier to be our bug than theirs —
+    /// which is exactly why it is run before hunting rather than after.
+    #[test]
+    fn an_index_does_not_change_results_on_either_engine() {
+        let generator = SqlGenerator::new(Bounds::V1_INDEXES);
+        let mut checked = 0;
+
+        for seed in 0..300 {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            let Some(pair) = indexed_pair(&case) else {
+                continue;
+            };
+            // Sanity: the index must actually reach the SQL, or this tests nothing.
+            assert!(
+                pair.with_indexes
+                    .statements(crate::render::Dialect::Sqlite)
+                    .iter()
+                    .any(|s| s.starts_with("CREATE INDEX")),
+                "seed {seed}: no CREATE INDEX was rendered"
+            );
+
+            let ordered = case.is_totally_ordered();
+            for engine in ["sqlite", "duckdb"] {
+                let run = |c: &SqlCase| -> Option<SqlOutcome> {
+                    if engine == "sqlite" {
+                        SqliteImpl.run(c).ok()
+                    } else {
+                        DuckDbImpl.run(c).ok()
+                    }
+                };
+                let (Some(with), Some(without)) =
+                    (run(&pair.with_indexes), run(&pair.without_indexes))
+                else {
+                    continue;
+                };
+
+                match check_indexed(&with, &without, ordered) {
+                    Relation::Violated {
+                        only_in_whole,
+                        only_in_partitions,
+                        ..
+                    } => panic!(
+                        "seed {seed} on {engine}: an index changed the result.\n\
+                         with:    {}\nwithout: {}\n{}",
+                        only_in_whole.join(" "),
+                        only_in_partitions.join(" "),
+                        pair.with_indexes
+                            .statements(crate::render::Dialect::Sqlite)
+                            .join(";\n")
+                    ),
+                    Relation::Holds => checked += 1,
+                    Relation::NotChecked(_) => {}
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} indexed comparisons ran");
     }
 
     /// Build a grouped result: each entry is a group key followed by its aggregate values,

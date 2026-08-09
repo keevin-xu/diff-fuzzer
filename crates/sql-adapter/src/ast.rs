@@ -24,7 +24,7 @@
 //!   comparison?" — which is a walk on a tree and string-matching on text.
 
 use crate::render::{Dialect, render_case};
-use crate::schema::{InsertRows, Literal, SelectStmt, Table};
+use crate::schema::{Index, InsertRows, Literal, SelectStmt, Table};
 use diff_fuzzer_core::traits::Input;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,11 @@ use serde::{Deserialize, Serialize};
 pub struct SqlCase {
     /// The tables to create, in order.
     pub schema: Vec<Table>,
+    /// Secondary indexes, created after the tables and before the rows.
+    ///
+    /// Semantically inert by definition — an index changes *how* an answer is reached, never
+    /// *what* it is — which is what makes them worth generating: any observable effect is a bug.
+    pub indexes: Vec<Index>,
     /// The rows to insert, per table.
     pub data: Vec<InsertRows>,
     /// The single `SELECT` under test. Exactly one, so a divergence names one query.
@@ -58,7 +63,13 @@ impl SqlCase {
     /// disagree because one of them applied the case differently. A divergence manufactured
     /// by this crate is the worst kind: it looks exactly like a finding.
     pub fn statements(&self, dialect: Dialect) -> Vec<String> {
-        render_case(&self.schema, &self.data, &self.query, dialect)
+        render_case(
+            &self.schema,
+            &self.indexes,
+            &self.data,
+            &self.query,
+            dialect,
+        )
     }
 
     /// The table the query reads, if the schema contains it.
@@ -168,6 +179,7 @@ impl SqlCase {
         };
 
         Self {
+            indexes: Vec::new(),
             schema: vec![Table {
                 name: "t0".to_string(),
                 columns: vec![
@@ -450,6 +462,7 @@ mod tests {
 
     fn simple_case() -> SqlCase {
         SqlCase {
+            indexes: Vec::new(),
             schema: vec![Table {
                 name: "t0".to_string(),
                 columns: vec![Column {
@@ -485,6 +498,7 @@ mod tests {
         let data = crate::gen_schema::generate_data(&mut rng, &schema, Bounds::V1);
         let query = crate::gen_query::generate_query(&mut rng, &schema, &data, Bounds::V1);
         SqlCase {
+            indexes: Vec::new(),
             schema,
             data,
             query,

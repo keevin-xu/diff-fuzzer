@@ -405,6 +405,78 @@ pub fn generate_query(
     }
 }
 
+/// Secondary indexes on the columns **this query actually references**.
+///
+/// Not a general "index some columns" — an index the planner cannot use is a `CREATE INDEX`
+/// statement and nothing more, and it would make the axis look busier than it is. The columns
+/// come from the `WHERE`, the `ORDER BY`, the `GROUP BY` and the join key, which are the four
+/// places an index can change a plan.
+///
+/// **`UNIQUE` is not generated.** It fails outright when the data holds duplicates, which would
+/// surface as a setup failure and a skipped case rather than a finding. Its `NULL` rule is a
+/// genuine divergence candidate and deserves its own axis with a duplicate check first.
+pub fn generate_indexes(
+    rng: &mut SeededRng,
+    tables: &[Table],
+    query: &SelectStmt,
+    bounds: Bounds,
+) -> Vec<crate::schema::Index> {
+    if !bounds.indexes {
+        return Vec::new();
+    }
+
+    // The columns a plan could turn on, in a stable order so the same seed gives the same
+    // indexes. `columns()` descends into subqueries, which is wanted: a correlated subquery's
+    // inner predicate is re-evaluated per outer row and is exactly where an index earns its
+    // keep.
+    let mut candidates: Vec<ColumnRef> = Vec::new();
+    if let Some(filter) = &query.filter {
+        candidates.extend(filter.columns().into_iter().cloned());
+    }
+    candidates.extend(query.order_by.iter().map(|key| key.column.clone()));
+    candidates.extend(query.group_by.iter().cloned());
+    // The join's `ON` predicate — both sides of it, since either can be the indexed side.
+    if let Some(join) = &query.join {
+        candidates.extend(join.on.columns().into_iter().cloned());
+    }
+    candidates.dedup();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut indexes = Vec::new();
+    let wanted = rng.random_range(1..=2);
+    for position in 0..wanted {
+        let anchor = &candidates[rng.random_range(0..candidates.len())];
+        if !tables.iter().any(|table| table.name == anchor.table) {
+            continue;
+        }
+
+        // A second column a quarter of the time: a composite index serves a lookup on its
+        // leading column and not on a trailing one, which is a plan distinction worth having.
+        let mut columns = vec![anchor.column.clone()];
+        if rng.random_range(0..100) < 25
+            && let Some(other) = candidates
+                .iter()
+                .find(|c| c.table == anchor.table && c.column != anchor.column)
+        {
+            columns.push(other.column.clone());
+        }
+
+        indexes.push(crate::schema::Index {
+            name: format!("i{position}"),
+            table: anchor.table.clone(),
+            columns,
+            unique: false,
+        });
+    }
+
+    // Two indexes with the same name is a setup failure, and two on the same columns is
+    // pointless; both are dropped rather than risked.
+    indexes.dedup_by(|a, b| a.table == b.table && a.columns == b.columns);
+    indexes
+}
+
 /// What kind of query to build. The shape decides what a legal projection looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryShape {
@@ -1278,6 +1350,7 @@ mod tests {
             let query = generate_query(&mut rng, &tables, &data, bounds);
 
             let case = SqlCase {
+                indexes: Vec::new(),
                 schema: tables.clone(),
                 data: data.clone(),
                 query: query.clone(),

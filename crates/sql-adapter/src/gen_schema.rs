@@ -182,6 +182,18 @@ pub struct Bounds {
     /// can reach `NULL` through either, and the signature tags them apart so a finding in one
     /// is not grouped with a finding in the other.
     pub case_expressions: bool,
+    /// Whether the generator may create **secondary indexes**.
+    ///
+    /// The first axis that targets **plan choice** rather than evaluation. Every earlier axis
+    /// asked what a query computes; this asks how the engine reaches it — and the two engines
+    /// are architecturally unalike there in a way they are not about arithmetic or `NULL`s.
+    ///
+    /// **The asymmetry is expected even at eight rows**, which is why it is worth doing without
+    /// first raising the data size: SQLite with no `ANALYZE` falls back to a constant row
+    /// estimate independent of the real table, so it will use an index; DuckDB gathers real
+    /// statistics and on eight rows will likely decline. Different plans for the same query is
+    /// the condition the differential oracle exists for, and no axis has produced it yet.
+    pub indexes: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -251,6 +263,7 @@ impl Bounds {
         not_in_correlated: false,
         multi_group_by: false,
         case_expressions: false,
+        indexes: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -308,6 +321,12 @@ impl Bounds {
         ..Bounds::V1
     };
 
+    /// V1 plus secondary indexes. Cleanly separable — needs no other axis.
+    pub const V1_INDEXES: Bounds = Bounds {
+        indexes: true,
+        ..Bounds::V1
+    };
+
     /// V1 plus joins. One axis, as always.
     pub const V1_JOINS: Bounds = Bounds {
         joins: true,
@@ -351,6 +370,7 @@ impl Bounds {
         not_in_correlated: true,
         multi_group_by: true,
         case_expressions: true,
+        indexes: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -427,6 +447,7 @@ impl GenerationAxes for Bounds {
             ("not-in-correlated", self.not_in_correlated),
             ("multi-group-by", self.multi_group_by),
             ("case", self.case_expressions),
+            ("indexes", self.indexes),
         ]
     }
 

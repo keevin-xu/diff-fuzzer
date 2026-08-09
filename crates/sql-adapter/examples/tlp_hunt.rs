@@ -41,8 +41,8 @@ use sql_adapter::gen_schema::Bounds;
 use sql_adapter::generator::SqlGenerator;
 use sql_adapter::metamorphic::{
     Partitioned, PartitionedAggregate, PartitionedGroups, PartitionedHaving, Relation, check,
-    check_aggregate, check_distinct, check_grouped, check_norec, norec, partition,
-    partition_aggregate, partition_grouped, partition_having,
+    check_aggregate, check_distinct, check_grouped, check_indexed, check_norec, indexed_pair,
+    norec, partition, partition_aggregate, partition_grouped, partition_having,
 };
 use sql_adapter::outcome::SqlOutcome;
 use sql_adapter::render::Dialect;
@@ -140,6 +140,7 @@ fn main() {
         Some("not-in-correlated") => Bounds::V1_NOT_IN_CORRELATED,
         Some("multi-group-by") => Bounds::V1_MULTI_GROUP_BY,
         Some("case") => Bounds::V1_CASE,
+        Some("indexes") => Bounds::V1_INDEXES,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,
         // **The default is now `V1_ALL`, matching the differential campaign.** It used to be
@@ -175,6 +176,7 @@ fn main() {
     // dressed up as coverage, and only a breakdown shows it.
     let (mut rows_checks, mut aggregate_checks, mut grouped_checks) = (0usize, 0usize, 0usize);
     let mut having_checks = 0usize;
+    let mut index_checks = 0usize;
 
     let started = Instant::now();
     for seed in 0..total as u64 {
@@ -183,6 +185,44 @@ fn main() {
         // The three forms are mutually exclusive by construction: `partition` refuses
         // aggregates and grouping, `partition_aggregate` requires an aggregate and refuses
         // grouping, `partition_grouped` requires grouping. A case matches at most one.
+        // **The index relation, before the partitionability gate.**
+        //
+        // It was first written inside the engine loop below — which sits after a `continue`
+        // that skips every non-partitionable case, so it silently covered only the TLP subset
+        // despite a comment claiming otherwise. The counts gave it away: index-invariance
+        // reported *exactly* the TLP figure, which for independent conditions would be a
+        // coincidence. Measured: on `V1_ALL`, 4,809 of 5,000 cases carry an index while only
+        // 899 are partitionable, so the check was missing **80%** of its reach — including the
+        // set-op and `LIMIT` queries whose plans are the most likely to differ.
+        for engine in &engines {
+            if let Some(pair) = indexed_pair(&case)
+                && let (Some(with), Some(without)) = (
+                    run(engine, &pair.with_indexes),
+                    run(engine, &pair.without_indexes),
+                )
+            {
+                match check_indexed(&with, &without, case.is_totally_ordered()) {
+                    Relation::Holds => index_checks += 1,
+                    Relation::NotChecked(_) => skipped += 1,
+                    Relation::Violated {
+                        only_in_whole,
+                        only_in_partitions,
+                        ..
+                    } => {
+                        violations += 1;
+                        println!(
+                            "INDEX VIOLATION  {engine}, seed {seed}: an index changed the result"
+                        );
+                        println!("  with:    {}", only_in_whole.join(" "));
+                        println!("  without: {}", only_in_partitions.join(" "));
+                        for statement in pair.with_indexes.statements(Dialect::Sqlite) {
+                            println!("  {statement};");
+                        }
+                    }
+                }
+            }
+        }
+
         let rows_parts = partition(&case);
         let aggregate_parts = partition_aggregate(&case);
         let grouped_parts = partition_grouped(&case);
@@ -326,6 +366,7 @@ fn main() {
     println!("    aggregate        {aggregate_checks:>8}");
     println!("    grouped          {grouped_checks:>8}");
     println!("    having           {having_checks:>8}");
+    println!("  index-invariance   {index_checks:>8} engine-checks");
     println!("  NoREC held         {norec_checks:>8} engine-checks");
     let _ = checked;
     println!("  unchecked          {skipped:>8}");

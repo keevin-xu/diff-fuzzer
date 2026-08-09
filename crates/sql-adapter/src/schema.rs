@@ -147,6 +147,39 @@ pub struct InsertRows {
     pub rows: Vec<Vec<Literal>>,
 }
 
+/// A secondary index on one or more columns of a table.
+///
+/// # Why this exists, and it is not "another construct"
+///
+/// Every axis before this one tested **evaluation** — what a query computes. An index tests
+/// **plan choice**: whether the engine reaches the answer by scanning or by seeking, and that is
+/// the one subsystem where SQLite and DuckDB are architecturally unalike.
+///
+/// **The asymmetry is expected even on eight rows.** SQLite without `ANALYZE` assumes a table
+/// holds roughly a million rows whatever its real size (`SPECS.md` §5.10 — the exact constant
+/// was not retrievable, but that the fallback is a constant independent of our data is what
+/// matters), so it will use an index it can use. DuckDB gathers real statistics and on eight
+/// rows will likely decline. **Two engines taking different plans for the same query is exactly
+/// the condition a differential oracle exists for**, and nothing in this project has produced it
+/// before.
+///
+/// It also supplies the strongest oracle here: **adding an index must not change a query's
+/// results.** If it does, that is a bug with no interpretation required — no tolerance, no legal
+/// difference, no argument about which engine is right.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Index {
+    pub name: String,
+    pub table: String,
+    /// Column names, in index order. Order matters to the planner: an index on `(a, b)` can
+    /// serve a lookup on `a` and cannot serve one on `b` alone.
+    pub columns: Vec<String>,
+    /// **Not generated in v1.** A `UNIQUE` index fails outright when the data has duplicates,
+    /// which would surface as a setup failure and a skipped case rather than a finding. Its
+    /// `NULL` rule is also a genuine divergence candidate (SQLite permits several `NULL`s in a
+    /// unique index) and deserves its own axis with a duplicate check, not a flag here.
+    pub unique: bool,
+}
+
 /// A reference to a column of a table in scope.
 ///
 /// Carries the table name as well as the column, even though v1 queries read from a single

@@ -19,8 +19,8 @@
 //!   validity failure on both engines at once, which looks like agreement.
 
 use crate::schema::{
-    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, Literal, OrderKey, SelectStmt,
-    SqlType, Table, UnaryOp,
+    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, Index, InsertRows, Literal, OrderKey,
+    SelectStmt, SqlType, Table, UnaryOp,
 };
 
 /// Which engine's spelling to use.
@@ -39,6 +39,7 @@ pub enum Dialect {
 /// Render the whole case as the statements to execute, in order.
 pub fn render_case(
     schema: &[Table],
+    indexes: &[Index],
     data: &[InsertRows],
     query: &SelectStmt,
     dialect: Dialect,
@@ -47,6 +48,12 @@ pub fn render_case(
         .iter()
         .map(|table| render_create_table(table, dialect))
         .collect();
+
+    // **Indexes go after `CREATE TABLE` and before `INSERT`.** Both orders are legal and both
+    // engines accept either, but creating the index first is what real schemas do, and it means
+    // the rows are inserted *through* the index rather than the index being built in bulk
+    // afterwards — two different code paths, and the common one is the one worth testing.
+    statements.extend(indexes.iter().map(render_create_index));
 
     // A table with no rows produces no `INSERT` at all — an empty statement would be a
     // syntax error, and "insert nothing" is exactly what an empty table means.
@@ -77,6 +84,24 @@ pub fn render_create_table(table: &Table, dialect: Dialect) -> String {
     format!(
         "CREATE TABLE {} ({})",
         quote_identifier(&table.name),
+        columns.join(", ")
+    )
+}
+
+/// `CREATE INDEX "i0" ON "t0" ("c0", "c1")`
+///
+/// Spelled identically by both engines, so no dialect distinction is needed.
+pub fn render_create_index(index: &Index) -> String {
+    let columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect();
+    format!(
+        "CREATE {}INDEX {} ON {} ({})",
+        if index.unique { "UNIQUE " } else { "" },
+        quote_identifier(&index.name),
+        quote_identifier(&index.table),
         columns.join(", ")
     )
 }
@@ -477,6 +502,7 @@ mod tests {
     fn an_empty_table_produces_no_insert() {
         let statements = render_case(
             &[table()],
+            &[],
             &[InsertRows {
                 table: "t0".to_string(),
                 rows: vec![],
@@ -521,8 +547,8 @@ mod tests {
             let query = crate::gen_query::generate_query(&mut rng, &tables, &data, bounds);
 
             assert_eq!(
-                render_case(&tables, &data, &query, Dialect::Sqlite),
-                render_case(&tables, &data, &query, Dialect::DuckDb),
+                render_case(&tables, &[], &data, &query, Dialect::Sqlite),
+                render_case(&tables, &[], &data, &query, Dialect::DuckDb),
                 "seed {seed}"
             );
         }

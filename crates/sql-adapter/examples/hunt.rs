@@ -79,6 +79,7 @@ fn main() {
         Some("not-in-correlated") => sql_adapter::gen_schema::Bounds::V1_NOT_IN_CORRELATED,
         Some("multi-group-by") => sql_adapter::gen_schema::Bounds::V1_MULTI_GROUP_BY,
         Some("case") => sql_adapter::gen_schema::Bounds::V1_CASE,
+        Some("indexes") => sql_adapter::gen_schema::Bounds::V1_INDEXES,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
         _ => sql_adapter::gen_schema::Bounds::V1,
@@ -101,7 +102,24 @@ fn main() {
     let mut ordered_cases = 0usize;
 
     let started = Instant::now();
+    // **Progress prints every 100,000 cases, flushed.** A campaign that reports only at the end
+    // loses everything when it is interrupted — which happened: a 50-minute run over ~500,000
+    // cases left four header lines and no verdict counts. The same defect had already been
+    // found and fixed in `axis_table` and was not carried across. A long measurement should be
+    // resumable by inspection: whatever it got through is on screen.
+    let progress_every = 100_000usize;
+
     for seed in 0..total as u64 {
+        if seed > 0 && (seed as usize).is_multiple_of(progress_every) {
+            let done = seed as usize;
+            let rate = done as f64 / started.elapsed().as_secs_f64();
+            println!(
+                "  … {done:>9} cases | agreed {agreed} diverged {diverged} skipped {skipped} \
+                 | {rate:.0}/sec | ordered {:.0}%",
+                100.0 * ordered_cases as f64 / done as f64
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
         let case = generator.generate(&mut SeededRng::from_seed(seed));
         if SortMode::for_case(&case) == SortMode::Ordered {
             ordered_cases += 1;

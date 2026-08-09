@@ -13,7 +13,7 @@
 //! generator that produced it, and generators change.
 
 use crate::ast::SqlCase;
-use crate::gen_query::generate_query;
+use crate::gen_query::{generate_indexes, generate_query};
 use crate::gen_schema::{Bounds, generate_data, generate_schema};
 use diff_fuzzer_core::GenerationAxes;
 use diff_fuzzer_core::rng::SeededRng;
@@ -53,9 +53,15 @@ impl Generator for SqlGenerator {
         let schema = generate_schema(rng, self.bounds);
         let data = generate_data(rng, &schema, self.bounds);
         let query = generate_query(rng, &schema, &data, self.bounds);
+        // **After the query, deliberately.** An index on a column the query never mentions is
+        // invisible to the planner — it would inflate the axis's apparent rate while testing
+        // nothing. Building it from the finished query guarantees every index is one the
+        // planner could actually choose to use.
+        let indexes = generate_indexes(rng, &schema, &query, self.bounds);
 
         SqlCase {
             schema,
+            indexes,
             data,
             query,
         }
