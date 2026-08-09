@@ -40,9 +40,10 @@ use sql_adapter::backends::{DuckDbImpl, SqliteImpl};
 use sql_adapter::gen_schema::Bounds;
 use sql_adapter::generator::SqlGenerator;
 use sql_adapter::metamorphic::{
-    Partitioned, PartitionedAggregate, PartitionedGroups, PartitionedHaving, Relation, check,
-    check_aggregate, check_distinct, check_grouped, check_indexed, check_norec, indexed_pair,
-    norec, partition, partition_aggregate, partition_grouped, partition_having,
+    Partitioned, PartitionedAggregate, PartitionedGroups, PartitionedHaving, Relation,
+    ViolationContext, check, check_aggregate, check_distinct, check_grouped, check_indexed,
+    check_norec, indexed_pair, norec, partition, partition_aggregate, partition_grouped,
+    partition_having, violation_report,
 };
 use sql_adapter::outcome::SqlOutcome;
 use sql_adapter::render::Dialect;
@@ -210,14 +211,29 @@ fn main() {
                         ..
                     } => {
                         violations += 1;
+                        let report = violation_report(
+                            ViolationContext {
+                                relation: "index-invariance",
+                                engine,
+                                seed,
+                                generator: &generator.description(),
+                                case: &case,
+                            },
+                            &[
+                                ("with_indexes", &pair.with_indexes),
+                                ("without_indexes", &pair.without_indexes),
+                            ],
+                            &[("with_indexes", &with), ("without_indexes", &without)],
+                            &only_in_whole,
+                            &only_in_partitions,
+                        );
+                        let path = report.save(&directory).expect("write violation");
                         println!(
                             "INDEX VIOLATION  {engine}, seed {seed}: an index changed the result"
                         );
                         println!("  with:    {}", only_in_whole.join(" "));
                         println!("  without: {}", only_in_partitions.join(" "));
-                        for statement in pair.with_indexes.statements(Dialect::Sqlite) {
-                            println!("  {statement};");
-                        }
+                        println!("  saved {path}");
                     }
                 }
             }
@@ -247,16 +263,35 @@ fn main() {
                     }
                     Relation::NotChecked(_) => skipped += 1,
                     Relation::Violated {
-                        whole, partitions, ..
+                        whole,
+                        partitions,
+                        only_in_whole,
+                        only_in_partitions,
                     } => {
                         violations += 1;
+                        let report = violation_report(
+                            ViolationContext {
+                                relation: "tlp-having",
+                                engine,
+                                seed,
+                                generator: &generator.description(),
+                                case: &case,
+                            },
+                            &[
+                                ("whole", &parts.whole),
+                                ("is_true", &parts.is_true),
+                                ("is_false", &parts.is_false),
+                                ("is_unknown", &parts.is_unknown),
+                            ],
+                            &[],
+                            &only_in_whole,
+                            &only_in_partitions,
+                        );
+                        let path = report.save(&directory).expect("write violation");
                         println!(
                             "HAVING VIOLATION  {engine}, seed {seed}: whole {whole}, \
-                             partitions {partitions}"
+                             partitions {partitions} — saved {path}"
                         );
-                        for statement in parts.whole.statements(Dialect::Sqlite) {
-                            println!("  {statement};");
-                        }
                     }
                 }
                 continue;
@@ -291,16 +326,30 @@ fn main() {
                     Relation::Holds => norec_checks += 1,
                     Relation::NotChecked(_) => skipped += 1,
                     Relation::Violated {
-                        whole, partitions, ..
+                        whole,
+                        partitions,
+                        only_in_whole,
+                        only_in_partitions,
                     } => {
                         violations += 1;
+                        let report = violation_report(
+                            ViolationContext {
+                                relation: "norec",
+                                engine,
+                                seed,
+                                generator: &generator.description(),
+                                case: &case,
+                            },
+                            &[("filtered", &pair.filtered), ("projected", &pair.projected)],
+                            &[("filtered", &filtered), ("projected", &projected)],
+                            &only_in_whole,
+                            &only_in_partitions,
+                        );
+                        let path = report.save(&directory).expect("write violation");
                         println!(
                             "NoREC VIOLATION  {engine}, seed {seed}: WHERE counted {whole}, \
-                             projection found {partitions}"
+                             projection found {partitions} — saved {path}"
                         );
-                        for statement in pair.filtered.statements(Dialect::Sqlite) {
-                            println!("  {statement};");
-                        }
                     }
                 }
             }
@@ -324,26 +373,53 @@ fn main() {
                 } => {
                     violations += 1;
 
-                    let record = serde_json::json!({
-                        "oracle": "TLP",
-                        "form": form,
-                        "engine": engine,
-                        "seed": seed,
-                        "generator": generator.description(),
-                        "whole": whole,
-                        "partitions": partitions,
-                        "only_in_whole": only_in_whole,
-                        "only_in_partitions": only_in_partitions,
-                        "sql": statements,
-                    });
+                    // The four variants, whichever form produced them. **Named rather than
+                    // implied**: a report that carried only the whole would not reproduce
+                    // anything, because the bug *is* the relationship between the four.
+                    let variants: Vec<(&str, &SqlCase)> =
+                        match (&rows_parts, &aggregate_parts, &grouped_parts) {
+                            (Some(p), _, _) => vec![
+                                ("whole", &p.whole),
+                                ("is_true", &p.is_true),
+                                ("is_false", &p.is_false),
+                                ("is_unknown", &p.is_unknown),
+                            ],
+                            (_, Some(p), _) => vec![
+                                ("whole", &p.whole),
+                                ("is_true", &p.is_true),
+                                ("is_false", &p.is_false),
+                                ("is_unknown", &p.is_unknown),
+                            ],
+                            (_, _, Some(p)) => vec![
+                                ("whole", &p.whole),
+                                ("is_true", &p.is_true),
+                                ("is_false", &p.is_false),
+                                ("is_unknown", &p.is_unknown),
+                            ],
+                            _ => Vec::new(),
+                        };
 
-                    std::fs::create_dir_all(&directory).expect("create findings directory");
-                    let path = format!("{directory}/tlp-{engine}-{seed}.json");
-                    std::fs::write(&path, serde_json::to_string_pretty(&record).expect("json"))
-                        .expect("write finding");
+                    // **Content-derived filename, replacing `tlp-{engine}-{seed}.json`.** The
+                    // old name keyed on the seed, so one bug found ten thousand times left ten
+                    // thousand files — which is how a campaign buries its own finding. Hashing
+                    // the SQL means re-finding the same problem overwrites.
+                    let report = violation_report(
+                        ViolationContext {
+                            relation: &format!("tlp-{form}"),
+                            engine,
+                            seed,
+                            generator: &generator.description(),
+                            case: &case,
+                        },
+                        &variants,
+                        &[],
+                        &only_in_whole,
+                        &only_in_partitions,
+                    );
+                    let path = report.save(&directory).expect("write violation");
 
                     if violations <= 5 {
-                        println!("VIOLATION  {engine}, seed {seed}");
+                        println!("VIOLATION  {engine}, seed {seed} ({form})");
                         println!("  whole returned {whole} rows; partitions returned {partitions}");
                         for statement in &statements {
                             println!("  {statement};");

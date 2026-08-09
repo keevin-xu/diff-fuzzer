@@ -799,6 +799,73 @@ pub fn check_norec(filtered: &SqlOutcome, projected: &SqlOutcome) -> Relation {
     }
 }
 
+/// Who violated what, on which case — the identity half of a violation report.
+///
+/// Grouped rather than passed as five loose parameters, which is both what clippy asks for and
+/// the better shape: these five always travel together, and a caller that got `engine` and
+/// `relation` the wrong way round would produce a report describing something that never
+/// happened, with no type error to catch it.
+pub struct ViolationContext<'a> {
+    /// `tlp-rows`, `tlp-grouped`, `tlp-having`, `norec`, `index-invariance`.
+    pub relation: &'a str,
+    /// The **single** engine that contradicted itself.
+    pub engine: &'a str,
+    pub seed: u64,
+    pub generator: &'a str,
+    pub case: &'a SqlCase,
+}
+
+/// Build a serialisable report from a violated relation.
+///
+/// One constructor rather than five call sites assembling the record by hand: the labels, the
+/// rendered SQL and the outputs have to line up, and five hand-written versions is five chances
+/// for a report to describe something other than what was compared.
+///
+/// `variants` is `(label, case)` in the order they were run. The labels are the relation's own —
+/// `whole`/`is_true`/… for TLP, `filtered`/`projected` for NoREC,
+/// `with_indexes`/`without_indexes` for index-invariance — so the report says what was compared
+/// instead of assuming the reader knows which relation produced it.
+pub fn violation_report(
+    context: ViolationContext<'_>,
+    variants: &[(&str, &SqlCase)],
+    outcomes: &[(&str, &SqlOutcome)],
+    only_in_whole: &[String],
+    only_in_partitions: &[String],
+) -> crate::report::MetamorphicViolation {
+    use crate::render::Dialect;
+    let ViolationContext {
+        relation,
+        engine,
+        seed,
+        generator,
+        case,
+    } = context;
+
+    crate::report::MetamorphicViolation {
+        relation: relation.to_string(),
+        engine: engine.to_string(),
+        seed,
+        generator: generator.to_string(),
+        case: case.clone(),
+        variants: variants
+            .iter()
+            .map(|(label, variant)| ((*label).to_string(), variant.statements(Dialect::Sqlite)))
+            .collect(),
+        outputs: outcomes
+            .iter()
+            .map(|(label, outcome)| ((*label).to_string(), format!("{outcome:?}")))
+            .collect(),
+        only_in_whole: only_in_whole.to_vec(),
+        only_in_partitions: only_in_partitions.to_vec(),
+        environment: crate::report::Environment::detect(),
+        summary: format!(
+            "{relation} violated on {engine}: the relation does not hold, which is {engine} \
+             contradicting itself — no second engine is involved and no legal-difference \
+             argument applies"
+        ),
+    }
+}
+
 /// What the relation check concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relation {
