@@ -82,7 +82,7 @@ fn judge_grouped(engine: &str, parts: &PartitionedGroups) -> Relation {
         return Relation::NotChecked("a variant could not be run");
     };
 
-    check_grouped(&parts.funcs, &whole, &t, &f, &u)
+    check_grouped(parts.keys, &parts.funcs, &whole, &t, &f, &u)
 }
 
 /// Run the four `HAVING` variants and check them.
@@ -138,6 +138,7 @@ fn main() {
         Some("distinct") => Bounds::V1_DISTINCT,
         Some("having") => Bounds::V1_HAVING,
         Some("not-in-correlated") => Bounds::V1_NOT_IN_CORRELATED,
+        Some("multi-group-by") => Bounds::V1_MULTI_GROUP_BY,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,
         // **The default is now `V1_ALL`, matching the differential campaign.** It used to be

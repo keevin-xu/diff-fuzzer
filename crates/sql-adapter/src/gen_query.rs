@@ -85,13 +85,33 @@ pub fn generate_query(
             (projection, Vec::new())
         }
         QueryShape::Grouped => {
-            let key = &table.columns[rng.random_range(0..table.columns.len())];
-            let key_ref = reference(table, &key.name);
-            let mut projection = vec![Expr::Column(key_ref.clone())];
+            // One key, or two when the axis allows and the table has two columns to give.
+            // Picked **without replacement**: `GROUP BY c0, c0` is legal but degenerate — it
+            // groups exactly as `GROUP BY c0` does, so it would dilute the axis with cases
+            // that do not exercise a compound key at all.
+            let wants_two =
+                bounds.multi_group_by && table.columns.len() > 1 && rng.random_range(0..100) < 60;
+
+            let first = rng.random_range(0..table.columns.len());
+            let mut chosen = vec![first];
+            if wants_two {
+                let mut second = rng.random_range(0..table.columns.len() - 1);
+                if second >= first {
+                    second += 1;
+                }
+                chosen.push(second);
+            }
+
+            let keys: Vec<ColumnRef> = chosen
+                .iter()
+                .map(|index| reference(table, &table.columns[*index].name))
+                .collect();
+
+            let mut projection: Vec<Expr> = keys.iter().cloned().map(Expr::Column).collect();
             for _ in 0..rng.random_range(1..=2) {
                 projection.push(generate_aggregate(rng, table));
             }
-            (projection, vec![key_ref])
+            (projection, keys)
         }
     };
 

@@ -163,6 +163,17 @@ pub struct Bounds {
     /// an anti-join has to preserve `NULL` semantics *and* the per-row list, and it is the
     /// rewrite rather than the semantics that is most likely to be wrong.
     pub not_in_correlated: bool,
+    /// Whether `GROUP BY` may name **more than one column**.
+    ///
+    /// A compound grouping key changes what "the same group" means, and `NULL` is again the
+    /// interesting part: `GROUP BY a, b` puts `(NULL, 1)` and `(NULL, 1)` in one group, since
+    /// grouping treats `NULL`s as equal — but `(NULL, 1)` and `(NULL, 2)` in two. An engine
+    /// hashing a compound key has to carry that exception through every column of the tuple.
+    ///
+    /// Also widens the **metamorphic** oracle: `partition_grouped` refused anything but a single
+    /// key, so multi-key grouped queries were unjudgeable until this axis and the tuple-key
+    /// support that came with it.
+    pub multi_group_by: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -230,6 +241,7 @@ impl Bounds {
         distinct: false,
         having: false,
         not_in_correlated: false,
+        multi_group_by: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -270,6 +282,14 @@ impl Bounds {
     /// `V1_HAVING`: the correlated form needs no other axis enabled to be generated.
     pub const V1_NOT_IN_CORRELATED: Bounds = Bounds {
         not_in_correlated: true,
+        ..Bounds::V1
+    };
+
+    /// V1 plus multi-column `GROUP BY`. Needs aggregates to group with, like `V1_HAVING`, so
+    /// its yield is `multi_group_by` **given** aggregates — compare against `V1_AGGREGATES`.
+    pub const V1_MULTI_GROUP_BY: Bounds = Bounds {
+        aggregates: true,
+        multi_group_by: true,
         ..Bounds::V1
     };
 
@@ -314,6 +334,7 @@ impl Bounds {
         distinct: true,
         having: true,
         not_in_correlated: true,
+        multi_group_by: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -388,6 +409,7 @@ impl GenerationAxes for Bounds {
             ("distinct", self.distinct),
             ("having", self.having),
             ("not-in-correlated", self.not_in_correlated),
+            ("multi-group-by", self.multi_group_by),
         ]
     }
 

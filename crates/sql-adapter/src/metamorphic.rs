@@ -271,7 +271,13 @@ pub fn check_aggregate(
 /// appears in only one carries straight through. So the check is per group key, not per result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionedGroups {
-    /// One entry per aggregate column, in projection order after the group key.
+    /// How many leading projection columns are **grouping keys**.
+    ///
+    /// One before S9.7, any number now. Carried explicitly rather than re-derived, because the
+    /// check splits each result row into "key" and "aggregates" at this boundary, and getting
+    /// it wrong would silently compare an aggregate against a key.
+    pub keys: usize,
+    /// One entry per aggregate column, in projection order after the group keys.
     pub funcs: Vec<AggregateFunc>,
     pub whole: SqlCase,
     pub is_true: SqlCase,
@@ -288,8 +294,11 @@ pub struct PartitionedGroups {
 pub fn partition_grouped(case: &SqlCase) -> Option<PartitionedGroups> {
     let predicate = case.query.filter.clone()?;
 
-    // One key, because the check buckets by a single cell. Several keys is the same idea with
-    // a tuple key and no new insight, so it is left out rather than built speculatively.
+    // **Any number of grouping keys since S9.7** — the check buckets by the *tuple* of leading
+    // cells. It was one key until multi-column `GROUP BY` became an axis, at which point
+    // "the same idea with a tuple key and no new insight" stopped being a reason to skip it:
+    // the insight was not new, but the coverage was.
+    //
     // `DISTINCT` refused for the same reason as the whole-table form: `GROUP BY` already emits
     // one row per group, so `DISTINCT` is very likely a no-op — and the per-group recombination
     // was derived without it.
@@ -299,7 +308,7 @@ pub fn partition_grouped(case: &SqlCase) -> Option<PartitionedGroups> {
     // split 2 and 4. The whole keeps the group, the partitions lose it, on a correct engine.
     // Partitioning on the `HAVING` predicate instead is sound — see [`partition_having`].
     if case.query.distinct
-        || case.query.group_by.len() != 1
+        || case.query.group_by.is_empty()
         || case.query.set_op.is_some()
         || case.query.limit.is_some()
         || case.query.having.is_some()
@@ -307,13 +316,19 @@ pub fn partition_grouped(case: &SqlCase) -> Option<PartitionedGroups> {
         return None;
     }
 
-    // `[first, rest @ ..]` is a **slice pattern** — it binds the first element and borrows the
-    // remainder as a slice in one step, and fails to match on an empty slice.
-    let [Expr::Column(key), rest @ ..] = case.query.projection.as_slice() else {
+    // The projection must be exactly the grouping keys, in order, then aggregates. Checked
+    // rather than assumed: the check reads the first `keys` cells of every result row as the
+    // group key, so a projection shaped differently would be silently misread.
+    let keys = case.query.group_by.len();
+    if case.query.projection.len() <= keys {
         return None;
-    };
-    if rest.is_empty() || *key != case.query.group_by[0] {
-        return None;
+    }
+    let (projected_keys, rest) = case.query.projection.split_at(keys);
+    for (projected, grouped) in projected_keys.iter().zip(&case.query.group_by) {
+        match projected {
+            Expr::Column(column) if column == grouped => {}
+            _ => return None,
+        }
     }
 
     // `collect` into `Option<Vec<_>>` short-circuits: one non-aggregate makes the whole thing
@@ -338,6 +353,7 @@ pub fn partition_grouped(case: &SqlCase) -> Option<PartitionedGroups> {
     };
 
     Some(PartitionedGroups {
+        keys,
         funcs,
         whole: base(None),
         is_true: base(Some(predicate.clone())),
@@ -387,9 +403,10 @@ fn recombine(func: AggregateFunc, parts: &[i64]) -> Option<i64> {
 /// twice can be told from one that appeared once.
 ///
 /// A **type alias** — it introduces no new type, just a shorter name for an existing one.
-type GroupedResult = (HashMap<Cell, Vec<Option<i64>>>, usize);
+type GroupedResult = (HashMap<Vec<Cell>, Vec<Option<i64>>>, usize);
 
 pub fn check_grouped(
+    keys: usize,
     funcs: &[AggregateFunc],
     whole: &SqlOutcome,
     is_true: &SqlOutcome,
@@ -404,12 +421,12 @@ pub fn check_grouped(
         };
         let mut map = HashMap::new();
         for row in rows {
-            let [key, aggregates @ ..] = row.as_slice() else {
-                return Err("a result row had no columns");
-            };
-            if aggregates.len() != funcs.len() {
+            if row.len() != keys + funcs.len() {
                 return Err("a result row had an unexpected number of columns");
             }
+            // The **tuple** of leading cells is the group key. `Vec<Cell>` works as a `HashMap`
+            // key because `Cell` derives `Hash` alongside `Eq`, and `Vec` inherits both.
+            let (key, aggregates) = row.split_at(keys);
             let mut values = Vec::with_capacity(aggregates.len());
             for cell in aggregates {
                 match cell {
@@ -420,7 +437,7 @@ pub fn check_grouped(
                     Cell::Text(_) => return Err("an aggregate column was not an integer"),
                 }
             }
-            map.insert(key.clone(), values);
+            map.insert(key.to_vec(), values);
         }
         let rows = rows.len();
         Ok((map, rows))
@@ -458,21 +475,21 @@ pub fn check_grouped(
     // Every key mentioned anywhere. Sorted by rendering so the report is deterministic —
     // `HashMap` iteration order is not, and a finding that reorders between runs is not
     // reproducible evidence.
-    let mut keys: Vec<&Cell> = whole_groups.keys().collect();
+    let mut all_keys: Vec<&Vec<Cell>> = whole_groups.keys().collect();
     for partition in partitions {
         for key in partition.keys() {
             if !whole_groups.contains_key(key) {
-                keys.push(key);
+                all_keys.push(key);
             }
         }
     }
-    keys.sort_by_key(|key| format!("{key:?}"));
-    keys.dedup();
+    all_keys.sort_by_key(|key| format!("{key:?}"));
+    all_keys.dedup();
 
     let mut only_in_whole = Vec::new();
     let mut only_in_partitions = Vec::new();
 
-    for key in keys {
+    for key in all_keys {
         let expected: Vec<Option<i64>> = (0..funcs.len())
             .map(|column| {
                 let present: Vec<i64> = partitions
@@ -1434,6 +1451,122 @@ mod tests {
         }
     }
 
+    /// A compound `GROUP BY` treats `NULL`s as equal **per column**, on both engines.
+    ///
+    /// `(NULL, 1)` and `(NULL, 1)` are one group — grouping's `NULL`-equality exception carried
+    /// through a tuple — while `(NULL, 1)` and `(NULL, 2)` are two. An engine hashing a compound
+    /// key has to apply the exception to every column, not just the first.
+    #[test]
+    fn a_compound_group_key_treats_nulls_as_equal_per_column() {
+        use crate::schema::{AggregateFunc, Column, InsertRows, Literal, SqlType, Table};
+
+        let column = |name: &str| ColumnRef {
+            table: "t0".to_string(),
+            column: name.to_string(),
+        };
+        let case = SqlCase {
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![
+                    Column {
+                        name: "a".to_string(),
+                        sql_type: SqlType::Integer,
+                    },
+                    Column {
+                        name: "b".to_string(),
+                        sql_type: SqlType::Integer,
+                    },
+                ],
+            }],
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                rows: vec![
+                    vec![Literal::Null, Literal::Integer(1)],
+                    vec![Literal::Null, Literal::Integer(1)],
+                    vec![Literal::Null, Literal::Integer(2)],
+                ],
+            }],
+            query: SelectStmt {
+                having: None,
+                distinct: false,
+                projection: vec![
+                    Expr::Column(column("a")),
+                    Expr::Column(column("b")),
+                    Expr::Aggregate {
+                        func: AggregateFunc::CountRows,
+                        arg: None,
+                    },
+                ],
+                from: "t0".to_string(),
+                join: None,
+                set_op: None,
+                group_by: vec![column("a"), column("b")],
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let outcome = if engine == "sqlite" {
+                SqliteImpl.run(&case).expect("sqlite runs the case")
+            } else {
+                DuckDbImpl.run(&case).expect("duckdb runs the case")
+            };
+            let SqlOutcome::Rows(mut result) = outcome else {
+                panic!("{engine}: expected rows")
+            };
+            result.sort_by_key(|row| format!("{row:?}"));
+
+            // Two groups, not three and not one: the two `(NULL, 1)` rows merge because
+            // grouping treats `NULL`s as equal, and `(NULL, 2)` stays separate because the
+            // second column differs.
+            assert_eq!(
+                result,
+                vec![
+                    vec![Cell::Null, Cell::Integer(1), Cell::Integer(2)],
+                    vec![Cell::Null, Cell::Integer(2), Cell::Integer(1)],
+                ],
+                "{engine}: compound key must apply NULL-equality per column"
+            );
+        }
+    }
+
+    /// The grouped relation with a **two-column** key, recombined per tuple.
+    #[test]
+    fn grouped_counts_recombine_under_a_compound_key() {
+        // Hand-computed. Keys (1,1) and (1,2). (1,1) has 4 rows split 3 TRUE / 1 FALSE;
+        // (1,2) has 2 rows, both UNKNOWN.
+        let pair =
+            |a: i64, b: i64, n: i64| vec![Cell::Integer(a), Cell::Integer(b), Cell::Integer(n)];
+        let grid = |rows: Vec<Vec<Cell>>| SqlOutcome::Rows(rows);
+
+        let relation = check_grouped(
+            2,
+            &[AggregateFunc::CountRows],
+            &grid(vec![pair(1, 1, 4), pair(1, 2, 2)]),
+            &grid(vec![pair(1, 1, 3)]),
+            &grid(vec![pair(1, 1, 1)]),
+            &grid(vec![pair(1, 2, 2)]),
+        );
+        assert_eq!(relation, Relation::Holds);
+
+        // And the tuple must be read as a whole: swapping the second column of one key makes
+        // it a different group, so the recombination must fail.
+        let violated = check_grouped(
+            2,
+            &[AggregateFunc::CountRows],
+            &grid(vec![pair(1, 1, 4), pair(1, 2, 2)]),
+            &grid(vec![pair(1, 9, 3)]),
+            &grid(vec![pair(1, 1, 1)]),
+            &grid(vec![pair(1, 2, 2)]),
+        );
+        assert!(
+            matches!(violated, Relation::Violated { .. }),
+            "the whole tuple must identify the group, not just its first column"
+        );
+    }
+
     /// Build a grouped result: each entry is a group key followed by its aggregate values,
     /// where `None` renders as `NULL`.
     fn groups(values: &[(i64, &[Option<i64>])]) -> SqlOutcome {
@@ -1458,6 +1591,7 @@ mod tests {
         // for 3 of group 1 and 1 of group 2, FALSE for 2 and 0, UNKNOWN for 0 and 2.
         // Group 1: 3 + 2 + 0 = 5. Group 2: 1 + 0 + 2 = 3. Both match the whole.
         let relation = check_grouped(
+            1,
             &[AggregateFunc::CountRows],
             &groups(&[(1, &[Some(5)]), (2, &[Some(3)])]),
             &groups(&[(1, &[Some(3)]), (2, &[Some(1)])]),
@@ -1473,6 +1607,7 @@ mod tests {
         // nowhere else. Its count must carry through untouched — an implementation that
         // required every group in every partition would call this a violation.
         let relation = check_grouped(
+            1,
             &[AggregateFunc::CountRows],
             &groups(&[(7, &[Some(4)])]),
             &groups(&[(7, &[Some(4)])]),
@@ -1488,6 +1623,7 @@ mod tests {
         // partition holding that group returns `NULL`, so the recombination must too —
         // summing an empty list of contributions is `NULL`.
         let relation = check_grouped(
+            1,
             &[AggregateFunc::Sum],
             &groups(&[(1, &[None])]),
             &groups(&[(1, &[None])]),
@@ -1501,6 +1637,7 @@ mod tests {
     fn grouped_min_takes_the_smallest_across_partitions() {
         // MIN over group 1 is 3 in TRUE, 9 in FALSE, absent in UNKNOWN. The whole must be 3.
         let held = check_grouped(
+            1,
             &[AggregateFunc::Min],
             &groups(&[(1, &[Some(3)])]),
             &groups(&[(1, &[Some(3)])]),
@@ -1511,6 +1648,7 @@ mod tests {
 
         // The same partitions with the whole claiming 9 — an engine that lost the smaller row.
         let violated = check_grouped(
+            1,
             &[AggregateFunc::Min],
             &groups(&[(1, &[Some(9)])]),
             &groups(&[(1, &[Some(3)])]),
@@ -1526,6 +1664,7 @@ mod tests {
         // because of rows where the predicate is UNKNOWN, and the unpartitioned query does
         // not return it.
         let relation = check_grouped(
+            1,
             &[AggregateFunc::CountRows],
             &groups(&[(1, &[Some(3)])]),
             &groups(&[(1, &[Some(3)])]),
@@ -1550,6 +1689,7 @@ mod tests {
         // `GROUP BY` returns one row per group by definition, so two rows for key 1 is the
         // engine contradicting itself regardless of what the partitions say.
         let relation = check_grouped(
+            1,
             &[AggregateFunc::CountRows],
             &groups(&[(1, &[Some(2)]), (1, &[Some(3)])]),
             &groups(&[(1, &[Some(5)])]),
@@ -1564,6 +1704,7 @@ mod tests {
         let with_text =
             SqlOutcome::Rows(vec![vec![Cell::Integer(1), Cell::Text("'a'".to_string())]]);
         let relation = check_grouped(
+            1,
             &[AggregateFunc::Min],
             &with_text,
             &groups(&[(1, &[Some(1)])]),
@@ -1591,7 +1732,14 @@ mod tests {
             );
             assert!(parts.whole.query.filter.is_none());
             assert!(parts.is_true.query.filter.is_some());
-            assert_eq!(parts.funcs.len(), case.query.projection.len() - 1);
+            // Computed from `keys`, not hardcoded to 1 — the same trap as the feature-vector
+            // test that pinned a 17-feature size and failed on a correct 20-feature one.
+            assert_eq!(parts.keys, case.query.group_by.len());
+            assert_eq!(
+                parts.funcs.len(),
+                case.query.projection.len() - parts.keys,
+                "seed {seed}: projection is not keys-then-aggregates"
+            );
             // The three forms are mutually exclusive: a case is at most one of them.
             assert!(partition(&case).is_none() && partition_aggregate(&case).is_none());
         }
@@ -1899,7 +2047,7 @@ mod tests {
                     continue;
                 };
 
-                match check_grouped(&parts.funcs, &w, &t, &f, &u) {
+                match check_grouped(parts.keys, &parts.funcs, &w, &t, &f, &u) {
                     Relation::Violated {
                         only_in_whole,
                         only_in_partitions,
