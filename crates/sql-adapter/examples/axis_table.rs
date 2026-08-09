@@ -28,9 +28,10 @@
 //! Run with:
 //!   cargo run --release -p sql-adapter --example axis_table -- [diff cases] [tlp cases]
 
-use diff_fuzzer_core::GenerationAxes;
 use diff_fuzzer_core::SeededRng;
-use diff_fuzzer_core::traits::{Generator, Implementation, NamedOutput, Normalizer, Oracle, Verdict};
+use diff_fuzzer_core::traits::{
+    Generator, Implementation, NamedOutput, Normalizer, Oracle, Verdict,
+};
 use sql_adapter::backends::{DuckDbImpl, SqliteImpl};
 use sql_adapter::gen_schema::Bounds;
 use sql_adapter::generator::SqlGenerator;
@@ -198,24 +199,47 @@ fn measure(axis: &'static str, bounds: Bounds, diff_cases: usize, tlp_cases: usi
         let run = |c: &_| -> Option<SqlOutcome> { DuckDbImpl.run(c).ok() };
 
         let relation = if let Some(parts) = partition_having(&case) {
-            four(&run, &parts.whole, &parts.is_true, &parts.is_false, &parts.is_unknown)
-                .map(|(w, t, f, u)| check(&w, &t, &f, &u))
-        } else if let Some(parts) = partition(&case) {
-            four(&run, &parts.whole, &parts.is_true, &parts.is_false, &parts.is_unknown).map(
-                |(w, t, f, u)| {
-                    if parts.distinct {
-                        check_distinct(&w, &t, &f, &u)
-                    } else {
-                        check(&w, &t, &f, &u)
-                    }
-                },
+            four(
+                &run,
+                &parts.whole,
+                &parts.is_true,
+                &parts.is_false,
+                &parts.is_unknown,
             )
+            .map(|(w, t, f, u)| check(&w, &t, &f, &u))
+        } else if let Some(parts) = partition(&case) {
+            four(
+                &run,
+                &parts.whole,
+                &parts.is_true,
+                &parts.is_false,
+                &parts.is_unknown,
+            )
+            .map(|(w, t, f, u)| {
+                if parts.distinct {
+                    check_distinct(&w, &t, &f, &u)
+                } else {
+                    check(&w, &t, &f, &u)
+                }
+            })
         } else if let Some(parts) = partition_aggregate(&case) {
-            four(&run, &parts.whole, &parts.is_true, &parts.is_false, &parts.is_unknown)
-                .map(|(w, t, f, u)| check_aggregate(parts.func, &w, &t, &f, &u))
+            four(
+                &run,
+                &parts.whole,
+                &parts.is_true,
+                &parts.is_false,
+                &parts.is_unknown,
+            )
+            .map(|(w, t, f, u)| check_aggregate(parts.func, &w, &t, &f, &u))
         } else if let Some(parts) = partition_grouped(&case) {
-            four(&run, &parts.whole, &parts.is_true, &parts.is_false, &parts.is_unknown)
-                .map(|(w, t, f, u)| check_grouped(parts.keys, &parts.funcs, &w, &t, &f, &u))
+            four(
+                &run,
+                &parts.whole,
+                &parts.is_true,
+                &parts.is_false,
+                &parts.is_unknown,
+            )
+            .map(|(w, t, f, u)| check_grouped(parts.keys, &parts.funcs, &w, &t, &f, &u))
         } else {
             None
         };
@@ -243,7 +267,13 @@ fn measure(axis: &'static str, bounds: Bounds, diff_cases: usize, tlp_cases: usi
 }
 
 /// Run four variants, or `None` if any could not be run.
-fn four<F, C>(run: &F, a: &C, b: &C, c: &C, d: &C) -> Option<(SqlOutcome, SqlOutcome, SqlOutcome, SqlOutcome)>
+fn four<F, C>(
+    run: &F,
+    a: &C,
+    b: &C,
+    c: &C,
+    d: &C,
+) -> Option<(SqlOutcome, SqlOutcome, SqlOutcome, SqlOutcome)>
 where
     F: Fn(&C) -> Option<SqlOutcome>,
 {

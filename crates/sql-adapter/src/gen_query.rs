@@ -81,7 +81,9 @@ pub fn generate_query(
         QueryShape::Rows => (generate_projection(rng, table, bounds), Vec::new()),
         QueryShape::WholeTableAggregate => {
             let count = rng.random_range(1..=2);
-            let projection = (0..count).map(|_| generate_aggregate(rng, table)).collect();
+            let projection = (0..count)
+                .map(|_| generate_aggregate(rng, table, bounds))
+                .collect();
             (projection, Vec::new())
         }
         QueryShape::Grouped => {
@@ -109,7 +111,7 @@ pub fn generate_query(
 
             let mut projection: Vec<Expr> = keys.iter().cloned().map(Expr::Column).collect();
             for _ in 0..rng.random_range(1..=2) {
-                projection.push(generate_aggregate(rng, table));
+                projection.push(generate_aggregate(rng, table, bounds));
             }
             (projection, keys)
         }
@@ -734,9 +736,26 @@ fn generate_join(rng: &mut SeededRng, left: &Table, right: &Table) -> Option<Joi
 /// SQLite keeps an integer until it overflows into `REAL`, so summing a `BIGINT` column of
 /// extreme values would reproduce the documented overflow difference instead of testing
 /// aggregation. With at most 8 rows of values below 2^31, a sum cannot leave `i64`.
-fn generate_aggregate(rng: &mut SeededRng, table: &Table) -> Expr {
+fn generate_aggregate(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Expr {
     let column = &table.columns[rng.random_range(0..table.columns.len())];
-    let column_ref = Expr::Column(reference(table, &column.name));
+
+    // **Conditional aggregation** — `SUM(CASE WHEN c > 0 THEN c ELSE NULL END)` — added at S9.12
+    // because the corpus-shape check reported "CASE inside a grouped query" at **0%**. It was
+    // not impossible, it was unreachable: `CASE` was only emitted by `generate_projection`,
+    // which runs for row queries, while grouped queries build their projection from keys and
+    // aggregates. A bare `CASE` in a grouped projection would be invalid SQL anyway — neither a
+    // key nor an aggregate — so *inside* an aggregate is the form that is both valid and
+    // interesting.
+    //
+    // It is the only place in this generator where two `NULL` mechanisms compose: the `CASE`'s
+    // missing-`ELSE` route produces `NULL`s, and the aggregate then has to decide what to do
+    // with them (`COUNT(x)` skips them, `SUM` of all-`NULL` is `NULL`, not 0).
+    let argument = if bounds.case_expressions && rng.random_range(0..100) < 30 {
+        generate_case(rng, table, column.sql_type, bounds)
+    } else {
+        Expr::Column(reference(table, &column.name))
+    };
+    let column_ref = argument;
 
     let summable = column.sql_type == SqlType::Integer;
     let choice = rng.random_range(0..100);
