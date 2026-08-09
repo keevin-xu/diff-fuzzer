@@ -78,11 +78,11 @@ pub fn generate_query(
     };
 
     let (projection, group_by) = match shape {
-        QueryShape::Rows => (generate_projection(rng, table, bounds), Vec::new()),
+        QueryShape::Rows => (generate_projection(rng, table, bounds, rows), Vec::new()),
         QueryShape::WholeTableAggregate => {
             let count = rng.random_range(1..=2);
             let projection = (0..count)
-                .map(|_| generate_aggregate(rng, table, bounds))
+                .map(|_| generate_aggregate(rng, table, bounds, rows))
                 .collect();
             (projection, Vec::new())
         }
@@ -111,61 +111,57 @@ pub fn generate_query(
 
             let mut projection: Vec<Expr> = keys.iter().cloned().map(Expr::Column).collect();
             for _ in 0..rng.random_range(1..=2) {
-                projection.push(generate_aggregate(rng, table, bounds));
+                projection.push(generate_aggregate(rng, table, bounds, rows));
             }
             (projection, keys)
         }
     };
 
     let mut filter =
-        (rng.random_range(0..100) < 70).then(|| generate_predicate(rng, table, bounds, 0));
+        (rng.random_range(0..100) < 70).then(|| generate_predicate(rng, table, bounds, 0, rows));
 
-    // An `IN`/`NOT IN` membership test in the `WHERE` clause. **Conjoined with `AND`
-    // specifically, never `OR`** — unlike the correlated subquery below, which picks either.
-    // `OR` would let the other side of the disjunction return rows on its own, which is
-    // exactly what would mask the trap: the whole signal here is a predicate that returns
-    // *nothing* when it should return something.
-    // The literal-list membership test. Needs no second table, so it fires in single-table
-    // schemas too — and is conjoined with `AND` for the same reason as the subquery form: `OR`
-    // would let the other side return rows and mask a predicate that should return none.
-    if bounds.not_in_list && rng.random_range(0..100) < 45 {
-        let membership = generate_in_list(rng, table);
-        filter = Some(match filter {
-            Some(existing) => Expr::Binary {
-                op: BinaryOp::And,
-                left: Box::new(existing),
-                right: Box::new(membership),
-            },
-            None => membership,
-        });
-    }
+    // **At most ONE membership test per case, at 30% — one die, not three.**
+    //
+    // The three membership axes were built one at a time, each measured alone at 45%, and their
+    // *combined* rate was never chosen by anyone. Independent at 45%, the chance a case escapes
+    // all three is 0.55³ ≈ 17%, so **83% of the combined corpus carried one** — and since a
+    // `NOT IN` with a `NULL` in reach correctly returns nothing, that alone kept `V1_ALL` at
+    // **62% empty results** (S9.13). Two engines both returning nothing always agree, so most of
+    // a campaign tested nothing.
+    //
+    // The failure is not in any axis: each is individually reasonable. It is in their
+    // *composition*, which the per-axis table cannot see by construction, because every row
+    // there was measured alone. Rolling once and then choosing the kind makes the combined rate
+    // a decision rather than an accident, while keeping all three reachable.
+    //
+    // What this gives up: two membership forms in one query. That interaction was never designed
+    // and is not what any of the three axes was built to test.
+    //
+    // All forms are conjoined with `AND`, never `OR`: a disjunction could return rows on its own
+    // and mask a predicate that should return none, which is the whole signal here.
+    let membership_kinds: Vec<u8> = [
+        (bounds.not_in_list, 0u8),
+        (bounds.not_in, 1),
+        (bounds.not_in_correlated, 2),
+    ]
+    .into_iter()
+    .filter(|(enabled, _)| *enabled)
+    .map(|(_, kind)| kind)
+    .collect();
 
-    // The correlated membership test. Same `AND`-only conjunction as the other two, for the
-    // same reason: a disjunction could return rows on its own and mask a predicate that should
-    // return none.
-    if bounds.not_in_correlated && tables.len() > 1 && rng.random_range(0..100) < 45 {
-        let inner = tables
-            .iter()
-            .find(|candidate| candidate.name != table.name)
-            .expect("more than one table");
-        if let Some(membership) = generate_correlated_not_in(rng, table, inner) {
-            filter = Some(match filter {
-                Some(existing) => Expr::Binary {
-                    op: BinaryOp::And,
-                    left: Box::new(existing),
-                    right: Box::new(membership),
-                },
-                None => membership,
-            });
-        }
-    }
-
-    if bounds.not_in && tables.len() > 1 && rng.random_range(0..100) < 45 {
-        let inner = tables
-            .iter()
-            .find(|candidate| candidate.name != table.name)
-            .expect("more than one table");
-        if let Some(membership) = generate_not_in(rng, table, inner) {
+    if !membership_kinds.is_empty() && rng.random_range(0..100) < 30 {
+        let kind = membership_kinds[rng.random_range(0..membership_kinds.len())];
+        let other = tables.iter().find(|candidate| candidate.name != table.name);
+        let membership = match (kind, other) {
+            (0, _) => Some(generate_in_list(rng, table)),
+            (1, Some(inner)) => generate_not_in(rng, table, inner),
+            (2, Some(inner)) => generate_correlated_not_in(rng, table, inner),
+            // The subquery forms need a second table; with one table only the list form is
+            // reachable, and falling back to it keeps the axis alive rather than dropping it.
+            (_, None) => Some(generate_in_list(rng, table)),
+            _ => None,
+        };
+        if let Some(membership) = membership {
             filter = Some(match filter {
                 Some(existing) => Expr::Binary {
                     op: BinaryOp::And,
@@ -303,7 +299,7 @@ pub fn generate_query(
                     set_op: None,
                     group_by: Vec::new(),
                     filter: (rng.random_range(0..100) < 80)
-                        .then(|| generate_predicate(rng, table, bounds, 0)),
+                        .then(|| generate_predicate(rng, table, bounds, 0, rows)),
                     order_by: Vec::new(),
                     limit: None,
                 }),
@@ -323,7 +319,7 @@ pub fn generate_query(
                 set_op: inner,
                 group_by: Vec::new(),
                 filter: (rng.random_range(0..100) < 80)
-                    .then(|| generate_predicate(rng, table, bounds, 0)),
+                    .then(|| generate_predicate(rng, table, bounds, 0, rows)),
                 order_by: Vec::new(),
                 limit: None,
             }),
@@ -736,7 +732,12 @@ fn generate_join(rng: &mut SeededRng, left: &Table, right: &Table) -> Option<Joi
 /// SQLite keeps an integer until it overflows into `REAL`, so summing a `BIGINT` column of
 /// extreme values would reproduce the documented overflow difference instead of testing
 /// aggregation. With at most 8 rows of values below 2^31, a sum cannot leave `i64`.
-fn generate_aggregate(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Expr {
+fn generate_aggregate(
+    rng: &mut SeededRng,
+    table: &Table,
+    bounds: Bounds,
+    rows: &[Vec<Literal>],
+) -> Expr {
     let column = &table.columns[rng.random_range(0..table.columns.len())];
 
     // **Conditional aggregation** — `SUM(CASE WHEN c > 0 THEN c ELSE NULL END)` — added at S9.12
@@ -751,7 +752,7 @@ fn generate_aggregate(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Exp
     // missing-`ELSE` route produces `NULL`s, and the aggregate then has to decide what to do
     // with them (`COUNT(x)` skips them, `SUM` of all-`NULL` is `NULL`, not 0).
     let argument = if bounds.case_expressions && rng.random_range(0..100) < 30 {
-        generate_case(rng, table, column.sql_type, bounds)
+        generate_case(rng, table, column.sql_type, bounds, rows)
     } else {
         Expr::Column(reference(table, &column.name))
     };
@@ -777,7 +778,12 @@ fn generate_aggregate(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Exp
 }
 
 /// What the query returns: between one column and all of them, sometimes computed.
-fn generate_projection(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Vec<Expr> {
+fn generate_projection(
+    rng: &mut SeededRng,
+    table: &Table,
+    bounds: Bounds,
+    rows: &[Vec<Literal>],
+) -> Vec<Expr> {
     let count = rng.random_range(1..=table.columns.len());
 
     (0..count)
@@ -786,11 +792,11 @@ fn generate_projection(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Ve
             // Mostly bare columns: they keep minimized repros readable, and a divergence in
             // a projected column is easier to argue about than one inside an expression.
             if bounds.case_expressions && rng.random_range(0..100) < 30 {
-                generate_case(rng, table, column.sql_type, bounds)
+                generate_case(rng, table, column.sql_type, bounds, rows)
             } else if rng.random_range(0..100) < 70 {
                 Expr::Column(reference(table, &column.name))
             } else {
-                generate_scalar(rng, table, column.sql_type, bounds, 0)
+                generate_scalar(rng, table, column.sql_type, bounds, 0, rows)
             }
         })
         .collect()
@@ -807,14 +813,27 @@ fn generate_projection(rng: &mut SeededRng, table: &Table, bounds: Bounds) -> Ve
 /// result column's type differ between engines — the text-versus-integer hazard the `HAVING`
 /// axis reintroduced at S9.5 and paid 825 spurious findings for. The type walk in the tests
 /// asserts this independently rather than trusting the comment.
-fn generate_case(rng: &mut SeededRng, table: &Table, result_type: SqlType, bounds: Bounds) -> Expr {
+fn generate_case(
+    rng: &mut SeededRng,
+    table: &Table,
+    result_type: SqlType,
+    bounds: Bounds,
+    rows: &[Vec<Literal>],
+) -> Expr {
     let count = rng.random_range(1..=2);
     let branches: Vec<(Expr, Expr)> = (0..count)
         .map(|_| {
             // The condition is an ordinary predicate, so it can itself be UNKNOWN — the second
             // `NULL` route, independent of the missing `ELSE`.
-            let when = generate_predicate(rng, table, bounds, bounds.max_expr_depth - 1);
-            let then = generate_scalar(rng, table, result_type, bounds, bounds.max_expr_depth - 1);
+            let when = generate_predicate(rng, table, bounds, bounds.max_expr_depth - 1, rows);
+            let then = generate_scalar(
+                rng,
+                table,
+                result_type,
+                bounds,
+                bounds.max_expr_depth - 1,
+                rows,
+            );
             (when, then)
         })
         .collect();
@@ -826,6 +845,7 @@ fn generate_case(rng: &mut SeededRng, table: &Table, result_type: SqlType, bound
             result_type,
             bounds,
             bounds.max_expr_depth - 1,
+            rows,
         ))
     });
 
@@ -841,13 +861,19 @@ fn generate_case(rng: &mut SeededRng, table: &Table, result_type: SqlType, bound
 /// looks: expression size grows exponentially in depth, so an unbounded generator produces a
 /// few enormous cases rather than many small ones, and enormous cases are both slow to run
 /// and miserable to minimize.
-fn generate_predicate(rng: &mut SeededRng, table: &Table, bounds: Bounds, depth: usize) -> Expr {
+fn generate_predicate(
+    rng: &mut SeededRng,
+    table: &Table,
+    bounds: Bounds,
+    depth: usize,
+    rows: &[Vec<Literal>],
+) -> Expr {
     if depth >= bounds.max_expr_depth {
-        return generate_comparison(rng, table, bounds, depth);
+        return generate_comparison(rng, table, bounds, depth, rows);
     }
 
     match rng.random_range(0..100) {
-        0..=45 => generate_comparison(rng, table, bounds, depth),
+        0..=45 => generate_comparison(rng, table, bounds, depth, rows),
         46..=60 => {
             // `IS NULL` / `IS NOT NULL` — the one way to ask about `NULL` that yields a
             // definite answer rather than an unknown, and therefore worth generating often.
@@ -863,7 +889,7 @@ fn generate_predicate(rng: &mut SeededRng, table: &Table, bounds: Bounds, depth:
         }
         61..=75 => Expr::Unary {
             op: UnaryOp::Not,
-            operand: Box::new(generate_predicate(rng, table, bounds, depth + 1)),
+            operand: Box::new(generate_predicate(rng, table, bounds, depth + 1, rows)),
         },
         _ => Expr::Binary {
             op: if rng.random_range(0..2) == 0 {
@@ -871,8 +897,8 @@ fn generate_predicate(rng: &mut SeededRng, table: &Table, bounds: Bounds, depth:
             } else {
                 BinaryOp::Or
             },
-            left: Box::new(generate_predicate(rng, table, bounds, depth + 1)),
-            right: Box::new(generate_predicate(rng, table, bounds, depth + 1)),
+            left: Box::new(generate_predicate(rng, table, bounds, depth + 1, rows)),
+            right: Box::new(generate_predicate(rng, table, bounds, depth + 1, rows)),
         },
     }
 }
@@ -882,7 +908,13 @@ fn generate_predicate(rng: &mut SeededRng, table: &Table, bounds: Bounds, depth:
 /// The type is chosen first, from a column that exists, and both sides are then built at
 /// that type. This is what makes `1 = 'x'` — where the engines' coercion rules differ —
 /// impossible to produce rather than merely unlikely.
-fn generate_comparison(rng: &mut SeededRng, table: &Table, bounds: Bounds, depth: usize) -> Expr {
+fn generate_comparison(
+    rng: &mut SeededRng,
+    table: &Table,
+    bounds: Bounds,
+    depth: usize,
+    rows: &[Vec<Literal>],
+) -> Expr {
     let column = &table.columns[rng.random_range(0..table.columns.len())];
     let sql_type = column.sql_type;
 
@@ -895,20 +927,70 @@ fn generate_comparison(rng: &mut SeededRng, table: &Table, bounds: Bounds, depth
         _ => BinaryOp::GreaterOrEqual,
     };
 
+    // **The right-hand side is drawn from the column's own data 65% of the time.** Measured at
+    // S9.13: with literals taken only from the interesting-value pool, `V1` returned an empty
+    // result **39%** of the time and `V1_ALL` **62%**, mean 0.85 rows. Two engines both
+    // returning nothing always agree, so most of a campaign was comparing empty against empty —
+    // and every clause downstream of the `WHERE` (ordering, grouping, `HAVING`, aggregates,
+    // joins) only does work when rows survive it.
+    //
+    // Drawing from the values actually present guarantees an equality predicate has something
+    // to match. The remaining 35% keep the pool, which is what still reaches the boundaries
+    // (`i64::MIN`, `0`, the empty string) that the data may not contain — losing those would
+    // trade one blind spot for another.
+    let right = if rng.random_range(0..100) < 65 {
+        match value_from_column(rng, table, &column.name, rows) {
+            Some(literal) => Expr::Literal(literal),
+            None => generate_scalar(rng, table, sql_type, bounds, depth + 1, rows),
+        }
+    } else {
+        generate_scalar(rng, table, sql_type, bounds, depth + 1, rows)
+    };
+
     Expr::Binary {
         op,
         left: Box::new(Expr::Column(reference(table, &column.name))),
-        right: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
+        right: Box::new(right),
     }
 }
 
+/// A **non-`NULL`** value this column actually holds in this case's data, if it holds any.
+///
+/// `NULL` is excluded deliberately. Comparing against `NULL` is UNKNOWN, which excludes the row
+/// — the very outcome this function exists to avoid — and `NULL` comparisons are already
+/// generated in quantity by `IS NULL` tests and by the literal pool. Drawing them here would
+/// spend the matching budget on the case that cannot match.
+fn value_from_column(
+    rng: &mut SeededRng,
+    table: &Table,
+    column_name: &str,
+    rows: &[Vec<Literal>],
+) -> Option<Literal> {
+    let (index, _) = table.column(column_name)?;
+    let present: Vec<&Literal> = rows
+        .iter()
+        .filter_map(|row| row.get(index))
+        .filter(|value| **value != Literal::Null)
+        .collect();
+    if present.is_empty() {
+        return None;
+    }
+    Some(present[rng.random_range(0..present.len())].clone())
+}
+
 /// A value expression of a given type: a column, a literal, or something computed.
+// `rows` looks unused here and is not: this function recurses into `generate_predicate`, which
+// reaches `generate_comparison`, which is where a literal is drawn from the column's own data.
+// Removing the parameter would cut nested predicates off from the data and quietly restore the
+// 62%-empty corpus for exactly the cases that are hardest to reason about.
+#[allow(clippy::only_used_in_recursion)]
 fn generate_scalar(
     rng: &mut SeededRng,
     table: &Table,
     sql_type: SqlType,
     bounds: Bounds,
     depth: usize,
+    rows: &[Vec<Literal>],
 ) -> Expr {
     let matching: Vec<&crate::schema::Column> = table
         .columns
@@ -954,8 +1036,22 @@ fn generate_scalar(
                     // the bounded setting at S5 to answer whether it finds anything.
                     Expr::Binary {
                         op,
-                        left: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
-                        right: Box::new(generate_scalar(rng, table, sql_type, bounds, depth + 1)),
+                        left: Box::new(generate_scalar(
+                            rng,
+                            table,
+                            sql_type,
+                            bounds,
+                            depth + 1,
+                            rows,
+                        )),
+                        right: Box::new(generate_scalar(
+                            rng,
+                            table,
+                            sql_type,
+                            bounds,
+                            depth + 1,
+                            rows,
+                        )),
                     }
                 } else {
                     Expr::Binary {
@@ -998,6 +1094,7 @@ fn generate_scalar(
                         SqlType::Integer,
                         bounds,
                         depth + 1,
+                        rows,
                     )),
                     to: SqlType::BigInt,
                 }
