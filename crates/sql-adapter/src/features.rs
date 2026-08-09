@@ -33,7 +33,17 @@ use crate::schema::{Expr, JoinKind, Literal, SetOp};
 /// and where the two **meet**. The third group is the interesting one and is the reason to
 /// have a vocabulary at all — "there is a `NULL` somewhere" and "a `NULL` is in the column a
 /// join matches on" are different claims, and only the second describes a mechanism.
-pub const FEATURES: [&str; 20] = [
+/// **Extended 2026-08-09 from 20 to 27.** The original twenty were written at S7, before seven
+/// further axes existed — `distinct`, `having`, `case`, the three membership forms,
+/// multi-column `GROUP BY` and `indexes`. None of them appeared here, so the saturation
+/// measurement's "feature vectors" column was **blind to more than half the generator**, and its
+/// flattening was read as the generator running out of things to express. It was partly the
+/// vocabulary running out of things to notice.
+///
+/// **The rule this produced: a new generation axis and its feature land in the same commit.**
+/// Eight separate checks in this project have silently narrowed while the thing they measure
+/// grew, and not one announced itself.
+pub const FEATURES: [&str; 27] = [
     // --- data: what is in the tables ---
     "null_in_data",
     "empty_table",
@@ -54,10 +64,55 @@ pub const FEATURES: [&str; 20] = [
     "subquery_present",
     "null_literal_in_predicate",
     "is_null_test_present",
+    // --- added with their axes (S9) ---
+    "distinct_present",
+    "having_present",
+    "case_present",
+    "case_without_else",
+    "membership_present",
+    "multi_group_by",
+    "index_present",
     // --- the interaction: where the data meets the query ---
     "null_in_join_key",
     "aggregate_over_empty",
 ];
+
+/// Visit every node of an expression.
+///
+/// A free walker rather than a method on `Expr`: what counts as "contains" differs per question,
+/// and the schema should not grow a predicate for each one a report happens to want.
+fn walk(expression: &Expr, visit: &mut impl FnMut(&Expr)) {
+    visit(expression);
+    match expression {
+        Expr::Unary { operand, .. } => walk(operand, visit),
+        Expr::Binary { left, right, .. } => {
+            walk(left, visit);
+            walk(right, visit);
+        }
+        Expr::Cast { expr, .. } => walk(expr, visit),
+        Expr::Aggregate { arg, .. } => {
+            if let Some(arg) = arg {
+                walk(arg, visit);
+            }
+        }
+        Expr::InList { left, .. }
+        | Expr::InSubquery { left, .. }
+        | Expr::ScalarSubquery { left, .. } => walk(left, visit),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (when, then) in branches {
+                walk(when, visit);
+                walk(then, visit);
+            }
+            if let Some(otherwise) = otherwise {
+                walk(otherwise, visit);
+            }
+        }
+        Expr::Exists { .. } | Expr::Column(_) | Expr::Literal(_) => {}
+    }
+}
 
 /// One case's features, one bit each.
 ///
@@ -148,6 +203,51 @@ fn data_features(case: &SqlCase, features: &mut FeatureVec) {
 /// What the query is made of.
 fn query_features(case: &SqlCase, features: &mut FeatureVec) {
     let query = &case.query;
+
+    if query.distinct {
+        features.set("distinct_present");
+    }
+    if query.having.is_some() {
+        features.set("having_present");
+    }
+    if query.group_by.len() > 1 {
+        features.set("multi_group_by");
+    }
+    if !case.indexes.is_empty() {
+        features.set("index_present");
+    }
+    // `CASE` and membership can sit anywhere in the projection or the predicate, so both are
+    // walked rather than checked at the top level.
+    let mut has_case = false;
+    let mut case_no_else = false;
+    let mut has_membership = false;
+    let mut note = |expression: &Expr| {
+        walk(expression, &mut |node| match node {
+            Expr::Case { otherwise, .. } => {
+                has_case = true;
+                if otherwise.is_none() {
+                    case_no_else = true;
+                }
+            }
+            Expr::InList { .. } | Expr::InSubquery { .. } => has_membership = true,
+            _ => {}
+        });
+    };
+    for expression in &query.projection {
+        note(expression);
+    }
+    if let Some(filter) = &query.filter {
+        note(filter);
+    }
+    if has_case {
+        features.set("case_present");
+    }
+    if case_no_else {
+        features.set("case_without_else");
+    }
+    if has_membership {
+        features.set("membership_present");
+    }
 
     if query.filter.is_some() {
         features.set("where_present");

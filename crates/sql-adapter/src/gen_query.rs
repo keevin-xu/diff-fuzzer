@@ -830,7 +830,19 @@ fn generate_aggregate(
     };
     let column_ref = argument;
 
-    let summable = column.sql_type == SqlType::Integer;
+    // **`SUM` only over a plain `INTEGER` column, never over a `CASE`.**
+    //
+    // The intent was always that eight 32-bit values cannot overflow an `i64`. Conditional
+    // aggregation (S9.12) defeated it: the `CASE`'s branches go through `generate_scalar`, and
+    // `Integer.accepts(BigInt)` is true, so the `CASE` could return a **`BIGINT`** column
+    // holding `i64::MAX` while the *chosen* column was `INTEGER`. The guard was checking the
+    // column picked, not the expression actually summed.
+    //
+    // Found by the campaign's `skipped` counter — 2 cases in 400,000. SQLite raises
+    // `integer overflow`; DuckDB widens the sum to `HUGEINT`, which this crate's reader
+    // correctly refuses. Both became skips rather than divergences, which is the oracle behaving
+    // properly, but they are cases the campaign could not judge.
+    let summable = column.sql_type == SqlType::Integer && matches!(column_ref, Expr::Column(_));
     let choice = rng.random_range(0..100);
 
     let (func, arg) = match choice {
@@ -1237,6 +1249,99 @@ mod tests {
         let data = generate_data(&mut rng, &tables, Bounds::V1);
         let query = generate_query(&mut rng, &tables, &data, Bounds::V1);
         (tables, data, query)
+    }
+
+    /// `SUM` is only ever applied to a plain `INTEGER` column — asserted **structurally**, not
+    /// sampled.
+    ///
+    /// The invariant: eight 32-bit values cannot overflow an `i64`, so `SUM` over an `INTEGER`
+    /// column is safe, and `SUM` over anything else is not. Conditional aggregation broke it by
+    /// letting a `CASE` return a `BIGINT` column while the *chosen* column was `INTEGER`.
+    ///
+    /// **A statistical test would be the wrong instrument here.** The bug produced 2 unrunnable
+    /// cases in 400,000 — about 3 in 10,000 of the `SUM` cases — so a 20,000-seed sample would
+    /// catch a regression roughly one time in ten. Checking the shape of every `SUM` catches it
+    /// every time, costs no engine runs, and says exactly what the rule is.
+    #[test]
+    fn sum_is_only_applied_to_a_plain_integer_column() {
+        fn check_aggregates(expression: &Expr, table: &Table, seed: u64) {
+            if let Expr::Aggregate {
+                func: AggregateFunc::Sum,
+                arg,
+            } = expression
+            {
+                let Some(argument) = arg else {
+                    panic!("seed {seed}: SUM with no argument");
+                };
+                match argument.as_ref() {
+                    Expr::Column(reference) => {
+                        let (_, column) = table
+                            .column(&reference.column)
+                            .unwrap_or_else(|| panic!("seed {seed}: SUM over unknown column"));
+                        assert_eq!(
+                            column.sql_type,
+                            SqlType::Integer,
+                            "seed {seed}: SUM over a {:?} column can overflow i64",
+                            column.sql_type
+                        );
+                    }
+                    other => panic!(
+                        "seed {seed}: SUM over a non-column expression, which can widen past \
+                         i64 whatever the chosen column's type: {other:?}"
+                    ),
+                }
+            }
+            // Aggregates only appear at the top of a projection in this generator, but the walk
+            // is total so a future nesting cannot slip past.
+            match expression {
+                Expr::Aggregate { arg: Some(arg), .. } => check_aggregates(arg, table, seed),
+                Expr::Unary { operand, .. } => check_aggregates(operand, table, seed),
+                Expr::Binary { left, right, .. } => {
+                    check_aggregates(left, table, seed);
+                    check_aggregates(right, table, seed);
+                }
+                Expr::Case {
+                    branches,
+                    otherwise,
+                } => {
+                    for (when, then) in branches {
+                        check_aggregates(when, table, seed);
+                        check_aggregates(then, table, seed);
+                    }
+                    if let Some(otherwise) = otherwise {
+                        check_aggregates(otherwise, table, seed);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut seen = 0usize;
+        for seed in 0..20_000u64 {
+            let mut rng = SeededRng::from_seed(seed);
+            let bounds = Bounds::V1_ALL;
+            let tables = generate_schema(&mut rng, bounds);
+            let data = generate_data(&mut rng, &tables, bounds);
+            let query = generate_query(&mut rng, &tables, &data, bounds);
+            let table = table_of(&tables, &query.from);
+
+            for expression in &query.projection {
+                if matches!(
+                    expression,
+                    Expr::Aggregate {
+                        func: AggregateFunc::Sum,
+                        ..
+                    }
+                ) {
+                    seen += 1;
+                }
+                check_aggregates(expression, table, seed);
+            }
+            if let Some(having) = &query.having {
+                check_aggregates(having, table, seed);
+            }
+        }
+        assert!(seen > 100, "only {seen} SUM aggregates in 20000 cases");
     }
 
     /// The `case` axis must fire, must omit the `ELSE` often enough to test the route it was
