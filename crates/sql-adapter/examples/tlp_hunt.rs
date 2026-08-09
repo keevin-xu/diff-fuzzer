@@ -137,6 +137,7 @@ fn main() {
         Some("not-in-list") => Bounds::V1_NOT_IN_LIST,
         Some("distinct") => Bounds::V1_DISTINCT,
         Some("having") => Bounds::V1_HAVING,
+        Some("not-in-correlated") => Bounds::V1_NOT_IN_CORRELATED,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,
         // **The default is now `V1_ALL`, matching the differential campaign.** It used to be

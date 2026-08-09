@@ -148,6 +148,21 @@ pub struct Bounds {
     ///
     /// Requires aggregation, so it only attaches to grouped or whole-table-aggregate queries.
     pub having: bool,
+    /// Whether the generator may emit a **correlated** `NOT IN` subquery.
+    ///
+    /// `x NOT IN (SELECT b FROM inner WHERE inner.c = outer.d)` — the membership list is
+    /// recomputed for every outer row, so each row gets a *different* list, and whether that
+    /// list contains a `NULL` can differ row by row.
+    ///
+    /// **Deferred at S8 deliberately and enabled now for a reason.** Correlating would have
+    /// confounded two mechanisms while the uncorrelated form was unmeasured. Both uncorrelated
+    /// routes (subquery at S8, literal list at S9.3) are now clean over 30,000 cases each, so
+    /// any yield here is attributable to **correlation** rather than to `NOT IN`.
+    ///
+    /// This is also where the two mechanisms compound: an optimizer that rewrites `NOT IN` to
+    /// an anti-join has to preserve `NULL` semantics *and* the per-row list, and it is the
+    /// rewrite rather than the semantics that is most likely to be wrong.
+    pub not_in_correlated: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -214,6 +229,7 @@ impl Bounds {
         not_in_list: false,
         distinct: false,
         having: false,
+        not_in_correlated: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -247,6 +263,13 @@ impl Bounds {
     pub const V1_HAVING: Bounds = Bounds {
         aggregates: true,
         having: true,
+        ..Bounds::V1
+    };
+
+    /// V1 plus **correlated** `NOT IN`. One axis, as always — and cleanly separable, unlike
+    /// `V1_HAVING`: the correlated form needs no other axis enabled to be generated.
+    pub const V1_NOT_IN_CORRELATED: Bounds = Bounds {
+        not_in_correlated: true,
         ..Bounds::V1
     };
 
@@ -290,6 +313,7 @@ impl Bounds {
         not_in_list: true,
         distinct: true,
         having: true,
+        not_in_correlated: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -363,6 +387,7 @@ impl GenerationAxes for Bounds {
             ("not-in-list", self.not_in_list),
             ("distinct", self.distinct),
             ("having", self.having),
+            ("not-in-correlated", self.not_in_correlated),
         ]
     }
 

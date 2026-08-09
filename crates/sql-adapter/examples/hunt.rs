@@ -76,6 +76,7 @@ fn main() {
         Some("not-in-list") => sql_adapter::gen_schema::Bounds::V1_NOT_IN_LIST,
         Some("distinct") => sql_adapter::gen_schema::Bounds::V1_DISTINCT,
         Some("having") => sql_adapter::gen_schema::Bounds::V1_HAVING,
+        Some("not-in-correlated") => sql_adapter::gen_schema::Bounds::V1_NOT_IN_CORRELATED,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
         _ => sql_adapter::gen_schema::Bounds::V1,

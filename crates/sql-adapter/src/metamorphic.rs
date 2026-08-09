@@ -1334,6 +1334,106 @@ mod tests {
         assert!(checked > 50, "only {checked} HAVING checks ran");
     }
 
+    /// A **correlated** `NOT IN` traps some rows and not others — verified on both engines.
+    ///
+    /// The uncorrelated form is all-or-nothing: one `NULL` anywhere in the list and the whole
+    /// query returns empty. Correlated, each outer row is tested against its own list, so the
+    /// `NULL` reaches some rows and not others. That is a harder thing for an engine to get
+    /// right — particularly one that rewrites `NOT IN` into an anti-join — and a much harder
+    /// thing to notice by eye, which is why it is pinned here rather than trusted.
+    #[test]
+    fn a_correlated_not_in_traps_only_the_rows_whose_list_holds_a_null() {
+        use crate::schema::{BinaryOp, Column, InsertRows, Literal, SqlType, Table};
+
+        let column = |table: &str, name: &str| ColumnRef {
+            table: table.to_string(),
+            column: name.to_string(),
+        };
+        let table = |name: &str| Table {
+            name: name.to_string(),
+            columns: vec![
+                Column {
+                    name: "k".to_string(),
+                    sql_type: SqlType::Integer,
+                },
+                Column {
+                    name: "v".to_string(),
+                    sql_type: SqlType::Integer,
+                },
+            ],
+        };
+
+        let case = SqlCase {
+            schema: vec![table("t0"), table("t1")],
+            data: vec![
+                InsertRows {
+                    table: "t0".to_string(),
+                    rows: vec![
+                        vec![Literal::Integer(1), Literal::Integer(10)],
+                        vec![Literal::Integer(2), Literal::Integer(20)],
+                    ],
+                },
+                InsertRows {
+                    table: "t1".to_string(),
+                    rows: vec![
+                        // Group k=1 has a NULL in its list -> outer row 1 is trapped.
+                        vec![Literal::Integer(1), Literal::Null],
+                        // Group k=2 has no NULL and does not contain 20 -> outer row 2 survives.
+                        vec![Literal::Integer(2), Literal::Integer(99)],
+                    ],
+                },
+            ],
+            query: SelectStmt {
+                having: None,
+                distinct: false,
+                projection: vec![Expr::Column(column("t0", "k"))],
+                from: "t0".to_string(),
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: Some(Expr::InSubquery {
+                    not: true,
+                    left: Box::new(Expr::Column(column("t0", "v"))),
+                    query: Box::new(SelectStmt {
+                        having: None,
+                        distinct: false,
+                        projection: vec![Expr::Column(column("t1", "v"))],
+                        from: "t1".to_string(),
+                        join: None,
+                        set_op: None,
+                        group_by: Vec::new(),
+                        filter: Some(Expr::Binary {
+                            op: BinaryOp::Equal,
+                            left: Box::new(Expr::Column(column("t1", "k"))),
+                            right: Box::new(Expr::Column(column("t0", "k"))),
+                        }),
+                        order_by: Vec::new(),
+                        limit: None,
+                    }),
+                }),
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let outcome = if engine == "sqlite" {
+                SqliteImpl.run(&case).expect("sqlite runs the case")
+            } else {
+                DuckDbImpl.run(&case).expect("duckdb runs the case")
+            };
+
+            // **Exactly one row survives**, which is the whole point: the uncorrelated form
+            // would return either both or neither. Row 1's list is (NULL) so it is UNKNOWN;
+            // row 2's list is (99) so `20 NOT IN (99)` is plainly TRUE.
+            assert_eq!(
+                outcome,
+                SqlOutcome::Rows(vec![vec![Cell::Integer(2)]]),
+                "{engine}: a correlated NOT IN must trap only the rows whose own list has a NULL"
+            );
+        }
+    }
+
     /// Build a grouped result: each entry is a group key followed by its aggregate values,
     /// where `None` renders as `NULL`.
     fn groups(values: &[(i64, &[Option<i64>])]) -> SqlOutcome {

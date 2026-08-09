@@ -118,6 +118,26 @@ pub fn generate_query(
         });
     }
 
+    // The correlated membership test. Same `AND`-only conjunction as the other two, for the
+    // same reason: a disjunction could return rows on its own and mask a predicate that should
+    // return none.
+    if bounds.not_in_correlated && tables.len() > 1 && rng.random_range(0..100) < 45 {
+        let inner = tables
+            .iter()
+            .find(|candidate| candidate.name != table.name)
+            .expect("more than one table");
+        if let Some(membership) = generate_correlated_not_in(rng, table, inner) {
+            filter = Some(match filter {
+                Some(existing) => Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(existing),
+                    right: Box::new(membership),
+                },
+                None => membership,
+            });
+        }
+    }
+
     if bounds.not_in && tables.len() > 1 && rng.random_range(0..100) < 45 {
         let inner = tables
             .iter()
@@ -457,6 +477,63 @@ fn generate_in_list(rng: &mut SeededRng, table: &Table) -> Expr {
         left: Box::new(Expr::Column(reference(table, &column.name))),
         list,
     }
+}
+
+/// `outer.a NOT IN (SELECT inner.b FROM inner WHERE inner.c = outer.d)` — the **correlated**
+/// membership test.
+///
+/// The list is recomputed per outer row, so each row is tested against a *different* list — and
+/// crucially, whether that list contains a `NULL` can differ row by row. The uncorrelated form
+/// is all-or-nothing: one `NULL` anywhere and the whole query returns empty. Here the trap
+/// fires for some rows and not others, which is both a harder thing to implement and a harder
+/// thing to spot by eye.
+///
+/// Two column pairs are needed, and they are chosen independently: one for the membership
+/// comparison and one for the correlation. Reusing a single pair would restrict the shape for
+/// no reason and would make every case look the same to the signature.
+fn generate_correlated_not_in(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Option<Expr> {
+    let mut pairs = Vec::new();
+    for outer_column in &outer.columns {
+        for inner_column in &inner.columns {
+            if outer_column.sql_type.accepts(inner_column.sql_type) {
+                pairs.push((outer_column, inner_column));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let (member_outer, member_inner) = pairs[rng.random_range(0..pairs.len())];
+    let (correlate_outer, correlate_inner) = pairs[rng.random_range(0..pairs.len())];
+
+    Some(Expr::InSubquery {
+        not: rng.random_range(0..100) < 80,
+        left: Box::new(Expr::Column(reference(outer, &member_outer.name))),
+        query: Box::new(SelectStmt {
+            having: None,
+            distinct: false,
+            projection: vec![Expr::Column(reference(inner, &member_inner.name))],
+            from: inner.name.clone(),
+            join: None,
+            set_op: None,
+            group_by: Vec::new(),
+            // **The correlation.** Referencing the outer row here is what makes the subquery
+            // re-evaluated per row; `NotEqual` is offered as well as `Equal` so the inner list
+            // is sometimes large and sometimes a single row.
+            filter: Some(Expr::Binary {
+                op: if rng.random_range(0..100) < 75 {
+                    BinaryOp::Equal
+                } else {
+                    BinaryOp::NotEqual
+                },
+                left: Box::new(Expr::Column(reference(inner, &correlate_inner.name))),
+                right: Box::new(Expr::Column(reference(outer, &correlate_outer.name))),
+            }),
+            order_by: Vec::new(),
+            limit: None,
+        }),
+    })
 }
 
 /// `outer.c IN (SELECT inner.d FROM inner)` — or, mostly, `NOT IN`.
@@ -911,6 +988,73 @@ mod tests {
         let data = generate_data(&mut rng, &tables, Bounds::V1);
         let query = generate_query(&mut rng, &tables, &data, Bounds::V1);
         (tables, data, query)
+    }
+
+    /// The correlated `NOT IN` axis must fire, must actually correlate, and must produce cases
+    /// that pass the case-level validity check — which resolves names in **two scopes**.
+    #[test]
+    fn the_correlated_not_in_axis_correlates_and_stays_valid() {
+        use crate::ast::SqlCase;
+
+        fn correlated(expression: &Expr, outer_table: &str) -> Option<bool> {
+            match expression {
+                Expr::InSubquery { query, .. } => {
+                    // The inner filter must reference the OUTER table, or the subquery is
+                    // uncorrelated and this axis is silently generating the S8 form again.
+                    Some(query.filter.as_ref().is_some_and(|filter| {
+                        filter.columns().iter().any(|c| c.table == outer_table)
+                    }))
+                }
+                Expr::Unary { operand, .. } => correlated(operand, outer_table),
+                Expr::Binary { left, right, .. } => {
+                    correlated(left, outer_table).or_else(|| correlated(right, outer_table))
+                }
+                _ => None,
+            }
+        }
+
+        let (mut found, mut truly_correlated) = (0usize, 0usize);
+        for seed in 0..2_000 {
+            let mut rng = SeededRng::from_seed(seed);
+            let bounds = Bounds::V1_NOT_IN_CORRELATED;
+            let tables = generate_schema(&mut rng, bounds);
+            let data = generate_data(&mut rng, &tables, bounds);
+            let query = generate_query(&mut rng, &tables, &data, bounds);
+
+            let case = SqlCase {
+                schema: tables.clone(),
+                data: data.clone(),
+                query: query.clone(),
+            };
+            // **The check that matters for a correlated construct.** Two-scope resolution is
+            // where an inner reference to an outer column either works or silently names
+            // nothing, and `validate` is what would notice.
+            assert!(
+                case.validate().is_ok(),
+                "seed {seed}: correlated case failed validation: {:?}",
+                case.validate()
+            );
+
+            if let Some(filter) = &query.filter
+                && let Some(is_correlated) = correlated(filter, &query.from)
+            {
+                found += 1;
+                if is_correlated {
+                    truly_correlated += 1;
+                }
+            }
+        }
+
+        assert!(
+            found > 200,
+            "only {found} membership subqueries in 2000 cases"
+        );
+        assert_eq!(
+            found,
+            truly_correlated,
+            "every subquery on this axis must reference the outer row — {} did not",
+            found - truly_correlated
+        );
     }
 
     /// The `distinct` axis must fire, must stay on row queries, and must never attach an
