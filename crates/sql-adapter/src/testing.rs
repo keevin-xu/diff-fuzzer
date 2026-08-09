@@ -178,6 +178,92 @@ mod tests {
         }
     }
 
+    /// Detection, proven on the **campaign's own corpus** rather than on one hand-written case.
+    ///
+    /// # Why the test above is not enough
+    ///
+    /// `every_fault_is_caught_on_either_side` uses [`SqlCase::fixed_example`] — one table, two
+    /// columns, four rows, a simple filter. The campaign runs generated cases across twelve
+    /// axes: joins, aggregates, subqueries, set operations, empty tables. **The sentence every
+    /// zero in this project rests on** — "a quiet campaign means something only because fault
+    /// injection proves detection works" — was underwritten by a corpus of exactly one.
+    ///
+    /// # The distinction this test exists to make
+    ///
+    /// A fault that **cannot change the output** cannot be caught, and that is not an oracle
+    /// failure. `DropLastRow` on a query returning no rows is a no-op; so is `ChangeFirstCell`.
+    /// Roughly a tenth of the campaign corpus has an empty table, so a meaningful share of cases
+    /// are simply not injectable — and counting those as "undetected" would understate the
+    /// oracle while counting them as "detected" would overstate it.
+    ///
+    /// So each case is classified three ways: the fault changed the output and the oracle caught
+    /// it (**good**), the fault changed nothing (**not injectable**, reported not hidden), or
+    /// the fault changed the output and the oracle stayed silent (**a real defect**, and the
+    /// only outcome that fails this test).
+    #[test]
+    fn detection_holds_across_the_campaigns_own_corpus() {
+        use crate::gen_schema::Bounds;
+        use crate::generator::SqlGenerator;
+        use diff_fuzzer_core::SeededRng;
+        use diff_fuzzer_core::traits::Generator;
+
+        let generator = SqlGenerator::new(Bounds::V1_ALL);
+        let honest_duckdb = NormalizedRunner::new(DuckDbImpl, SqlNormalizer);
+
+        for fault in [
+            Fault::DropLastRow,
+            Fault::ChangeFirstCell,
+            Fault::AlwaysRefuse,
+        ] {
+            let faulty_sqlite = NormalizedRunner::new(
+                FaultyEngine::new(SqliteImpl, fault, "sqlite-with-injected-fault"),
+                SqlNormalizer,
+            );
+            let honest_sqlite = NormalizedRunner::new(SqliteImpl, SqlNormalizer);
+
+            let (mut caught, mut not_injectable, mut missed) = (0usize, 0usize, 0usize);
+
+            for seed in 0..300u64 {
+                let case = generator.generate(&mut SeededRng::from_seed(seed));
+
+                // What the fault actually did to this case's output. Comparing the faulty
+                // engine against the *honest same engine* isolates the injection from any
+                // cross-engine difference.
+                let changed = verdict_for(&case, &faulty_sqlite, &honest_sqlite);
+                let detected = verdict_for(&case, &faulty_sqlite, &honest_duckdb);
+
+                match (changed, detected) {
+                    // The fault did nothing to this case — nothing to catch.
+                    (Verdict::Agree, _) => not_injectable += 1,
+                    // It changed the output and the oracle said so.
+                    (_, Verdict::Diverged(_)) => caught += 1,
+                    // It changed the output and the oracle did not. The only real failure.
+                    (_, _) => missed += 1,
+                }
+            }
+
+            assert_eq!(
+                missed, 0,
+                "{fault:?}: the oracle missed {missed} cases where the fault DID change the \
+                 output — this is the claim every zero in this project rests on"
+            );
+            // And the fault must be injectable often enough for the above to mean anything: a
+            // fault that is a no-op on every case would pass with `caught == 0`.
+            //
+            // **The floor is 50, not 100, and the reason is a finding rather than a
+            // concession.** On `V1_ALL` about **62% of queries return no rows at all** (S9.13),
+            // so a fault that mutates rows is a no-op on most of the corpus. That is measured,
+            // recorded in `PENDING` 2.19, and the campaign's own weakness — not this test's.
+            // Fifty injectable cases still proves detection on fifty *generated* cases across
+            // twelve axes, against the one hand-written case it rested on before.
+            assert!(
+                caught > 50,
+                "{fault:?}: only {caught} of 300 cases were injectable ({not_injectable} were \
+                 no-ops) — too few for the zero above to be evidence"
+            );
+        }
+    }
+
     /// The control. Without it, the test above could pass because *everything* diverges.
     ///
     /// A detector that reports every case as a divergence catches all three faults and is
