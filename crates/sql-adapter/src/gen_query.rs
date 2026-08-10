@@ -56,6 +56,7 @@ pub fn generate_query(
     };
     // A joined query is treated as unordered — an outer join manufactures rows that are in no
     // table — so it gets no `ORDER BY` and no `LIMIT`, the same reasoning as grouping.
+    let query_join = join.clone();
     let joined = join.is_some();
     let rows = data
         .iter()
@@ -294,7 +295,7 @@ pub fn generate_query(
                     having: None,
                     distinct: false,
                     projection: projection.clone(),
-                    from: table.name.clone(),
+                    from: vec![table.name.clone()],
                     join: None,
                     set_op: None,
                     group_by: Vec::new(),
@@ -314,7 +315,7 @@ pub fn generate_query(
                 having: None,
                 distinct: false,
                 projection: projection.clone(),
-                from: table.name.clone(),
+                from: vec![table.name.clone()],
                 join: None,
                 set_op: inner,
                 group_by: Vec::new(),
@@ -391,11 +392,25 @@ pub fn generate_query(
         && ordering_is_projected
         && rng.random_range(0..100) < 50;
 
+    // **The comma-join list.** A second table in `FROM`, alongside whatever explicit join the
+    // query already has — because the divergence is about how the two *bind relative to each
+    // other*, not about either alone. Only tables not already in scope are added, so the query
+    // does not name the same table twice (which needs aliases, a separate and deferred change).
+    let mut from = vec![table.name.clone()];
+    if bounds.comma_joins && rng.random_range(0..100) < 60 {
+        let joined = query_join.as_ref().map(|j| j.table.clone());
+        if let Some(extra) = tables.iter().find(|candidate| {
+            candidate.name != table.name && Some(&candidate.name) != joined.as_ref()
+        }) {
+            from.push(extra.name.clone());
+        }
+    }
+
     SelectStmt {
         having,
         distinct,
         projection,
-        from: table.name.clone(),
+        from,
         join,
         set_op,
         group_by,
@@ -604,7 +619,7 @@ fn generate_correlated_not_in(rng: &mut SeededRng, outer: &Table, inner: &Table)
             having: None,
             distinct: false,
             projection: vec![Expr::Column(reference(inner, &member_inner.name))],
-            from: inner.name.clone(),
+            from: vec![inner.name.clone()],
             join: None,
             set_op: None,
             group_by: Vec::new(),
@@ -661,7 +676,7 @@ fn generate_not_in(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Option<
             having: None,
             distinct: false,
             projection: vec![Expr::Column(reference(inner, &inner_column.name))],
-            from: inner.name.clone(),
+            from: vec![inner.name.clone()],
             join: None,
             set_op: None,
             group_by: Vec::new(),
@@ -704,7 +719,7 @@ fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Optio
                 having: None,
                 distinct: false,
                 projection: vec![Expr::Column(reference(inner, &inner_column.name))],
-                from: inner.name.clone(),
+                from: vec![inner.name.clone()],
                 join: None,
                 set_op: None,
                 group_by: Vec::new(),
@@ -737,7 +752,7 @@ fn generate_subquery(rng: &mut SeededRng, outer: &Table, inner: &Table) -> Optio
                     func,
                     arg: Some(Box::new(Expr::Column(reference(inner, &inner_column.name)))),
                 }],
-                from: inner.name.clone(),
+                from: vec![inner.name.clone()],
                 join: None,
                 set_op: None,
                 group_by: Vec::new(),
@@ -1323,7 +1338,7 @@ mod tests {
             let tables = generate_schema(&mut rng, bounds);
             let data = generate_data(&mut rng, &tables, bounds);
             let query = generate_query(&mut rng, &tables, &data, bounds);
-            let table = table_of(&tables, &query.from);
+            let table = table_of(&tables, query.primary());
 
             for expression in &query.projection {
                 if matches!(
@@ -1470,7 +1485,7 @@ mod tests {
             );
 
             if let Some(filter) = &query.filter
-                && let Some(is_correlated) = correlated(filter, &query.from)
+                && let Some(is_correlated) = correlated(filter, query.primary())
             {
                 found += 1;
                 if is_correlated {
@@ -1701,7 +1716,7 @@ mod tests {
     fn every_referenced_column_exists() {
         for seed in 0..500 {
             let (tables, _, query) = generated(seed);
-            let table = table_of(&tables, &query.from);
+            let table = table_of(&tables, query.primary());
 
             let mut referenced: Vec<&ColumnRef> = Vec::new();
             for expression in &query.projection {
@@ -1738,7 +1753,7 @@ mod tests {
             }
             with_limit += 1;
 
-            let table = table_of(&tables, &query.from);
+            let table = table_of(&tables, query.primary());
             let rows = data
                 .iter()
                 .find(|insert| insert.table == table.name)
@@ -1797,7 +1812,7 @@ mod tests {
                 let tables = generate_schema(&mut rng, bounds);
                 let data = generate_data(&mut rng, &tables, bounds);
                 let query = generate_query(&mut rng, &tables, &data, bounds);
-                let table = table_of(&tables, &query.from);
+                let table = table_of(&tables, query.primary());
 
                 if let Some(filter) = &query.filter {
                     assert_types_agree(filter, table, seed);
@@ -1830,7 +1845,7 @@ mod tests {
             let tables = generate_schema(&mut rng, Bounds::V1_HAVING);
             let data = generate_data(&mut rng, &tables, Bounds::V1_HAVING);
             let query = generate_query(&mut rng, &tables, &data, Bounds::V1_HAVING);
-            let table = table_of(&tables, &query.from);
+            let table = table_of(&tables, query.primary());
 
             let Some(Expr::Binary { left, .. }) = &query.having else {
                 continue;

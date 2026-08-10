@@ -194,6 +194,21 @@ pub struct Bounds {
     /// statistics and on eight rows will likely decline. Different plans for the same query is
     /// the condition the differential oracle exists for, and no axis has produced it yet.
     pub indexes: bool,
+    /// Whether the `FROM` clause may list **several tables**, comma-joined.
+    ///
+    /// **The only axis in this crate chosen from a divergence that was confirmed first.**
+    /// SQLite documents its own parser as giving all join operators equal precedence, left to
+    /// right, and notes that this *"is not quite correct"* — comma-joins should bind loosest
+    /// (`SPECS.md` §2.11). Measured before this axis existed: `FROM a, b RIGHT JOIN c` yields
+    /// `(NULL, NULL, 3)` on SQLite against `(1, NULL, 3)` on DuckDB.
+    ///
+    /// It is enabled to make that case **representable**, not to discover it. Until now the
+    /// `FROM` clause held a single table, so the one real divergence this project has could not
+    /// be built as a `SqlCase` and therefore could not be minimized, signatured or triaged.
+    ///
+    /// **Requires a `known.rs` entry before any campaign uses it**, or this single known
+    /// mechanism swamps the run exactly as chained set operations do at 12.5%.
+    pub comma_joins: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -264,6 +279,7 @@ impl Bounds {
         multi_group_by: false,
         case_expressions: false,
         indexes: false,
+        comma_joins: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -327,6 +343,15 @@ impl Bounds {
         ..Bounds::V1
     };
 
+    /// V1 plus comma-joined `FROM` lists, **and** joins — the combination is the point, since
+    /// the divergence is about how a comma-join and an explicit join bind relative to each other.
+    /// One of the two axes that cannot be varied entirely alone.
+    pub const V1_COMMA_JOINS: Bounds = Bounds {
+        comma_joins: true,
+        joins: true,
+        ..Bounds::V1
+    };
+
     /// V1 plus joins. One axis, as always.
     pub const V1_JOINS: Bounds = Bounds {
         joins: true,
@@ -371,6 +396,10 @@ impl Bounds {
         multi_group_by: true,
         case_expressions: true,
         indexes: true,
+        // **Deliberately OFF in the combined configuration.** The mechanism is already
+        // understood and would flood, as `chained_set_ops` does. It is enabled only in its own
+        // preset, for reproducing and triaging the finding.
+        comma_joins: false,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -448,6 +477,7 @@ impl GenerationAxes for Bounds {
             ("multi-group-by", self.multi_group_by),
             ("case", self.case_expressions),
             ("indexes", self.indexes),
+            ("comma-joins", self.comma_joins),
         ]
     }
 

@@ -76,7 +76,7 @@ impl SqlCase {
     pub fn queried_table(&self) -> Option<&Table> {
         self.schema
             .iter()
-            .find(|table| table.name == self.query.from)
+            .find(|table| table.name == self.query.primary())
     }
 
     /// The rows of the table the query reads.
@@ -86,7 +86,7 @@ impl SqlCase {
     pub fn queried_rows(&self) -> &[Vec<Literal>] {
         self.data
             .iter()
-            .find(|insert| insert.table == self.query.from)
+            .find(|insert| insert.table == self.query.primary())
             .map(|insert| insert.rows.as_slice())
             .unwrap_or_default()
     }
@@ -136,7 +136,9 @@ impl SqlCase {
         // table, padded with `NULL`s. The ordering check inspects the *queried table's* seeded
         // rows, which are no longer what comes back, so — as with grouping and set operations —
         // take the safe answer and sort before comparing.
-        if self.query.join.is_some() {
+        // A comma-join is a cross product, so the rows returned are not the seeded rows of any
+        // one table — the same reason an explicit join disqualifies the check.
+        if self.query.join.is_some() || self.query.from.len() > 1 {
             return false;
         }
 
@@ -206,7 +208,7 @@ impl SqlCase {
                 having: None,
                 distinct: false,
                 projection: vec![Expr::Column(reference("c0")), Expr::Column(reference("c1"))],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: vec![],
@@ -236,7 +238,7 @@ impl SqlCase {
         let _table = self.queried_table().ok_or_else(|| {
             format!(
                 "query reads table {} which is not in the schema",
-                self.query.from
+                self.query.primary()
             )
         })?;
 
@@ -315,7 +317,7 @@ impl SqlCase {
         // Join rules. A self join needs aliases, which the v1 AST cannot express; the joined
         // table's existence and its `ON` predicate's references are covered by `resolve_scopes`.
         if let Some(join) = &self.query.join
-            && join.table == self.query.from
+            && join.table == self.query.primary()
         {
             return Err("a self join needs aliases, which v1 cannot express".to_string());
         }
@@ -335,7 +337,7 @@ impl SqlCase {
             if !branch.right.order_by.is_empty() || branch.right.limit.is_some() {
                 return Err("a set operation's right branch may not order or limit".to_string());
             }
-            if branch.right.from != self.query.from {
+            if branch.right.primary() != self.query.primary() {
                 return Err("both branches must read the same table in v1".to_string());
             }
             // Chaining is permitted to one further level, and no more: two operations is
@@ -351,7 +353,7 @@ impl SqlCase {
                 if !inner.right.order_by.is_empty() || inner.right.limit.is_some() {
                     return Err("no branch of a chain may order or limit".to_string());
                 }
-                if inner.right.from != self.query.from {
+                if inner.right.primary() != self.query.primary() {
                     return Err("every branch must read the same table in v1".to_string());
                 }
             }
@@ -381,17 +383,20 @@ fn resolve_scopes(
     schema: &[Table],
     outer: &[&Table],
 ) -> Result<(), String> {
-    let own = schema
-        .iter()
-        .find(|table| table.name == statement.from)
-        .ok_or_else(|| {
-            format!(
-                "query reads table {}, which is not in the schema",
-                statement.from
-            )
-        })?;
-
-    let mut scope: Vec<&Table> = vec![own];
+    // **Every table in `FROM` is in scope**, not just the first. Before S10 this was a single
+    // table and the list could not exist; a comma-join puts several in scope at once, and a
+    // resolver that saw only the first would reject valid references to the others.
+    let mut scope: Vec<&Table> = Vec::new();
+    for name in &statement.from {
+        let table = schema
+            .iter()
+            .find(|table| table.name == *name)
+            .ok_or_else(|| format!("query reads table {name}, which is not in the schema"))?;
+        scope.push(table);
+    }
+    if scope.is_empty() {
+        return Err("query has an empty FROM clause".to_string());
+    }
     if let Some(join) = &statement.join {
         let joined = schema
             .iter()
@@ -430,7 +435,9 @@ fn resolve_scopes(
         if !resolves(reference) {
             return Err(format!(
                 "{}.{} is not in scope for the query over {}",
-                reference.table, reference.column, statement.from
+                reference.table,
+                reference.column,
+                statement.from.join(", ")
             ));
         }
     }
@@ -481,7 +488,7 @@ mod tests {
                     table: "t0".to_string(),
                     column: "c0".to_string(),
                 })],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: vec![],
@@ -668,7 +675,7 @@ mod tests {
                 having: None,
                 distinct: false,
                 projection: vec![Expr::Column(inner_column.clone())],
-                from: "t1".to_string(),
+                from: vec!["t1".to_string()],
                 join: None,
                 set_op: None,
                 group_by: vec![],

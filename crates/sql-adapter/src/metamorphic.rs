@@ -1083,7 +1083,7 @@ mod tests {
                 having: None,
                 distinct: false,
                 projection: vec![Expr::Column(column("t0", "c0"))],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: Vec::new(),
@@ -1094,7 +1094,7 @@ mod tests {
                         having: None,
                         distinct: false,
                         projection: vec![Expr::Column(column("t1", "c0"))],
-                        from: "t1".to_string(),
+                        from: vec!["t1".to_string()],
                         join: None,
                         set_op: None,
                         group_by: Vec::new(),
@@ -1174,7 +1174,7 @@ mod tests {
                     table: "t0".to_string(),
                     column: "c0".to_string(),
                 })],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: Vec::new(),
@@ -1266,7 +1266,7 @@ mod tests {
                     table: "t0".to_string(),
                     column: "c0".to_string(),
                 })],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: Vec::new(),
@@ -1402,7 +1402,7 @@ mod tests {
                 having,
                 distinct: false,
                 projection: vec![Expr::Column(key.clone()), sum()],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: vec![key.clone()],
@@ -1569,7 +1569,7 @@ mod tests {
                 having: None,
                 distinct: false,
                 projection: vec![Expr::Column(column("t0", "k"))],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: Vec::new(),
@@ -1580,7 +1580,7 @@ mod tests {
                         having: None,
                         distinct: false,
                         projection: vec![Expr::Column(column("t1", "v"))],
-                        from: "t1".to_string(),
+                        from: vec!["t1".to_string()],
                         join: None,
                         set_op: None,
                         group_by: Vec::new(),
@@ -1663,7 +1663,7 @@ mod tests {
                         arg: None,
                     },
                 ],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: vec![column("a"), column("b")],
@@ -1780,7 +1780,7 @@ mod tests {
                 having: None,
                 distinct: false,
                 projection: vec![case_expr(otherwise)],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: Vec::new(),
@@ -1887,6 +1887,110 @@ mod tests {
             }
         }
         assert!(checked > 100, "only {checked} indexed comparisons ran");
+    }
+
+    /// **The comma-join precedence divergence, now expressible as a `SqlCase`.**
+    ///
+    /// This is the case `examples/join_precedence_probe.rs` found in raw SQL. Until S10 it could
+    /// not be built through the AST at all — `SelectStmt::from` held a single table — so the one
+    /// real divergence this project has could not be minimized, signatured or triaged. This test
+    /// asserts it now *can* be, and that it still diverges.
+    ///
+    /// SQLite's own documentation says which side is wrong (`SPECS.md` §2.11): it gives all join
+    /// operators equal precedence left to right, while the comma should bind loosest.
+    #[test]
+    fn the_comma_join_divergence_is_expressible_and_still_diverges() {
+        use crate::schema::{BinaryOp, Column, InsertRows, JoinKind, Literal, SqlType, Table};
+
+        let table = |name: &str, column: &str, value: i64| {
+            (
+                Table {
+                    name: name.to_string(),
+                    columns: vec![Column {
+                        name: column.to_string(),
+                        sql_type: SqlType::Integer,
+                    }],
+                },
+                InsertRows {
+                    table: name.to_string(),
+                    rows: vec![vec![Literal::Integer(value)]],
+                },
+            )
+        };
+        let (a, a_rows) = table("a", "x", 1);
+        let (b, b_rows) = table("b", "y", 2);
+        let (c, c_rows) = table("c", "z", 3);
+        let column = |t: &str, col: &str| ColumnRef {
+            table: t.to_string(),
+            column: col.to_string(),
+        };
+
+        let case = SqlCase {
+            schema: vec![a, b, c],
+            indexes: Vec::new(),
+            data: vec![a_rows, b_rows, c_rows],
+            query: SelectStmt {
+                having: None,
+                distinct: false,
+                projection: vec![
+                    Expr::Column(column("a", "x")),
+                    Expr::Column(column("b", "y")),
+                    Expr::Column(column("c", "z")),
+                ],
+                // The construct: two tables comma-joined, then an explicit RIGHT JOIN.
+                from: vec!["a".to_string(), "b".to_string()],
+                join: Some(crate::schema::Join {
+                    kind: JoinKind::Right,
+                    table: "c".to_string(),
+                    on: Expr::Binary {
+                        op: BinaryOp::Equal,
+                        left: Box::new(Expr::Column(column("b", "y"))),
+                        right: Box::new(Expr::Column(column("c", "z"))),
+                    },
+                }),
+                set_op: None,
+                group_by: Vec::new(),
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        // **It must be a valid case**, not merely constructible — resolution now has to place
+        // every `FROM` table in scope, which it could not do when `from` was a single name.
+        assert!(
+            case.validate().is_ok(),
+            "the case does not validate: {:?}",
+            case.validate()
+        );
+        let sql = case.statements(crate::render::Dialect::Sqlite).join(";\n");
+        // Checked structurally rather than against an exact spelling: the renderer emits
+        // `RIGHT OUTER JOIN`, and pinning the full string would make this test about the
+        // renderer's word choice instead of about the construct.
+        assert!(
+            sql.contains(r#"FROM "a", "b" "#) && sql.contains(r#"JOIN "c""#),
+            "rendered FROM is not a comma-join followed by an explicit join:\n{sql}"
+        );
+
+        let sqlite = SqliteImpl.run(&case).expect("sqlite runs the case");
+        let duckdb = DuckDbImpl.run(&case).expect("duckdb runs the case");
+
+        // SQLite: `(a, b) RIGHT JOIN c` — the cross join happens first, so `a`'s column is
+        // nulled along with `b`'s. DuckDB: `a CROSS JOIN (b RIGHT JOIN c)` — `a` survives.
+        assert_eq!(
+            sqlite,
+            SqlOutcome::Rows(vec![vec![Cell::Null, Cell::Null, Cell::Integer(3)]]),
+            "sqlite no longer parses comma-joins left-to-right; SPECS §2.11 may be stale"
+        );
+        assert_eq!(
+            duckdb,
+            SqlOutcome::Rows(vec![vec![Cell::Integer(1), Cell::Null, Cell::Integer(3)]]),
+            "duckdb no longer binds the comma loosest; SPECS §2.11 may be stale"
+        );
+        assert_ne!(
+            sqlite, duckdb,
+            "the engines agree — the divergence has gone"
+        );
     }
 
     /// Build a grouped result: each entry is a group key followed by its aggregate values,

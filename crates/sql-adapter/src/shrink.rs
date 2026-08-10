@@ -133,7 +133,7 @@ impl Shrink for SqlCase {
         // Drop a table the query does not read. Two-table schemas are common and the second
         // table is usually irrelevant to the failure.
         for (index, table) in self.schema.iter().enumerate() {
-            if table.name != self.query.from {
+            if !self.query.from.contains(&table.name) {
                 let mut candidate = self.clone();
                 candidate.schema.remove(index);
                 candidate.data.retain(|insert| insert.table != table.name);

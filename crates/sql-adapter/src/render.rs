@@ -136,7 +136,16 @@ pub fn render_select(query: &SelectStmt, dialect: Dialect) -> String {
         "SELECT {}{} FROM {}",
         if query.distinct { "DISTINCT " } else { "" },
         projection.join(", "),
-        quote_identifier(&query.from)
+        // Comma-separated, and **this order is the construct under test**: SQLite parses
+        // `a, b RIGHT JOIN c` as `(a, b) RIGHT JOIN c` while the standard binds the comma
+        // loosest (`SPECS.md` §2.11). Rendering must not add parentheses that would settle the
+        // question the query exists to ask.
+        query
+            .from
+            .iter()
+            .map(|name| quote_identifier(name))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     // The join goes on the `FROM` clause, before `WHERE`. Both engines spell all four kinds
@@ -511,7 +520,7 @@ mod tests {
                 having: None,
                 distinct: false,
                 projection: vec![Expr::Literal(Literal::Integer(1))],
-                from: "t0".to_string(),
+                from: vec!["t0".to_string()],
                 join: None,
                 set_op: None,
                 group_by: vec![],

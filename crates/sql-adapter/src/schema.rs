@@ -700,6 +700,7 @@ pub enum Direction {
 /// legal SQL, but whether an order is *total* has to be decidable from the case, and that
 /// is far easier to establish for a column whose values are sitting in the seed data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+
 pub struct OrderKey {
     pub column: ColumnRef,
     pub direction: Direction,
@@ -818,8 +819,25 @@ pub struct SelectStmt {
     pub distinct: bool,
     /// What to return. Never empty — `SELECT` with nothing to select is not a case.
     pub projection: Vec<Expr>,
-    /// The single table read from.
-    pub from: String,
+    /// The tables in the `FROM` clause, comma-joined.
+    ///
+    /// **Never empty**, and the first entry is the *primary* table — the one predicates and
+    /// projections are built against. Additional entries are comma-joins, i.e. cross products.
+    ///
+    /// # Why this is a list rather than a single table
+    ///
+    /// It was a single `String` until S10. The restriction was deliberate and its stated reason
+    /// was *"so a case never depends on the associativity of chained joins"* — the same reason
+    /// set operations are limited to one. **Both restrictions turned out to hide a divergence**,
+    /// and both for the same underlying cause: precedence.
+    ///
+    /// SQLite documents its own parser as getting comma-join precedence wrong (`SPECS.md`
+    /// §2.11), and measurement confirms it — `FROM a, b RIGHT JOIN c` yields `(NULL, NULL, 3)` on
+    /// SQLite against `(1, NULL, 3)` on DuckDB. That case **could not be built at all** while
+    /// this field was a `String`, so the one real finding this project has could not be minimized,
+    /// signatured or triaged. Widening it is the prerequisite for using the finding, not merely
+    /// another axis.
+    pub from: Vec<String>,
     /// `WHERE`, if any.
     pub filter: Option<Expr>,
     /// A join with one other table, if any.
@@ -862,6 +880,30 @@ pub struct SelectStmt {
     /// honestly excuse. The generator enforces the pairing; `SqlCase::validate` will check
     /// it, so a hand-built or shrunk case cannot slip past.
     pub limit: Option<u32>,
+}
+
+impl SelectStmt {
+    /// The **primary** table: the first entry of `FROM`, which predicates and projections are
+    /// built against. Additional entries are comma-joins.
+    ///
+    /// Returns `""` rather than panicking when `FROM` is empty. An empty `FROM` is not valid SQL
+    /// and [`crate::ast::SqlCase::validate`] rejects it — but this is a fuzzer, and a case that
+    /// slipped through should make a lookup fail cleanly rather than abort a campaign hours in.
+    pub fn primary(&self) -> &str {
+        self.from.first().map(String::as_str).unwrap_or_default()
+    }
+
+    /// Every table in scope for this query: the `FROM` list plus any joined table.
+    ///
+    /// Name resolution needs all of them, and before S10 "all of them" was at most two and could
+    /// be written out by hand at each site. With a comma-join list it cannot.
+    pub fn tables_in_scope(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.from.iter().map(String::as_str).collect();
+        if let Some(join) = &self.join {
+            names.push(&join.table);
+        }
+        names
+    }
 }
 
 impl SelectStmt {
@@ -1060,7 +1102,7 @@ mod tests {
             having: None,
             distinct: false,
             projection: vec![Expr::Column(column_ref("a"))],
-            from: "t".to_string(),
+            from: vec!["t".to_string()],
             join: None,
             set_op: None,
             group_by: vec![],
