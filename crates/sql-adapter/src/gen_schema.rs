@@ -359,6 +359,35 @@ impl Bounds {
         ..Bounds::V1
     };
 
+    /// V1 plus **large tables and indexes together**, because they are only meaningful together.
+    ///
+    /// # Why 2,000 rows, and why paired
+    ///
+    /// S9.2 measured no yield from row count alone (1×10⁻⁴) and the generator has run at eight
+    /// rows ever since. But that measurement excluded joins, and it tested size *without*
+    /// indexes — while DuckDB documents its ART index serving queries at **"< 0.1% selectivity"**
+    /// (`SPECS.md` §3.13). Eight rows cannot reach 0.1% of anything: one row out of eight is
+    /// 12.5%, so the index path the engine documents was unreachable by construction. At 2,000
+    /// rows a single matching row is 0.05%, which clears the documented threshold with margin.
+    ///
+    /// **Testing the two apart is what hid this**, and it is the same shape as the two
+    /// subset restrictions that hid divergences at S9 and S10.4: each axis looked unproductive
+    /// alone because the thing that makes it productive was switched off.
+    ///
+    /// # What it costs
+    ///
+    /// Minimization was quadratic in row count until S10.7 — 15.3 s to minimize a 2,000-row case
+    /// against 1 ms at eight — because the shrinker built one candidate clone per row and per
+    /// cell. Bounded sampling above `ROW_FIRST_THRESHOLD` brought that to 201 ms, near-linear.
+    /// **This preset is not usable without that fix**, which is why `PENDING` 2.17 named a row
+    /// count rise as the trigger for un-parking it.
+    pub const V1_LARGE: Bounds = Bounds {
+        max_rows: 2_000,
+        indexes: true,
+        joins: true,
+        ..Bounds::V1
+    };
+
     /// V1 plus comma-joined `FROM` lists, **and** joins — the combination is the point, since
     /// the divergence is about how a comma-join and an explicit join bind relative to each other.
     /// One of the two axes that cannot be varied entirely alone.
@@ -613,7 +642,7 @@ pub fn generate_data(rng: &mut SeededRng, tables: &[Table], bounds: Bounds) -> V
     tables
         .iter()
         .map(|table| {
-            let row_count = rng.random_range(0..=bounds.max_rows);
+            let row_count = draw_row_count(rng, bounds.max_rows);
             let rows = (0..row_count)
                 .map(|_| {
                     table
@@ -630,6 +659,51 @@ pub fn generate_data(rng: &mut SeededRng, tables: &[Table], bounds: Bounds) -> V
             }
         })
         .collect()
+}
+
+/// How many rows this table gets, given the configured maximum.
+///
+/// # Uniform is right for small tables and wrong for large ones
+///
+/// Drawing uniformly from `0..=max_rows` is fine while the maximum is eight: every size from
+/// empty to full is common, and the corpus carries both. At `max_rows = 2000` the same draw
+/// gives a mean of a thousand and makes small tables vanishingly rare — **measured: 4 of 2,000
+/// cases were totally ordered, against 42% at eight rows.**
+///
+/// That matters because total ordering gates real axes. A total order requires every value in
+/// the sorted column to be distinct, and with `NULL_PERCENT` at 25 two `NULL`s tie, so beyond a
+/// few dozen rows a totally-ordered case is not merely rare but **structurally impossible**.
+/// `LIMIT`, `row_number` and `ROWS` frames are all gated on it, so a uniformly-drawn large
+/// corpus silently switches them off — a monoculture, which is exactly the corpus-shape failure
+/// this project has recorded four times.
+///
+/// # So: log-uniform above the small regime
+///
+/// Pick an order of magnitude first, then a size within it. Small tables stay common, large ones
+/// still occur, and one corpus carries both regimes instead of one.
+///
+/// **Gated on `max_rows`** so every preset that existed before S10.7 draws exactly as it did —
+/// changing the distribution for `Bounds::V1` would silently invalidate every corpus statistic
+/// and yield figure measured in phases S1 through S10.
+fn draw_row_count(rng: &mut SeededRng, max_rows: usize) -> usize {
+    const UNIFORM_UP_TO: usize = 64;
+    if max_rows <= UNIFORM_UP_TO {
+        return rng.random_range(0..=max_rows);
+    }
+
+    // `ilog2` of a positive number; `max_rows` is > 64 here so it is safe.
+    let top = max_rows.ilog2() as usize;
+    let magnitude = rng.random_range(0..=top);
+    // **The top magnitude uses `max_rows` itself, not `2^top`.** Rounding down would quietly cap
+    // the corpus below the configured maximum — at `max_rows = 2000`, `ilog2` is 10 and `2^10`
+    // is 1024, so nearly half the requested range would never be generated and the preset's
+    // stated row count would be fiction.
+    let ceiling = if magnitude == top {
+        max_rows
+    } else {
+        1usize << magnitude
+    };
+    rng.random_range(0..=ceiling)
 }
 
 /// One value of the given type — `NULL` a quarter of the time, otherwise usually a value
@@ -672,6 +746,67 @@ pub fn generate_literal(rng: &mut SeededRng, sql_type: SqlType) -> Literal {
         SqlType::Decimal | SqlType::Boolean => {
             unreachable!("{sql_type:?} is not generated in v1; see SqlType::GENERATED")
         }
+    }
+}
+
+#[cfg(test)]
+mod row_count_tests {
+    use super::*;
+    use diff_fuzzer_core::SeededRng;
+
+    /// A large-row preset must carry **both** regimes, not just the big one.
+    ///
+    /// The first attempt drew uniformly and produced a monoculture — 4 of 2,000 cases totally
+    /// ordered — which silently disabled every axis gated on total ordering. This pins the shape
+    /// that fixed it: small tables common, large tables present, and the configured maximum
+    /// actually reachable.
+    #[test]
+    fn a_large_maximum_still_produces_small_tables() {
+        let mut rng = SeededRng::from_seed(1);
+        let counts: Vec<usize> = (0..4_000)
+            .map(|_| draw_row_count(&mut rng, 2_000))
+            .collect();
+
+        let small = counts.iter().filter(|count| **count <= 8).count();
+        let large = counts.iter().filter(|count| **count > 1_024).count();
+
+        assert!(
+            small * 10 > counts.len(),
+            "small tables should stay common, got {small} of {}",
+            counts.len(),
+        );
+        assert!(
+            large > 0,
+            "the corpus must still reach past 1024 rows, or the index selectivity this preset \
+             exists for is never tested",
+        );
+        assert!(
+            counts.iter().all(|count| *count <= 2_000),
+            "the configured maximum must be respected",
+        );
+    }
+
+    /// Presets that predate S10.7 must draw exactly as they did — the distribution change is
+    /// gated on `max_rows`, and a regression here would invalidate every corpus figure measured
+    /// in earlier phases.
+    #[test]
+    fn small_maxima_are_drawn_uniformly_as_before() {
+        let mut rng = SeededRng::from_seed(9);
+        let counts: Vec<usize> = (0..2_000).map(|_| draw_row_count(&mut rng, 8)).collect();
+
+        for size in 0..=8usize {
+            assert!(
+                counts.contains(&size),
+                "a uniform draw over 0..=8 should reach {size}",
+            );
+        }
+        // Uniform over nine outcomes: each should land near 1/9 of the draws. A wide band,
+        // because this asserts "not skewed", not a precise rate.
+        let empties = counts.iter().filter(|count| **count == 0).count();
+        assert!(
+            (140..=300).contains(&empties),
+            "empty tables should be ~1/9 of a uniform draw, got {empties} of 2000",
+        );
     }
 }
 

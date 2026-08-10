@@ -81,6 +81,7 @@ fn main() {
         Some("case") => sql_adapter::gen_schema::Bounds::V1_CASE,
         Some("window") => sql_adapter::gen_schema::Bounds::V1_WINDOW,
         Some("indexes") => sql_adapter::gen_schema::Bounds::V1_INDEXES,
+        Some("large") => sql_adapter::gen_schema::Bounds::V1_LARGE,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
         _ => sql_adapter::gen_schema::Bounds::V1,

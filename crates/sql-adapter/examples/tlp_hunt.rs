@@ -143,6 +143,7 @@ fn main() {
         Some("case") => Bounds::V1_CASE,
         Some("window") => Bounds::V1_WINDOW,
         Some("indexes") => Bounds::V1_INDEXES,
+        Some("large") => Bounds::V1_LARGE,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,
         // **The default is now `V1_ALL`, matching the differential campaign.** It used to be

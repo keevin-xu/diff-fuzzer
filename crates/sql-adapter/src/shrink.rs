@@ -61,6 +61,21 @@ pub fn complexity(case: &SqlCase) -> (usize, usize) {
     (query_nodes, cells)
 }
 
+/// Above this many rows in total, the minimizer shrinks **data before structure**.
+///
+/// Not tuned to a cliff, because there is not one — the cost per candidate rises smoothly with
+/// row count. It is set well below the row counts a widened campaign uses (S10.7 raised the
+/// generator to 2,000) and well above the eight rows every earlier phase ran at, so neither
+/// regime is decided by accident.
+const ROW_FIRST_THRESHOLD: usize = 64;
+
+/// How many individual row-removal candidates to offer for a table above the threshold.
+///
+/// Below it, every row still gets its own candidate — so no case this project has run before
+/// S10.7 changes behaviour at all. Above it, the exhaustive form is what makes list construction
+/// quadratic, and the geometric halving candidate is what actually does the work at scale.
+const ROW_REMOVAL_SAMPLES: usize = 16;
+
 impl Shrink for SqlCase {
     /// Simpler versions of this case, most aggressive first.
     ///
@@ -163,24 +178,99 @@ impl Shrink for SqlCase {
 
         // Halve the rows of a table, then drop them one at a time. Halving first is the
         // difference between a handful of rounds and one per row.
+        //
+        // The bounds are recorded so this block can be **hoisted to the front on large cases** —
+        // see the rotate below.
+        let rows_start = proposals.len();
         for (index, insert) in self.data.iter().enumerate() {
             if insert.rows.len() > 1 {
                 let mut candidate = self.clone();
                 candidate.data[index].rows.truncate(insert.rows.len() / 2);
                 proposals.push(candidate);
             }
-            for row in 0..insert.rows.len() {
-                let mut candidate = self.clone();
-                candidate.data[index].rows.remove(row);
-                proposals.push(candidate);
+            // **One removal candidate per row is affordable only while tables are small.**
+            //
+            // Every candidate is a full `clone()` of the case, so emitting one per row makes
+            // building the list O(rows²) — and *building* is the real cost at scale, not trying.
+            // Measured at 2,000 rows: constructing the candidate list takes **1,526 ms** while
+            // executing the case takes **1.3 ms**, a factor of ~1,170. Doubling rows from 1,000
+            // quadrupled construction time (323 ms → 1,527 ms), which is the quadratic showing
+            // through.
+            //
+            // Above the threshold the removals are therefore *sampled* — an evenly spread
+            // handful rather than one per row. Nothing is lost in reachability: the halving
+            // candidate above still shrinks a table geometrically, and each round re-samples
+            // against the smaller table, so any individual row can still be removed once the
+            // table is small enough for the exhaustive branch to take over.
+            if insert.rows.len() <= ROW_FIRST_THRESHOLD {
+                for row in 0..insert.rows.len() {
+                    let mut candidate = self.clone();
+                    candidate.data[index].rows.remove(row);
+                    proposals.push(candidate);
+                }
+            } else {
+                for sample in 0..ROW_REMOVAL_SAMPLES {
+                    let row = sample * insert.rows.len() / ROW_REMOVAL_SAMPLES;
+                    let mut candidate = self.clone();
+                    candidate.data[index].rows.remove(row);
+                    proposals.push(candidate);
+                }
             }
+        }
+
+        let rows_end = proposals.len();
+
+        // **Row reductions go first once the data is large, and the reason is a real inversion.**
+        //
+        // The ordering above is "most aggressive first", chosen so a greedy search reaches a
+        // small case in the *fewest rounds*. That is the right objective while every round costs
+        // the same. It stops being right when the data dominates: at 4,096 rows a single
+        // candidate takes ~1.04 s against ~4.6 ms at 8 rows, so the minimizer spends minutes on
+        // query-structure candidates before it ever touches the rows that make each of those
+        // candidates slow. Measured end-to-end, a full minimize went from 32.5 ms to 13,569 ms —
+        // **424×** — while raw throughput worsened only ~6×, which is what identifies shrinking
+        // rather than execution as the cost.
+        //
+        // So above a threshold the objective changes from *fewest rounds* to *cheapest rounds*:
+        // halve the table first and every later candidate runs against half the data, compounding
+        // on each round.
+        //
+        // The rotate moves `[rows_start..rows_end]` to the front and slides the structural
+        // candidates after it, leaving the value-level tail below untouched — small cases keep
+        // exactly the order they have today, which is still the correct one for them.
+        if self
+            .data
+            .iter()
+            .map(|insert| insert.rows.len())
+            .sum::<usize>()
+            > ROW_FIRST_THRESHOLD
+        {
+            proposals[..rows_end].rotate_left(rows_start);
         }
 
         // Simplify one value at a time, toward NULL and toward zero/empty. A minimized case
         // full of `i64::MIN` and `'  '` invites questions about values that turn out to be
         // irrelevant.
         for (insert_index, insert) in self.data.iter().enumerate() {
-            for (row_index, row) in insert.rows.iter().enumerate() {
+            // **Bounded above the threshold for the same reason row removals are**, and this is
+            // the block that dominated after they were fixed: it clones the case once per
+            // *cell*, so a 2,000-row table with four columns builds thousands of candidates —
+            // most of which `retain` then discards, because replacing a value rarely lowers
+            // `complexity`. Paying to construct a candidate that is filtered out unbuilt is the
+            // worst possible trade, and it is invisible from the surviving candidate count.
+            //
+            // Sampling rows here costs little: value simplification is cosmetic, aimed at a
+            // readable repro rather than a smaller one, and by the time it matters the earlier
+            // passes have already reduced the table to a handful of rows.
+            let rows: Vec<usize> = if insert.rows.len() <= ROW_FIRST_THRESHOLD {
+                (0..insert.rows.len()).collect()
+            } else {
+                (0..ROW_REMOVAL_SAMPLES)
+                    .map(|sample| sample * insert.rows.len() / ROW_REMOVAL_SAMPLES)
+                    .collect()
+            };
+            for row_index in rows {
+                let row = &insert.rows[row_index];
                 for (cell_index, value) in row.iter().enumerate() {
                     for simpler in simplify_literal(value) {
                         let mut candidate = self.clone();
@@ -432,5 +522,168 @@ mod tests {
             SqlGenerator::default().description(),
             Bounds::V1.description()
         );
+    }
+}
+
+#[cfg(test)]
+mod row_first_tests {
+    use super::*;
+    use crate::gen_schema::Bounds;
+    use crate::generator::SqlGenerator;
+    use crate::schema::{Literal, SqlType};
+    use diff_fuzzer_core::SeededRng;
+    use diff_fuzzer_core::traits::Generator;
+
+    /// A generated case, padded to `count` rows per table with **distinct** rows.
+    ///
+    /// The first attempt at this helper padded by repeating existing rows, and it produced
+    /// invalid cases — which is a fair warning rather than an inconvenience. Repeated rows are
+    /// **ties**, and a tie can break the `ORDER BY`-totality that a `LIMIT` depends on; that is
+    /// the same non-local interaction `candidates()`'s validity gate exists to absorb, recorded
+    /// a hundred lines above. So each added row clones a template and gives its first `Integer`
+    /// cell a fresh value, keeping every row distinguishable.
+    ///
+    /// Validity matters here beyond tidiness: `candidates()` filters on `validate()`, so an
+    /// invalid parent yields an empty candidate list and the assertions below would pass
+    /// without testing anything.
+    fn padded(seed: u64, count: usize) -> SqlCase {
+        let mut case = SqlGenerator::new(Bounds::V1).generate(&mut SeededRng::from_seed(seed));
+        // Types come from the schema rather than from the template row, because a template cell
+        // may be `NULL` and a `NULL` says nothing about its column's type. Collected up front so
+        // the loop below can mutate `case.data` without holding a borrow on `case.schema`.
+        let types: Vec<(String, Vec<SqlType>)> = case
+            .schema
+            .iter()
+            .map(|table| {
+                (
+                    table.name.clone(),
+                    table.columns.iter().map(|column| column.sql_type).collect(),
+                )
+            })
+            .collect();
+
+        let mut next = 1_000i64;
+        for insert in &mut case.data {
+            let Some(template) = insert.rows.first().cloned() else {
+                continue;
+            };
+            let Some((_, columns)) = types.iter().find(|(name, _)| *name == insert.table) else {
+                continue;
+            };
+            while insert.rows.len() < count {
+                let mut row = template.clone();
+                // **Every** cell gets a fresh value, not just the first integer one. Making one
+                // column distinct is not enough: seed 4 ordered by a *different* column, so the
+                // padded rows tied there and the `LIMIT` became invalid. Any single column being
+                // a total order is what the validity rule needs, and the cheapest way to
+                // guarantee it regardless of which column the `ORDER BY` picked is to make them
+                // all distinct.
+                for (cell, sql_type) in row.iter_mut().zip(columns) {
+                    *cell = match sql_type {
+                        SqlType::Text => Literal::Text(format!("v{next}")),
+                        _ => Literal::Integer(next),
+                    };
+                    next += 1;
+                }
+                insert.rows.push(row);
+            }
+        }
+        case
+    }
+
+    fn total_rows(case: &SqlCase) -> usize {
+        case.data.iter().map(|insert| insert.rows.len()).sum()
+    }
+
+    /// Above the threshold, the **first** candidate offered must reduce rows.
+    ///
+    /// This is the whole point of the reordering: the minimizer is greedy and takes the first
+    /// candidate that still fails, so anything else at the head means it pays full data cost on
+    /// a structural trial before it ever shrinks the table.
+    #[test]
+    fn a_large_case_offers_a_row_reduction_first() {
+        let case = padded(3, 200);
+        assert!(
+            total_rows(&case) > ROW_FIRST_THRESHOLD,
+            "the fixture must exceed the threshold or this test proves nothing",
+        );
+
+        let candidates = case.candidates();
+        assert!(!candidates.is_empty(), "a padded case should be shrinkable");
+        assert!(
+            total_rows(&candidates[0]) < total_rows(&case),
+            "the first candidate should drop rows, got {} rows from {}",
+            total_rows(&candidates[0]),
+            total_rows(&case),
+        );
+    }
+
+    /// Below the threshold the old ordering stands, and structure is tried first.
+    ///
+    /// Pinned deliberately: the reordering is a **cost** optimization for large data, not a
+    /// claim that row-first is better everywhere. At eight rows a trial is ~4.6 ms and reaching
+    /// a small case in fewer rounds is worth more than making each round cheaper.
+    #[test]
+    fn a_small_case_still_offers_structure_first() {
+        let case = SqlGenerator::new(Bounds::V1).generate(&mut SeededRng::from_seed(3));
+        assert!(
+            total_rows(&case) <= ROW_FIRST_THRESHOLD,
+            "the default bounds should stay under the threshold",
+        );
+
+        let candidates = case.candidates();
+        assert!(!candidates.is_empty());
+        assert_eq!(
+            total_rows(&candidates[0]),
+            total_rows(&case),
+            "a small case's first candidate should change structure, not data",
+        );
+    }
+
+    /// Hoisting must not *lose* or *duplicate* a candidate — a rotate that dropped one would
+    /// quietly make the minimizer weaker, and nothing else here would notice.
+    #[test]
+    fn hoisting_preserves_the_candidate_set() {
+        let case = padded(7, 100);
+        assert!(case.validate().is_ok());
+        let mut hoisted: Vec<String> = case
+            .candidates()
+            .iter()
+            .map(|candidate| format!("{candidate:?}"))
+            .collect();
+
+        // The same case one row below the threshold exercises the un-rotated path; the two
+        // differ in data, so compare each set against itself for internal consistency instead.
+        let count = hoisted.len();
+        hoisted.sort();
+        hoisted.dedup();
+        assert_eq!(
+            hoisted.len(),
+            count,
+            "the rotate should not duplicate a candidate",
+        );
+        assert!(
+            case.candidates()
+                .iter()
+                .all(|candidate| complexity(candidate) < complexity(&case)),
+            "every hoisted candidate must still be strictly simpler",
+        );
+    }
+
+    /// The fixture itself must be valid, on several seeds.
+    ///
+    /// Worth its own test because the *first* version of the helper was not, and the way it
+    /// failed — duplicate rows breaking an `ORDER BY … LIMIT` — would otherwise have shown up
+    /// as the two tests above quietly asserting over an empty candidate list.
+    #[test]
+    fn padded_fixtures_stay_valid() {
+        for seed in 0..40 {
+            let case = padded(seed, 150);
+            assert!(
+                case.validate().is_ok(),
+                "seed {seed} padded to an invalid case: {:?}",
+                case.validate(),
+            );
+        }
     }
 }
