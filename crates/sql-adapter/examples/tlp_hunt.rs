@@ -179,8 +179,30 @@ fn main() {
     let mut having_checks = 0usize;
     let mut index_checks = 0usize;
 
+    // **Progress every 25,000 cases, flushed.** This is the third runner to need it and the
+    // third time the defect has been the same: report only at the end, and an interrupted run
+    // leaves nothing. `axis_table` lost a 60-minute sweep to it; `hunt` lost ~500,000 cases.
+    // This runner then ran a 58-minute metamorphic campaign that could show none of its work.
+    //
+    // The interval is 25,000 rather than `hunt`'s 100,000 because this runner is ~4x slower per
+    // case — it executes up to eight queries per case per engine — so an equal *time* between
+    // lines means a smaller count.
+    let progress_every = 25_000usize;
+
     let started = Instant::now();
     for seed in 0..total as u64 {
+        if seed > 0 && (seed as usize).is_multiple_of(progress_every) {
+            let done = seed as usize;
+            let rate = done as f64 / started.elapsed().as_secs_f64();
+            println!(
+                "  … {done:>8} cases | tlp {tlp_checks} (rows {rows_checks} agg \
+                 {aggregate_checks} grp {grouped_checks} hav {having_checks}) | index \
+                 {index_checks} | norec {norec_checks} | unchecked {skipped} | \
+                 **violations {violations}** | {rate:.0}/sec"
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+
         let case = generator.generate(&mut SeededRng::from_seed(seed));
 
         // The three forms are mutually exclusive by construction: `partition` refuses
