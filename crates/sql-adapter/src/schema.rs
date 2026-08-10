@@ -837,6 +837,7 @@ pub struct SelectStmt {
     /// this field was a `String`, so the one real finding this project has could not be minimized,
     /// signatured or triaged. Widening it is the prerequisite for using the finding, not merely
     /// another axis.
+    #[serde(deserialize_with = "one_or_many_tables")]
     pub from: Vec<String>,
     /// `WHERE`, if any.
     pub filter: Option<Expr>,
@@ -882,6 +883,39 @@ pub struct SelectStmt {
     pub limit: Option<u32>,
 }
 
+/// Accept a `FROM` clause written either as a single table name or as a list.
+///
+/// # Why this exists, and why it is not merely convenience
+///
+/// Findings on disk store the **whole `SqlCase`**, not the seed. [`crate::ast::SqlCase`] explains
+/// why: a seed reproduces a case only for the exact generator that produced it, and the tensor
+/// domain lost 810 of 814 recorded findings to that. Storing the case makes a finding durable
+/// across generator changes.
+///
+/// **Widening `from` from `String` to `Vec<String>` broke that guarantee** — every finding
+/// recorded before S10 became unloadable, so the durability held against *generator* changes and
+/// not against *AST* changes, which this project makes constantly. Accepting both spellings
+/// restores it for six lines.
+///
+/// The reverse direction needs nothing: new findings serialise as a list, and nothing older reads
+/// them.
+fn one_or_many_tables<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(name) => vec![name],
+        OneOrMany::Many(names) => names,
+    })
+}
+
 impl SelectStmt {
     /// The **primary** table: the first entry of `FROM`, which predicates and projections are
     /// built against. Additional entries are comma-joins.
@@ -904,9 +938,7 @@ impl SelectStmt {
         }
         names
     }
-}
 
-impl SelectStmt {
     /// Every expression this statement contains, at its own level.
     fn expressions(&self) -> impl Iterator<Item = &Expr> {
         self.projection

@@ -233,6 +233,76 @@ mod tests {
     use super::*;
     use crate::signature::signature;
 
+    /// A finding recorded **before** `FROM` became a list still loads and still runs.
+    ///
+    /// # The guarantee this protects
+    ///
+    /// Findings store the whole `SqlCase`, not the seed, because a seed reproduces a case only
+    /// for the exact generator that made it — the tensor domain lost 810 of 814 findings to
+    /// that. Storing the case is what makes a finding durable.
+    ///
+    /// **Widening `SelectStmt::from` from `String` to `Vec<String>` silently broke that**: every
+    /// finding on disk became unloadable. The durability held against *generator* changes and
+    /// not against *AST* changes, which this project makes constantly — thirteen axes so far.
+    /// A compatibility deserializer restores it; this test is what says so.
+    #[test]
+    fn a_finding_recorded_before_the_from_clause_became_a_list_still_loads() {
+        // The old spelling, verbatim: `"from": "t1"` rather than `"from": ["t1"]`.
+        let old = r#"{
+          "signature": "chained-set-op/row-count",
+          "kind": "RowCount",
+          "disagreeing": ["sqlite", "duckdb"],
+          "seed": 15,
+          "generator": "sql-v1(tables<=2, columns<=4, rows<=8, depth<=3)",
+          "case": {
+            "schema": [{"name": "t1", "columns": [{"name": "c0", "sql_type": "Integer"}]}],
+            "data": [{"table": "t1", "rows": [[{"Integer": -2}]]}],
+            "query": {
+              "projection": [{"Column": {"table": "t1", "column": "c0"}}],
+              "from": "t1",
+              "filter": null,
+              "join": null,
+              "set_op": null,
+              "group_by": [],
+              "order_by": [],
+              "limit": null,
+              "distinct": false,
+              "having": null
+            },
+            "indexes": []
+          },
+          "minimisation": {"steps": 0, "candidates_tried": 0, "complete": true,
+                           "complexity_before": [1, 1], "complexity_after": [1, 1]},
+          "sql": [],
+          "outputs": [],
+          "environment": {"sqlite": "3.53.2", "duckdb": "v1.5.5", "platform": "historical"},
+          "summary": "historical"
+        }"#;
+
+        let recovered: SqlDivergence =
+            serde_json::from_str(old).expect("a pre-S10 finding must still deserialize");
+
+        // It loads *as a list*, so everything downstream sees the current shape.
+        assert_eq!(recovered.case.query.from, vec!["t1".to_string()]);
+        assert_eq!(recovered.case.query.primary(), "t1");
+
+        // And it is still a runnable case — which is the actual promise, not merely that the
+        // bytes parse.
+        assert!(
+            recovered.case.validate().is_ok(),
+            "a recovered finding must still be a valid case: {:?}",
+            recovered.case.validate()
+        );
+        assert!(
+            recovered
+                .case
+                .statements(Dialect::Sqlite)
+                .iter()
+                .any(|s| s.contains("FROM \"t1\"")),
+            "the recovered case does not render its FROM clause"
+        );
+    }
+
     /// Every relation's violation serialises, round-trips, and gets a **content-derived** name.
     ///
     /// The acceptance criterion for S10.1: before it, only TLP wrote a file. NoREC, `HAVING` and
