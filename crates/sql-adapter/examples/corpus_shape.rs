@@ -18,7 +18,8 @@ use sql_adapter::ast::SqlCase;
 use sql_adapter::gen_schema::Bounds;
 use sql_adapter::generator::SqlGenerator;
 use sql_adapter::metamorphic::{
-    partition, partition_aggregate, partition_grouped, partition_having,
+    indexed_pair, norec, partition, partition_aggregate, partition_grouped, partition_having,
+    windowed_groups,
 };
 use sql_adapter::oracle::SortMode;
 use sql_adapter::schema::{Expr, Literal};
@@ -171,6 +172,21 @@ const FEATURES: &[Feature] = &[
         name: "window function",
         holds: |case| case.has_window(),
     },
+    // **Added at S10.9, and their absence until then was the gap this table exists to catch.**
+    // The "absent construct" guard below can only flag what it knows about, so an axis missing
+    // from this list is invisible to the very check written to notice missing axes.
+    Feature {
+        name: "index present",
+        holds: |case| !case.indexes.is_empty(),
+    },
+    Feature {
+        name: "comma join (multi-table FROM)",
+        holds: |case| case.query.from.len() > 1,
+    },
+    Feature {
+        name: "large table (> 64 rows)",
+        holds: |case| case.data.iter().any(|insert| insert.rows.len() > 64),
+    },
     Feature {
         name: "case expression",
         holds: |case| {
@@ -231,6 +247,24 @@ const INTERACTIONS: &[Feature] = &[
     Feature {
         name: "grouped query over a join",
         holds: |case| !case.query.group_by.is_empty() && case.query.join.is_some(),
+    },
+    // **The S10.7 pairing, checked rather than assumed.** Size and indexes were measured apart
+    // and each looked unproductive; the argument for pairing them is that DuckDB's ART index
+    // serves queries below 0.1% selectivity, which eight rows cannot reach. If this row reads
+    // 0%, that argument is not being tested no matter what the verdict counts say.
+    // **The shape the comma-join axis exists to produce, checked directly.** Both constructs
+    // read healthy alone — 27% comma-joins, 54% joins — while their *combination* was 0%,
+    // because it needs a third table and the budget allowed two. Neither single-construct row
+    // could show that, which is the argument for interaction rows in general.
+    Feature {
+        name: "comma join + explicit join",
+        holds: |case| case.query.from.len() > 1 && case.query.join.is_some(),
+    },
+    Feature {
+        name: "index over a large table",
+        holds: |case| {
+            !case.indexes.is_empty() && case.data.iter().any(|insert| insert.rows.len() > 64)
+        },
     },
     Feature {
         name: "set op over a joined query",
@@ -313,6 +347,9 @@ fn main() {
         Some("having") => Bounds::V1_HAVING,
         Some("case") => Bounds::V1_CASE,
         Some("window") => Bounds::V1_WINDOW,
+        Some("indexes") => Bounds::V1_INDEXES,
+        Some("comma-joins") => Bounds::V1_COMMA_JOINS,
+        Some("large") => Bounds::V1_LARGE,
         _ => Bounds::V1,
     };
 
@@ -347,7 +384,9 @@ fn main() {
     // say. A corpus can be rich in constructs and still be mostly invisible to the second
     // oracle, and that gap is exactly what a combined run needs to know before it starts.
     let (mut rows, mut aggregate, mut grouped, mut having, mut refused) = (0, 0, 0, 0, 0);
+    let (mut indexed, mut no_rec, mut windowed) = (0, 0, 0);
     for case in &cases {
+        // The four TLP forms are mutually exclusive by construction, so this stays a chain.
         if partition_having(case).is_some() {
             having += 1;
         } else if partition(case).is_some() {
@@ -356,18 +395,42 @@ fn main() {
             aggregate += 1;
         } else if partition_grouped(case).is_some() {
             grouped += 1;
-        } else {
+        }
+
+        // **The other three are independent, not alternatives** — a case can be judged by
+        // several at once, and by these even when every TLP form refuses it.
+        let by_index = indexed_pair(case).is_some();
+        let by_norec = norec(case).is_some();
+        let by_window = windowed_groups(case).is_some();
+        indexed += usize::from(by_index);
+        no_rec += usize::from(by_norec);
+        windowed += usize::from(by_window);
+
+        // **`refused` now means "no relation at all applies", which is what the word implied
+        // and did not mean.** It previously counted cases refused by the four TLP forms, and
+        // `judged` was derived as `total - refused` — so every case judgeable *only* by
+        // index-invariance, NoREC or windowed-vs-grouped was reported as unjudged. That is the
+        // headline judgeability figure, the one a campaign is sized against, and it understated
+        // the oracle's reach by exactly the three relations added after this code was written.
+        let by_tlp = partition_having(case).is_some()
+            || partition(case).is_some()
+            || partition_aggregate(case).is_some()
+            || partition_grouped(case).is_some();
+        if !(by_tlp || by_index || by_norec || by_window) {
             refused += 1;
         }
     }
     let judged = total - refused;
-    println!("metamorphic judgeability");
+    println!("metamorphic judgeability (a case may be judged by several relations)");
     for (name, count) in [
-        ("rows", rows),
-        ("whole-table aggregate", aggregate),
-        ("grouped", grouped),
-        ("having", having),
-        ("REFUSED (no predicate/set-op/LIMIT)", refused),
+        ("TLP rows", rows),
+        ("TLP whole-table aggregate", aggregate),
+        ("TLP grouped", grouped),
+        ("TLP having", having),
+        ("index-invariance", indexed),
+        ("NoREC", no_rec),
+        ("windowed-vs-grouped", windowed),
+        ("REFUSED (no relation applies)", refused),
     ] {
         let share = 100.0 * count as f64 / total as f64;
         let bar = "#".repeat((share / 2.5).round() as usize);

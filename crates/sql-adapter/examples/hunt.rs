@@ -20,6 +20,7 @@ use sql_adapter::FINDINGS_ROOT;
 use sql_adapter::ast::SqlCase;
 use sql_adapter::backends::{DuckDbImpl, SqliteImpl};
 use sql_adapter::generator::SqlGenerator;
+use sql_adapter::known::known_comma_join_defect;
 use sql_adapter::normalize::{CanonicalResult, SqlNormalizer};
 use sql_adapter::oracle::{SortMode, SqlDifferentialOracle};
 use sql_adapter::render::Dialect;
@@ -84,8 +85,34 @@ fn main() {
         Some("large") => sql_adapter::gen_schema::Bounds::V1_LARGE,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
-        _ => sql_adapter::gen_schema::Bounds::V1,
+        Some("comma-joins") => sql_adapter::gen_schema::Bounds::V1_COMMA_JOINS,
+        None => sql_adapter::gen_schema::Bounds::V1,
+        // **An unrecognised name is a hard error, not a silent fallback to the default.**
+        //
+        // It read `_ => <default>`, so a typo or a preset this runner had never been taught
+        // about produced a full clean run *under a different configuration than the one named*.
+        // That is not hypothetical: a 30,000-case sweep labelled `comma-joins` ran the baseline
+        // and reported "0 divergences" while the real comma-joins axis diverges at **12%**. The
+        // label goes into the findings directory and into every summary quoting the run, so the
+        // wrong number outlives the command that produced it.
+        //
+        // Listing the valid names in the message matters too — the missing name here *was*
+        // `comma-joins`, and a bare "unknown axis" would not have shown that it was absent
+        // rather than misspelled.
+        Some(unknown) => {
+            eprintln!(
+                "unknown axis {unknown:?}. valid: wide, aggregates, setops, chained, joins, \
+                 comma-joins, not-in, not-in-list, not-in-correlated, distinct, having, \
+                 multi-group-by, case, window, indexes, large, subqueries, all"
+            );
+            std::process::exit(2);
+        }
     };
+
+    // Counted and reported separately from `agreed`: a case suppressed by the catalog is not a
+    // case where the engines agreed, and folding the two together would overstate agreement by
+    // exactly the size of the catalog's reach.
+    let mut known_legal = 0usize;
 
     let generator = SqlGenerator::new(bounds);
     let directory = format!("{FINDINGS_ROOT}/runs/{label}");
@@ -148,6 +175,31 @@ fn main() {
                 }
             }
             Verdict::Diverged(divergence) => {
+                // **The catalogued comma-join defect, filtered here rather than in the oracle.**
+                //
+                // `known_comma_join_defect` was written at S10.4, unit-tested, and **never
+                // called by any runner** — dead code guarding nothing. `PENDING` 2.21 had
+                // predicted the consequence exactly: *"required before any campaign enables
+                // comma-joins, or this one mechanism swamps every run"*. Measured on the fixed
+                // generator, it swamps at **12.0%** — 3,602 of 30,000 cases, two signatures,
+                // both tracing to SQLite's documented parser defect (`SPECS.md` §2.11).
+                //
+                // It cannot live in the `Oracle` seam, and that is structural rather than an
+                // oversight: `legal_difference` judges *outputs*, while this defect is a
+                // property of the *query* — a comma-join and an explicit join binding against
+                // each other. The same mismatch recorded at G-S8. The runner is the first place
+                // that holds both the case and the verdict, so it is where the filter belongs.
+                if let Some(entry) = known_comma_join_defect(&case) {
+                    known_legal += 1;
+                    if known_legal <= 3 {
+                        println!(
+                            "seed {seed}: suppressed as a known legal difference ({})",
+                            entry.name
+                        );
+                    }
+                    continue;
+                }
+
                 diverged += 1;
 
                 // Minimize before recording. A raw generated divergence is a whole database
@@ -228,6 +280,10 @@ fn main() {
     let percent = |count: usize| 100.0 * count as f64 / total as f64;
     println!("verdicts over {total} cases");
     println!("  agreed    {agreed:>7} ({:>5.1}%)", percent(agreed));
+    println!(
+        "  known-legal {known_legal:>5} ({:>5.1}%) — suppressed by the catalog, NOT agreement",
+        percent(known_legal)
+    );
     println!("  diverged  {diverged:>7} ({:>5.1}%)", percent(diverged));
     println!("  skipped   {skipped:>7} ({:>5.1}%)", percent(skipped));
 

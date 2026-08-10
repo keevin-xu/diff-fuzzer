@@ -151,7 +151,28 @@ fn main() {
         // left ~84% of cases unjudged. With the aggregate and grouped forms built, the only
         // remaining refusals are set operations, `LIMIT`, and queries with no `WHERE` — so the
         // two campaigns can now be run over the same surface and their zeros compared directly.
-        _ => Bounds::V1_ALL,
+        None => Bounds::V1_ALL,
+        Some("comma-joins") => Bounds::V1_COMMA_JOINS,
+        // **An unrecognised name is a hard error, not a silent fallback to the default.**
+        //
+        // It read `_ => <default>`, so a typo or a preset this runner had never been taught
+        // about produced a full clean run *under a different configuration than the one named*.
+        // That is not hypothetical: a 30,000-case sweep labelled `comma-joins` ran the baseline
+        // and reported "0 divergences" while the real comma-joins axis diverges at **12%**. The
+        // label goes into the findings directory and into every summary quoting the run, so the
+        // wrong number outlives the command that produced it.
+        //
+        // Listing the valid names in the message matters too — the missing name here *was*
+        // `comma-joins`, and a bare "unknown axis" would not have shown that it was absent
+        // rather than misspelled.
+        Some(unknown) => {
+            eprintln!(
+                "unknown axis {unknown:?}. valid: rows, all, aggregates, setops, chained, \
+                 joins, comma-joins, subqueries, not-in, not-in-list, not-in-correlated, \
+                 distinct, having, multi-group-by, case, window, indexes, large"
+            );
+            std::process::exit(2);
+        }
     };
 
     // The target under test. DuckDB alone by default — see the module docs.

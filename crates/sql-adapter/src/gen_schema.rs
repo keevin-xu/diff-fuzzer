@@ -394,6 +394,19 @@ impl Bounds {
     pub const V1_COMMA_JOINS: Bounds = Bounds {
         comma_joins: true,
         joins: true,
+        // **Three tables, and the axis is worthless without them.** The confirmed divergence is
+        // `SELECT a.x, b.y, c.z FROM a, b RIGHT JOIN c ON b.y = c.z` — a comma-join *and* an
+        // explicit join, which is three tables. At `max_tables = 2` the comma-join consumes both
+        // and `generate_query`'s search for a table that is neither the primary nor the joined
+        // one finds nothing, so the two constructs **never co-occur** and the one shape this
+        // axis exists to produce cannot be built.
+        //
+        // Measured before the fix: 30,000 cases, **zero divergences** — which would have entered
+        // the yield table as evidence that the engines agree on comma-join precedence. They do
+        // not; S10.4 proved otherwise by probe. **This is the second barrier in front of the same
+        // finding**: `from` was a `String` until S10, which made the shape unrepresentable, and
+        // removing that left this one standing.
+        max_tables: 3,
         ..Bounds::V1
     };
 
@@ -589,7 +602,7 @@ const INTERESTING_TEXT: [&str; 6] = ["", "NULL", "'", "a", "A", "  "];
 /// comparisons is the single richest source of engine disagreement in SQL.
 const NULL_PERCENT: u32 = 25;
 
-/// Build a schema: one or two tables, each with a few typed columns.
+/// Build a schema: one to `max_tables` tables, each with a few typed columns.
 ///
 /// Names are positional (`t0`, `c0`) rather than random. A random identifier would add
 /// noise to every minimized repro without testing anything — engines do not care what a
@@ -600,14 +613,35 @@ pub fn generate_schema(rng: &mut SeededRng, bounds: Bounds) -> Vec<Table> {
     // and quietly test joins far less than the run appears to — the same shape of confound
     // that made the first set-op sweep meaningless.
     let table_count = if bounds.joins || bounds.subqueries {
-        // Exactly two. A join needs somewhere to join to, and v1 caps the schema at two
-        // anyway — so this is not a clamp, it is the only value that makes the axis mean
-        // anything.
+        // **At least two — a join needs somewhere to join to — but no longer exactly two.**
+        //
+        // This branch returned a literal `2`, justified by "v1 caps the schema at two anyway, so
+        // this is not a clamp". That reasoning was sound when written and became false the
+        // moment a preset raised `max_tables`: the literal then silently *overrode* the bound,
+        // and `Bounds::V1_COMMA_JOINS` generated two-table schemas while its description
+        // advertised three.
+        //
+        // The cost was not theoretical. The comma-join axis exists to produce
+        // `FROM a, b RIGHT JOIN c`, which needs three tables, and it produced **zero** such
+        // cases in 30,000 — a clean row in the yield table asserting the engines agree on
+        // comma-join precedence, when S10.4 proved by probe that they do not. **This was the
+        // third barrier in front of that one finding**, after `from` being a `String` until S10
+        // and the preset's own table budget.
         debug_assert!(
             bounds.max_tables >= 2,
             "the joins and subqueries axes need a schema of at least two tables"
         );
-        2
+        //
+        // **The two-table case takes no draw at all**, so every preset that predates this change
+        // generates bit-identically. `random_range(2..=2)` would still consume from the stream
+        // and shift every downstream value, silently invalidating the yield figures already
+        // measured for `joins`, `subqueries` and the rest — the same reason the log-uniform row
+        // draw is gated rather than applied globally.
+        if bounds.max_tables <= 2 {
+            2
+        } else {
+            rng.random_range(2..=bounds.max_tables)
+        }
     } else {
         rng.random_range(1..=bounds.max_tables)
     };

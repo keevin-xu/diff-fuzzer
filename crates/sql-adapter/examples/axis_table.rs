@@ -17,16 +17,23 @@
 //!
 //! - **diverged** — the differential oracle's verdict: the two engines disagreed.
 //! - **tlp-viol** — the metamorphic oracle's: one engine contradicted itself.
-//! - **judged** — metamorphic engine-checks actually performed. A low number with zero
+//! - **judged** — metamorphic engine-checks actually performed, across **all six relations**:
+//!   the four TLP forms, index-invariance, NoREC and windowed-vs-grouped. A low number with zero
 //!   violations is much weaker evidence than a high one, and the difference is invisible in the
-//!   violation count alone.
+//!   violation count alone. *This column counted only the TLP forms until S10.8, which made the
+//!   window axis read as entirely unjudged when it was not.*
 //! - **ordered** — the share of totally-ordered queries. **Read this column.** Three widenings
 //!   have silently suppressed ordering while reporting clean agreement, and a fourth did it from
 //!   a size bound. A row whose ordered share collapses is a row whose zero means less.
-//! - **bound** — rule of three, 3/n, on the differential count.
+//! - **bound** — rule of three, 3/n, and **only meaningful on a row that diverged zero times**.
+//!   A row with divergences prints its measured `rate` instead: the rule of three bounds a rate
+//!   from the *absence* of events, so quoting it beside 4,148 of them inverts the reading.
 //!
 //! Run with:
-//!   cargo run --release -p sql-adapter --example axis_table -- [diff cases] [tlp cases]
+//!   cargo run --release -p sql-adapter --example axis_table -- [diff cases] [tlp cases] [only]
+//!
+//! where `only` is an optional comma-separated list of axis-name substrings, so an interrupted
+//! run can be resumed over just the rows it did not reach.
 
 use diff_fuzzer_core::SeededRng;
 use diff_fuzzer_core::traits::{
@@ -36,8 +43,9 @@ use sql_adapter::backends::{DuckDbImpl, SqliteImpl};
 use sql_adapter::gen_schema::Bounds;
 use sql_adapter::generator::SqlGenerator;
 use sql_adapter::metamorphic::{
-    Relation, check, check_aggregate, check_distinct, check_grouped, partition,
-    partition_aggregate, partition_grouped, partition_having,
+    Relation, check, check_aggregate, check_distinct, check_grouped, check_indexed, check_norec,
+    check_windowed_groups, indexed_pair, norec, partition, partition_aggregate, partition_grouped,
+    partition_having, windowed_groups,
 };
 use sql_adapter::normalize::SqlNormalizer;
 use sql_adapter::oracle::{SortMode, SqlDifferentialOracle};
@@ -66,6 +74,27 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
 
+    // **An optional comma-separated subset, because a long table needs to be resumable.**
+    //
+    // This run is ~2.5 hours and the first attempt was killed after 8 of 18 rows. The per-row
+    // flush meant those 8 survived on screen — but with no way to ask for the other 10, the only
+    // option was to re-measure everything, paying 25 minutes to reproduce numbers already in
+    // hand. Printing progress makes a run *inspectable* after an interruption; being able to
+    // name a subset makes it *resumable*, and the two are not the same property.
+    //
+    // Matching is on the substring so `window` selects `window` and `large` selects
+    // `large-rows+indexes`, and an empty or absent argument keeps every axis.
+    let only: Vec<String> = arguments
+        .next()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|name| name.trim().to_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Every axis this domain has, each **alone** against the same baseline. Two of them cannot
     // be varied entirely alone and are labelled so: `having` and `multi-group-by` need
     // aggregates to attach to, so their yield is "given aggregates" and the honest comparison
@@ -85,6 +114,10 @@ fn main() {
         ("having*", Bounds::V1_HAVING),
         ("multi-group-by*", Bounds::V1_MULTI_GROUP_BY),
         ("case", Bounds::V1_CASE),
+        ("indexes", Bounds::V1_INDEXES),
+        ("comma-joins", Bounds::V1_COMMA_JOINS),
+        ("window", Bounds::V1_WINDOW),
+        ("large-rows+indexes", Bounds::V1_LARGE),
     ];
 
     println!("differential: {diff_cases} cases per axis · metamorphic: {tlp_cases} cases per axis");
@@ -99,11 +132,40 @@ fn main() {
         "axis", "diverged", "skipped", "ordered", "cases/s", "tlp-judged", "tlp-viol", "bound"
     );
 
+    let axes: Vec<(&'static str, Bounds)> = axes
+        .into_iter()
+        .filter(|(name, _)| {
+            only.is_empty()
+                || only
+                    .iter()
+                    .any(|wanted| name.to_lowercase().contains(wanted.as_str()))
+        })
+        .collect();
+
+    if axes.is_empty() {
+        // Silently measuring nothing is the worst outcome: it prints a well-formed empty table
+        // that reads as "every axis is clean".
+        eprintln!("no axis matched the requested subset — nothing to measure");
+        return;
+    }
+
     let mut table = Vec::new();
     for (axis, bounds) in axes {
         let row = measure(axis, bounds, diff_cases, tlp_cases);
+        // **The rule of three bounds a rate only when *nothing* was observed.** Printing `3/n`
+        // beside a row that diverged says the rate is below `3/n` when it is demonstrably far
+        // above it: `chained-set-ops` diverged 4,148 times in 30,000 and still printed
+        // `1.0e-4`, understating the observed rate of 13.8% by three orders of magnitude. A
+        // reader scanning the column for the strongest claim would have taken the worst row for
+        // the best. On a row with events the measured rate is the honest figure, and it is
+        // marked so the two cannot be confused.
+        let bound = if row.diverged == 0 {
+            format!("{:.1e}", 3.0 / row.cases as f64)
+        } else {
+            format!("rate {:.1e}", row.diverged as f64 / row.cases as f64)
+        };
         println!(
-            "  {:<20} {:>9} {:>8} {:>7.0}% {:>9.0} {:>10} {:>9} {:>10.1e}",
+            "  {:<20} {:>9} {:>8} {:>7.0}% {:>9.0} {:>10} {:>9} {:>15}",
             row.axis,
             row.diverged,
             row.skipped,
@@ -111,7 +173,7 @@ fn main() {
             row.per_second,
             row.tlp_judged,
             row.tlp_violations,
-            3.0 / row.cases as f64,
+            bound,
         );
         // Without this the line sits in a pipe buffer, which is the same problem again when
         // the output is piped to `tail` or a log.
@@ -244,14 +306,43 @@ fn measure(axis: &'static str, bounds: Bounds, diff_cases: usize, tlp_cases: usi
             None
         };
 
-        match relation {
+        let mut tally = |relation: Option<Relation>| match relation {
             Some(Relation::Holds) => tlp_judged += 1,
             Some(Relation::Violated { .. }) => {
                 tlp_judged += 1;
                 tlp_violations += 1;
             }
             _ => {}
-        }
+        };
+        tally(relation);
+
+        // **The other three relations, counted too — they were missing.**
+        //
+        // This half ran only the four TLP forms, so the `judged` column measured *TLP's* reach
+        // and was read as the metamorphic oracle's. The gap is not small: index-invariance
+        // applies to any case with an index, NoREC to any case with a `WHERE`, and
+        // windowed-vs-grouped to any case with a suitable table — none of which require a
+        // partitionable query. On the window axis, where every TLP form refuses outright, the
+        // column reported **zero judged** while a relation covering 29% of cases existed.
+        //
+        // Same defect as index-invariance sitting below the partitionability gate in `tlp_hunt`,
+        // and as the feature vocabulary lagging seven axes: **a measurement narrowing silently
+        // while what it measures grows.** None of the three announced itself.
+        tally(
+            indexed_pair(&case)
+                .and_then(|pair| Some((run(&pair.with_indexes)?, run(&pair.without_indexes)?)))
+                .map(|(with, without)| check_indexed(&with, &without, case.is_totally_ordered())),
+        );
+        tally(
+            norec(&case)
+                .and_then(|pair| Some((run(&pair.filtered)?, run(&pair.projected)?)))
+                .map(|(filtered, projected)| check_norec(&filtered, &projected)),
+        );
+        tally(
+            windowed_groups(&case)
+                .and_then(|pair| Some((run(&pair.windowed)?, run(&pair.grouped)?)))
+                .map(|(windowed, grouped)| check_windowed_groups(&windowed, &grouped)),
+        );
     }
 
     Row {
