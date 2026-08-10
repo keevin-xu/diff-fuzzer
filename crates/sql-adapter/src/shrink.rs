@@ -36,15 +36,21 @@ use diff_fuzzer_core::minimize::Shrink;
 /// deleting a row — but a case with fewer rows is genuinely simpler at equal structure, and
 /// without the second element the search would stop while the data was still noisy.
 pub fn complexity(case: &SqlCase) -> (usize, usize) {
-    let query_nodes: usize = case
-        .query
-        .projection
-        .iter()
-        .map(Expr::node_count)
-        .sum::<usize>()
-        + case.query.filter.as_ref().map_or(0, Expr::node_count)
-        + case.query.order_by.len()
-        + usize::from(case.query.limit.is_some());
+    // **Delegates to `SelectStmt::node_count` rather than counting by hand.** It used to
+    // reimplement a narrower count — projection, filter, `ORDER BY`, `LIMIT` — and drifted as
+    // the query grew: the join's `ON`, `GROUP BY`, `HAVING` and set operations were all invisible
+    // to it, and so were indexes. A reduction the shrinker offered but the guard could not see
+    // produced a candidate of *equal* complexity, which the strictly-simpler rule then rejected.
+    //
+    // The effect was silent and only visible on a real finding: minimizing the comma-join case
+    // left a `CREATE INDEX` in the repro because dropping it changed no counted quantity.
+    // **A monotonicity guard that cannot see part of the case silently forbids simplifying it.**
+    let query_nodes = case.query.node_count()
+        // Schema-level structure the shrinker can remove. Counted with the query rather than
+        // with the data because, like the query, it is something a reader must understand:
+        // an index in a repro invites the question "does the index matter?".
+        + case.indexes.len()
+        + case.query.from.len();
 
     let cells: usize = case
         .data
@@ -68,6 +74,20 @@ impl Shrink for SqlCase {
         // Most aggressive first: whole clauses, then structure, then data, then values.
         // Order is about speed, not correctness — a greedy search takes the first candidate
         // that still fails, so leading with big cuts reaches a small case in fewer rounds.
+
+        // Drop an index. **Added at S10, and its absence until then was a real gap**: the
+        // shrinker was written at S5 and indexes arrived five phases later, so every minimized
+        // case carried whatever indexes it started with — including ones irrelevant to the
+        // failure. A repro with an unnecessary `CREATE INDEX` is a repro that invites the
+        // maintainer to wonder whether the index matters.
+        //
+        // Cheap and high-value: an index is one statement, and removing it is the difference
+        // between "this is about indexing" and "this is not".
+        for index in 0..self.indexes.len() {
+            let mut candidate = self.clone();
+            candidate.indexes.remove(index);
+            proposals.push(candidate);
+        }
 
         // Drop the WHERE clause entirely.
         if self.query.filter.is_some() {
