@@ -92,8 +92,12 @@ pub struct Partitioned {
 pub fn partition(case: &SqlCase) -> Option<Partitioned> {
     let predicate = case.query.filter.clone()?;
 
+    // **Window functions are refused**, and for the same reason `DISTINCT` and `HAVING` are:
+    // a window computes over the rows that survive the `WHERE`, so partitioning the rows changes
+    // what it sees. `row_number()` restarts in each part; the three cannot reconstruct the whole.
     if !case.query.group_by.is_empty()
         || case.aggregates()
+        || case.has_window()
         || case.query.set_op.is_some()
         || case.query.limit.is_some()
         || case.query.having.is_some()
@@ -161,6 +165,7 @@ pub fn partition_aggregate(case: &SqlCase) -> Option<PartitionedAggregate> {
     // whatever `DISTINCT` does, so it is a no-op here — but "probably a no-op" is not a basis
     // for a relation, and the recombination rules were derived without it.
     if case.query.distinct
+        || case.has_window()
         || !case.query.group_by.is_empty()
         || case.query.set_op.is_some()
         || case.query.limit.is_some()
@@ -308,6 +313,7 @@ pub fn partition_grouped(case: &SqlCase) -> Option<PartitionedGroups> {
     // split 2 and 4. The whole keeps the group, the partitions lose it, on a correct engine.
     // Partitioning on the `HAVING` predicate instead is sound — see [`partition_having`].
     if case.query.distinct
+        || case.has_window()
         || case.query.group_by.is_empty()
         || case.query.set_op.is_some()
         || case.query.limit.is_some()
@@ -563,7 +569,11 @@ pub fn partition_having(case: &SqlCase) -> Option<PartitionedHaving> {
     // A set operation or `LIMIT` would make "the groups this query returns" something other
     // than what the relation is about, exactly as for the other forms. `DISTINCT` is excluded
     // because it would deduplicate groups and reintroduce the straddling-duplicate problem.
-    if case.query.set_op.is_some() || case.query.limit.is_some() || case.query.distinct {
+    if case.query.set_op.is_some()
+        || case.query.limit.is_some()
+        || case.query.distinct
+        || case.has_window()
+    {
         return None;
     }
 
@@ -715,7 +725,7 @@ pub fn norec(case: &SqlCase) -> Option<NoRec> {
     // rows. Counting those would compare "how many rows match" against "how many *distinct*
     // truth values occurred", which is not the same question and would fail on almost every
     // case with more than three rows.
-    if case.query.distinct || case.query.having.is_some() {
+    if case.query.distinct || case.query.having.is_some() || case.has_window() {
         return None;
     }
 
@@ -1991,6 +2001,112 @@ mod tests {
             sqlite, duckdb,
             "the engines agree — the divergence has gone"
         );
+    }
+
+    /// Ranking window functions agree on both engines, **including how they treat ties**.
+    ///
+    /// The three differ precisely at ties, which is the only place two implementations of one
+    /// specification could plausibly part company:
+    ///
+    /// - `row_number` — distinct for every row, so **ambiguous under ties**. The generator only
+    ///   emits it when the order is total, and this test shows why: over tied rows the two
+    ///   engines could legitimately disagree.
+    /// - `rank` — tied rows share a value, and the next value **skips**: 1, 1, 3.
+    /// - `dense_rank` — tied rows share a value and the next **does not skip**: 1, 1, 2.
+    ///
+    /// Verified before hunting, as every axis in this project is.
+    #[test]
+    fn ranking_functions_treat_ties_identically_on_both_engines() {
+        use crate::schema::{
+            Column, Direction, InsertRows, Literal, OrderKey, SqlType, Table, WindowFunction,
+        };
+
+        let value = ColumnRef {
+            table: "t0".to_string(),
+            column: "v".to_string(),
+        };
+
+        let case = |function: WindowFunction| SqlCase {
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![Column {
+                    name: "v".to_string(),
+                    sql_type: SqlType::Integer,
+                }],
+            }],
+            indexes: Vec::new(),
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                // A deliberate tie on 10, so `rank` and `dense_rank` must differ from each other.
+                rows: vec![
+                    vec![Literal::Integer(10)],
+                    vec![Literal::Integer(10)],
+                    vec![Literal::Integer(30)],
+                ],
+            }],
+            query: SelectStmt {
+                having: None,
+                distinct: false,
+                projection: vec![Expr::Window {
+                    function,
+                    partition_by: Vec::new(),
+                    order_by: vec![OrderKey {
+                        column: value.clone(),
+                        direction: Direction::Ascending,
+                        nulls_first: true,
+                    }],
+                }],
+                from: vec!["t0".to_string()],
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let run = |c: &SqlCase| -> Vec<i64> {
+                let outcome = if engine == "sqlite" {
+                    SqliteImpl.run(c).expect("sqlite runs the case")
+                } else {
+                    DuckDbImpl.run(c).expect("duckdb runs the case")
+                };
+                let SqlOutcome::Rows(rows) = outcome else {
+                    panic!("{engine}: expected rows")
+                };
+                let mut values: Vec<i64> = rows
+                    .into_iter()
+                    .map(|row| match row.as_slice() {
+                        [Cell::Integer(n)] => *n,
+                        other => panic!("{engine}: expected one integer, got {other:?}"),
+                    })
+                    .collect();
+                values.sort_unstable();
+                values
+            };
+
+            // **`rank` skips after a tie**: two rows at 1, then 3.
+            assert_eq!(
+                run(&case(WindowFunction::Rank)),
+                vec![1, 1, 3],
+                "{engine}: rank must leave a gap after a tie"
+            );
+            // **`dense_rank` does not**: two rows at 1, then 2.
+            assert_eq!(
+                run(&case(WindowFunction::DenseRank)),
+                vec![1, 1, 2],
+                "{engine}: dense_rank must not leave a gap after a tie"
+            );
+            // `row_number` is total regardless — but *which* tied row gets 1 versus 2 is
+            // unspecified, which is exactly why the generator restricts it to a total order.
+            assert_eq!(
+                run(&case(WindowFunction::RowNumber)),
+                vec![1, 2, 3],
+                "{engine}: row_number must number every row distinctly"
+            );
+        }
     }
 
     /// Build a grouped result: each entry is a group key followed by its aggregate values,

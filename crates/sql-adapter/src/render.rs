@@ -300,6 +300,28 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
             sql.push_str(" END)");
             sql
         }
+        // `f() OVER (PARTITION BY … ORDER BY …)`. Both engines spell every part of this the
+        // same way, so there is no dialect distinction — the surface is shared, which is exactly
+        // why a divergence here would be a bug rather than a documented difference.
+        Expr::Window {
+            function,
+            partition_by,
+            order_by,
+        } => {
+            let mut over = String::new();
+            if !partition_by.is_empty() {
+                let columns: Vec<String> = partition_by.iter().map(render_column_ref).collect();
+                over.push_str(&format!("PARTITION BY {}", columns.join(", ")));
+            }
+            if !order_by.is_empty() {
+                if !over.is_empty() {
+                    over.push(' ');
+                }
+                let keys: Vec<String> = order_by.iter().map(render_order_key).collect();
+                over.push_str(&format!("ORDER BY {}", keys.join(", ")));
+            }
+            format!("{}() OVER ({over})", function.as_sql())
+        }
         Expr::InList { not, left, list } => {
             let values: Vec<String> = list.iter().map(render_literal).collect();
             format!(

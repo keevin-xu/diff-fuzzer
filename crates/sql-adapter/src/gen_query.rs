@@ -20,7 +20,7 @@ use crate::gen_schema::Bounds;
 use crate::ordering::orders_rows_totally;
 use crate::schema::{
     AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, Join, JoinKind, Literal,
-    OrderKey, SelectStmt, SetBranch, SetOp, SqlType, Table, UnaryOp,
+    OrderKey, SelectStmt, SetBranch, SetOp, SqlType, Table, UnaryOp, WindowFunction,
 };
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
@@ -890,7 +890,9 @@ fn generate_projection(
             let column = &table.columns[rng.random_range(0..table.columns.len())];
             // Mostly bare columns: they keep minimized repros readable, and a divergence in
             // a projected column is easier to argue about than one inside an expression.
-            if bounds.case_expressions && rng.random_range(0..100) < 30 {
+            if bounds.window_functions && rng.random_range(0..100) < 35 {
+                generate_window(rng, table, rows)
+            } else if bounds.case_expressions && rng.random_range(0..100) < 30 {
                 generate_case(rng, table, column.sql_type, bounds, rows)
             } else if rng.random_range(0..100) < 70 {
                 Expr::Column(reference(table, &column.name))
@@ -899,6 +901,62 @@ fn generate_projection(
             }
         })
         .collect()
+}
+
+/// A ranking window function over `PARTITION BY` / `ORDER BY`.
+///
+/// # The determinism rule, which decides whether the result is comparable at all
+///
+/// **`row_number()` is only emitted when the window's `ORDER BY` totally orders the rows.**
+/// With ties it assigns distinct numbers to indistinguishable rows, so two *correct* engines may
+/// number them differently — a legal difference that would flood the oracle, exactly as
+/// unordered `LIMIT` would. `rank()` and `dense_rank()` are safe under ties by definition: tied
+/// rows get the same value, which is what makes them the pair worth generating freely.
+///
+/// The same `orders_rows_totally` that gates `LIMIT` answers this, and for the same reason —
+/// it is a property of the *data*, not of the query.
+fn generate_window(rng: &mut SeededRng, table: &Table, rows: &[Vec<Literal>]) -> Expr {
+    let key = &table.columns[rng.random_range(0..table.columns.len())];
+    let order_by = vec![OrderKey {
+        column: reference(table, &key.name),
+        direction: if rng.random_range(0..2) == 0 {
+            Direction::Ascending
+        } else {
+            Direction::Descending
+        },
+        // Spelled explicitly, because the two engines' defaults differ (`SPECS.md` §3.6) and an
+        // implicit default would be a documented legal difference rather than a finding.
+        nulls_first: rng.random_range(0..2) == 0,
+    }];
+
+    // `PARTITION BY` a *different* column half the time. Partitioning by the ordering column
+    // would make every partition a single row, which ranks trivially and tests nothing.
+    let partition_by = if table.columns.len() > 1 && rng.random_range(0..100) < 50 {
+        let other = &table.columns[(0..table.columns.len())
+            .find(|index| table.columns[*index].name != key.name)
+            .expect("more than one column")];
+        vec![reference(table, &other.name)]
+    } else {
+        Vec::new()
+    };
+
+    // `row_number` only when the order is total *and* there is no partitioning — partitioning
+    // splits the rows, and total order over the whole table does not imply total order within
+    // each partition… which it does, since a subset of a totally ordered set is totally ordered.
+    // Kept conservative anyway: the cost is a slightly narrower axis, the risk is a flood.
+    let total_order = partition_by.is_empty() && orders_rows_totally(&order_by, table, rows);
+    let function = match rng.random_range(0..3) {
+        0 if total_order => WindowFunction::RowNumber,
+        0 => WindowFunction::Rank,
+        1 => WindowFunction::Rank,
+        _ => WindowFunction::DenseRank,
+    };
+
+    Expr::Window {
+        function,
+        partition_by,
+        order_by,
+    }
 }
 
 /// `CASE WHEN c THEN v ... [ELSE v] END`, with every branch at `result_type`.
@@ -1806,6 +1864,7 @@ mod tests {
             ("V1_SUBQUERIES", Bounds::V1_SUBQUERIES),
             ("V1_NOT_IN_LIST", Bounds::V1_NOT_IN_LIST),
             ("V1_CASE", Bounds::V1_CASE),
+            ("V1_WINDOW", Bounds::V1_WINDOW),
         ] {
             for seed in 0..500 {
                 let mut rng = SeededRng::from_seed(seed);
@@ -1894,6 +1953,11 @@ mod tests {
                 assert_types_agree(left, table, seed);
                 None
             }
+            // A ranking function is always an integer, whatever it ranks by — `row_number`
+            // counts positions, not values — so it has a type without needing to inspect its
+            // clauses. That is why these three were chosen for stage `a`: no argument, no type
+            // discipline to get wrong.
+            Expr::Window { .. } => Some(SqlType::BigInt),
             // The second arm that **asserts**: every branch of a `CASE` must yield the same
             // type, or the engines disagree about the result column's type — the same
             // text-versus-integer hazard the `HAVING` axis paid 825 spurious findings for.

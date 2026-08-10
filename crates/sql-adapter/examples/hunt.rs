@@ -79,6 +79,7 @@ fn main() {
         Some("not-in-correlated") => sql_adapter::gen_schema::Bounds::V1_NOT_IN_CORRELATED,
         Some("multi-group-by") => sql_adapter::gen_schema::Bounds::V1_MULTI_GROUP_BY,
         Some("case") => sql_adapter::gen_schema::Bounds::V1_CASE,
+        Some("window") => sql_adapter::gen_schema::Bounds::V1_WINDOW,
         Some("indexes") => sql_adapter::gen_schema::Bounds::V1_INDEXES,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,

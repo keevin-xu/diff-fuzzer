@@ -128,7 +128,10 @@ fn main() {
     }
     let before = complexity(&case);
     println!("\n  complexity (query nodes, data cells): {before:?}");
-    println!("  signature: {}", signature(&case, DisagreementKind::RowContent));
+    println!(
+        "  signature: {}",
+        signature(&case, DisagreementKind::RowContent)
+    );
     println!(
         "  known-defect catalog: {:?}",
         known_comma_join_defect(&case).map(|entry| entry.name)
@@ -154,7 +157,10 @@ fn main() {
     println!("\n== checks ==");
     let still_diverges = diverges(&minimized.input);
     println!("  still diverges:            {still_diverges}");
-    println!("  still valid:               {}", minimized.input.validate().is_ok());
+    println!(
+        "  still valid:               {}",
+        minimized.input.validate().is_ok()
+    );
     println!(
         "  still caught by the catalog: {:?}",
         known_comma_join_defect(&minimized.input).map(|entry| entry.name)

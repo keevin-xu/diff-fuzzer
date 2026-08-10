@@ -114,7 +114,11 @@ fn main() {
 
     for (rank, candidate) in result.classes.iter().enumerate() {
         println!("\n  #{} {}", rank + 1, candidate.predicate.describe());
-        println!("     covers {} of {} findings", candidate.covered.len(), findings.len());
+        println!(
+            "     covers {} of {} findings",
+            candidate.covered.len(),
+            findings.len()
+        );
         // **Never summed.** A rule firing on three near-misses and one firing on three
         // ordinary cases are different claims, and one number cannot say which.
         for (source, matched, total) in &candidate.negatives_by_source {
@@ -139,19 +143,26 @@ fn main() {
             if covers == 0 {
                 continue;
             }
-            let leaks = negative_vecs.iter().filter(|v| predicate.matches(**v)).count();
+            let leaks = negative_vecs
+                .iter()
+                .filter(|v| predicate.matches(**v))
+                .count();
             // Rank by coverage first, then by how few negatives it lets through.
             let score = (covers, usize::MAX - leaks);
             if best
                 .as_ref()
                 .is_none_or(|(c, l, _)| (covers, usize::MAX - leaks) > (*c, *l))
             {
-                best = Some((score.0, score.1, format!(
-                    "{} — covers {covers}/{} findings, matches {leaks}/{} negatives",
-                    predicate.describe(),
-                    findings.len(),
-                    negative_vecs.len()
-                )));
+                best = Some((
+                    score.0,
+                    score.1,
+                    format!(
+                        "{} — covers {covers}/{} findings, matches {leaks}/{} negatives",
+                        predicate.describe(),
+                        findings.len(),
+                        negative_vecs.len()
+                    ),
+                ));
             }
         }
         if let Some((_, _, description)) = best {

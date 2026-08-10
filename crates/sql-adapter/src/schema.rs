@@ -191,6 +191,38 @@ pub struct ColumnRef {
     pub column: String,
 }
 
+/// The window functions this crate generates.
+///
+/// A deliberately small subset of the eleven both engines provide (`SPECS.md` §2.13, §3.14):
+/// the three ranking functions, which need no argument and no frame to be meaningful. They are
+/// stage `a` of the window work — `lag`/`lead`/`first_value` and explicit frames come later,
+/// because each stage is independently sweepable and the peer-semantics ones are where two
+/// implementations of one paragraph most plausibly part company.
+///
+/// **`row_number` is not deterministic without a total order**, which is why the generator only
+/// emits these alongside an `ORDER BY` inside `OVER` — otherwise two correct engines may
+/// legitimately number tied rows differently and every case would look like a divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFunction {
+    /// Sequential position within the partition, from 1. Distinct for every row.
+    RowNumber,
+    /// Position with **gaps** after ties: 1, 2, 2, 4.
+    Rank,
+    /// Position **without** gaps after ties: 1, 2, 2, 3.
+    DenseRank,
+}
+
+impl WindowFunction {
+    /// How both engines spell it — identically, so no dialect distinction is needed.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            WindowFunction::RowNumber => "row_number",
+            WindowFunction::Rank => "rank",
+            WindowFunction::DenseRank => "dense_rank",
+        }
+    }
+}
+
 /// Binary operators.
 ///
 /// **No division.** SQLite's `/` performs integer division where DuckDB's does not, which
@@ -356,6 +388,30 @@ pub enum Expr {
     ///
     /// The list holds [`Literal`]s rather than [`Expr`]s deliberately: an expression list would
     /// defeat constant folding and so would test the path this variant was added to reach.
+    /// A **window function**: `f() OVER (PARTITION BY … ORDER BY …)`.
+    ///
+    /// # Why this is the largest documented surface available
+    ///
+    /// Both engines document the *same* intricate behaviour in detail — eleven built-ins,
+    /// `ROWS`/`RANGE`/`GROUPS` frames, all four `EXCLUDE` modes, named windows, `FILTER`
+    /// (`SPECS.md` §2.13, §3.14). Where both specifications agree, **a divergence is a bug**
+    /// rather than a catalogued difference, which is not true of most of what this project has
+    /// generated.
+    ///
+    /// # What it costs the metamorphic oracle
+    ///
+    /// TLP and NoREC must **refuse** window queries. A window function computes over the rows
+    /// that survive the `WHERE`, so partitioning rows into TRUE/FALSE/UNKNOWN changes what each
+    /// window sees — `row_number()` restarts, `rank()` recomputes — and the three parts cannot
+    /// reconstruct the whole. The relation fails on a *correct* engine, exactly as it does under
+    /// `DISTINCT` and `HAVING`. Index-invariance is unaffected and still applies.
+    Window {
+        function: WindowFunction,
+        /// `PARTITION BY`. Empty means one partition covering every row.
+        partition_by: Vec<ColumnRef>,
+        /// `ORDER BY` inside the `OVER` clause. Empty is legal and changes the default frame.
+        order_by: Vec<OrderKey>,
+    },
     /// `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ELSE v3 END`.
     ///
     /// **Two `NULL` traps in one construct, and they are different from each other.**
@@ -407,6 +463,11 @@ impl Expr {
             // Each literal counts, so minimization can see that shortening the list is a
             // genuine reduction — which it is, and often the one that isolates the `NULL`.
             Expr::InList { left, list, .. } => 1 + left.node_count() + list.len(),
+            Expr::Window {
+                partition_by,
+                order_by,
+                ..
+            } => 1 + partition_by.len() + order_by.len(),
             // Every condition and value counts, so removing a branch reads as a real reduction
             // to minimization — which it is, and often the one that isolates the `NULL` route.
             Expr::Case {
@@ -458,6 +519,14 @@ impl Expr {
             }
             // The list is literals, so only the left operand can reference a column.
             Expr::InList { left, .. } => left.collect_columns(found),
+            Expr::Window {
+                partition_by,
+                order_by,
+                ..
+            } => {
+                found.extend(partition_by.iter());
+                found.extend(order_by.iter().map(|key| &key.column));
+            }
             Expr::Case {
                 branches,
                 otherwise,
@@ -493,6 +562,11 @@ impl Expr {
             // Unlike the subquery forms, there is no inner scope here — an aggregate in the
             // left operand would belong to *this* query, so it is reported rather than hidden.
             Expr::InList { left, .. } => left.contains_aggregate(),
+            // **A window function is not an aggregate**, and this is the arm that would be
+            // easiest to get wrong. An aggregate collapses rows; a window function returns one
+            // value *per row*. Reporting `true` here would make the grouping rules demand a
+            // `GROUP BY` that must not exist, and every such case would be rejected by DuckDB.
+            Expr::Window { .. } => false,
             Expr::Case {
                 branches,
                 otherwise,
@@ -538,6 +612,14 @@ impl Expr {
                 left.collect_columns_here(found)
             }
             Expr::InList { left, .. } => left.collect_columns_here(found),
+            Expr::Window {
+                partition_by,
+                order_by,
+                ..
+            } => {
+                found.extend(partition_by.iter());
+                found.extend(order_by.iter().map(|key| &key.column));
+            }
             Expr::Case {
                 branches,
                 otherwise,
@@ -568,6 +650,8 @@ impl Expr {
                 found.push(query);
             }
             Expr::InList { left, .. } => left.collect_subqueries(found),
+            // A window's clauses are column references only, so there is nothing to descend into.
+            Expr::Window { .. } => {}
             Expr::Case {
                 branches,
                 otherwise,
@@ -601,6 +685,7 @@ impl Expr {
             Expr::Exists { .. } | Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } => true,
             // A literal list is not a subquery, whatever it superficially resembles.
             Expr::InList { left, .. } => left.contains_subquery(),
+            Expr::Window { .. } => false,
             Expr::Case {
                 branches,
                 otherwise,
@@ -639,6 +724,10 @@ impl Expr {
             // answer by accident; naming it means the next variant's author has to decide
             // rather than inherit. Third time this wildcard has stayed silent on a new variant.
             Expr::Case { .. } => false,
+            // Listed explicitly for the fourth time on this match. A ranking function yields a
+            // number, not a truth value, so `false` is right — and the `_` arm below would have
+            // given that answer without anyone deciding it.
+            Expr::Window { .. } => false,
             Expr::Unary { op, .. } => {
                 matches!(op, UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull)
             }
@@ -673,6 +762,8 @@ impl Expr {
             Expr::InList { left, list, .. } => {
                 left.contains_null_literal() || list.contains(&Literal::Null)
             }
+            // Column references only; a window clause cannot contain a literal.
+            Expr::Window { .. } => false,
             Expr::Case {
                 branches,
                 otherwise,

@@ -47,7 +47,7 @@ fn contains(expression: &Expr, predicate: &dyn Fn(&Expr) -> bool) -> bool {
                 .any(|(w, t)| contains(w, predicate) || contains(t, predicate))
                 || otherwise.as_ref().is_some_and(|e| contains(e, predicate))
         }
-        Expr::Exists { .. } | Expr::Column(_) | Expr::Literal(_) => false,
+        Expr::Window { .. } | Expr::Exists { .. } | Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
 
@@ -166,6 +166,10 @@ const FEATURES: &[Feature] = &[
                 .iter()
                 .any(|row| row.contains(&Literal::Null))
         },
+    },
+    Feature {
+        name: "window function",
+        holds: |case| case.has_window(),
     },
     Feature {
         name: "case expression",
@@ -308,6 +312,7 @@ fn main() {
         Some("distinct") => Bounds::V1_DISTINCT,
         Some("having") => Bounds::V1_HAVING,
         Some("case") => Bounds::V1_CASE,
+        Some("window") => Bounds::V1_WINDOW,
         _ => Bounds::V1,
     };
 

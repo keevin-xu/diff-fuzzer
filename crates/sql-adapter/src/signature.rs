@@ -215,6 +215,27 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
         // for our purposes: the three-valued-logic trap is asymmetric and lives entirely on
         // the negated side. Collapsing them would group a finding with cases that cannot
         // exhibit it.
+        Expr::Window {
+            function,
+            partition_by,
+            order_by,
+        } => {
+            tags.insert("window");
+            // Tagged by function, because the three differ in exactly the way that matters:
+            // `row_number` is total, `rank` leaves gaps after ties and `dense_rank` does not.
+            // A finding in one should not be grouped with a finding in another.
+            tags.insert(match function {
+                crate::schema::WindowFunction::RowNumber => "window-row-number",
+                crate::schema::WindowFunction::Rank => "window-rank",
+                crate::schema::WindowFunction::DenseRank => "window-dense-rank",
+            });
+            if !partition_by.is_empty() {
+                tags.insert("window-partitioned");
+            }
+            if !order_by.is_empty() {
+                tags.insert("window-ordered");
+            }
+        }
         Expr::Case {
             branches,
             otherwise,

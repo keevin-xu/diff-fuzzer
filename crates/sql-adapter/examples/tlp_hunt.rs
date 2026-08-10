@@ -141,6 +141,7 @@ fn main() {
         Some("not-in-correlated") => Bounds::V1_NOT_IN_CORRELATED,
         Some("multi-group-by") => Bounds::V1_MULTI_GROUP_BY,
         Some("case") => Bounds::V1_CASE,
+        Some("window") => Bounds::V1_WINDOW,
         Some("indexes") => Bounds::V1_INDEXES,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("rows") => Bounds::V1,

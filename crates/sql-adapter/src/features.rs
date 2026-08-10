@@ -43,7 +43,7 @@ use crate::schema::{Expr, JoinKind, Literal, SetOp};
 /// **The rule this produced: a new generation axis and its feature land in the same commit.**
 /// Eight separate checks in this project have silently narrowed while the thing they measure
 /// grew, and not one announced itself.
-pub const FEATURES: [&str; 28] = [
+pub const FEATURES: [&str; 29] = [
     // --- data: what is in the tables ---
     "null_in_data",
     "empty_table",
@@ -78,6 +78,7 @@ pub const FEATURES: [&str; 28] = [
     // reported 361 findings and 0 rules: with no feature for a comma-join, no conjunction of
     // features can describe what they share. That `unexplained` count is the machinery working.
     "comma_join",
+    "window_function",
     // --- the interaction: where the data meets the query ---
     "null_in_join_key",
     "aggregate_over_empty",
@@ -116,7 +117,8 @@ fn walk(expression: &Expr, visit: &mut impl FnMut(&Expr)) {
                 walk(otherwise, visit);
             }
         }
-        Expr::Exists { .. } | Expr::Column(_) | Expr::Literal(_) => {}
+        // A window carries column references only — nothing to descend into.
+        Expr::Window { .. } | Expr::Exists { .. } | Expr::Column(_) | Expr::Literal(_) => {}
     }
 }
 
@@ -226,6 +228,9 @@ fn query_features(case: &SqlCase, features: &mut FeatureVec) {
     // divergence this project has predicted from documentation (`SPECS.md` §2.11).
     if query.from.len() > 1 {
         features.set("comma_join");
+    }
+    if case.has_window() {
+        features.set("window_function");
     }
     // `CASE` and membership can sit anywhere in the projection or the predicate, so both are
     // walked rather than checked at the top level.
@@ -374,6 +379,8 @@ fn mentions_null_test(expression: &Expr) -> bool {
         // about. Reporting otherwise would conflate the two features a predicate rule most
         // needs to tell apart.
         Expr::InList { left, .. } => mentions_null_test(left),
+        // A window clause holds column references only — no predicate, so no `NULL` test.
+        Expr::Window { .. } => false,
         // A `CASE` condition is an ordinary predicate, so an `IS NULL` inside one counts —
         // unlike `InList`, where the `NULL` changes the answer without being asked about.
         Expr::Case {
@@ -447,6 +454,7 @@ mod tests {
         for bounds in [
             Bounds::V1_ALL,
             Bounds::V1_COMMA_JOINS,
+            Bounds::V1_WINDOW,
             Bounds::V1_CHAINED_SET_OPS,
             Bounds::V1_WIDE_ARITHMETIC,
         ] {

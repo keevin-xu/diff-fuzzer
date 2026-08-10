@@ -159,6 +159,40 @@ impl SqlCase {
         }
     }
 
+    /// Does the query contain a **window function**?
+    ///
+    /// Asked by every metamorphic partition, because splitting rows changes what a window sees:
+    /// `row_number()` restarts inside each partition and `rank()` recomputes, so the three parts
+    /// cannot reconstruct the whole. The relation fails on a **correct** engine, exactly as it
+    /// does under `DISTINCT` and `HAVING`.
+    ///
+    /// One method rather than the check written out at each site, so a fourth partition form
+    /// cannot be added without confronting it.
+    pub fn has_window(&self) -> bool {
+        fn walk(expression: &crate::schema::Expr) -> bool {
+            use crate::schema::Expr;
+            match expression {
+                Expr::Window { .. } => true,
+                Expr::Unary { operand, .. } => walk(operand),
+                Expr::Binary { left, right, .. } => walk(left) || walk(right),
+                Expr::Cast { expr, .. } => walk(expr),
+                Expr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|a| walk(a)),
+                Expr::Case {
+                    branches,
+                    otherwise,
+                } => {
+                    branches.iter().any(|(w, t)| walk(w) || walk(t))
+                        || otherwise.as_ref().is_some_and(|e| walk(e))
+                }
+                Expr::InList { left, .. }
+                | Expr::InSubquery { left, .. }
+                | Expr::ScalarSubquery { left, .. } => walk(left),
+                Expr::Exists { .. } | Expr::Column(_) | Expr::Literal(_) => false,
+            }
+        }
+        self.query.projection.iter().any(walk) || self.query.filter.as_ref().is_some_and(walk)
+    }
+
     /// Does the query aggregate — collapsing many rows into one?
     pub fn aggregates(&self) -> bool {
         self.query

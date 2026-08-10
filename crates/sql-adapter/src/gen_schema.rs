@@ -209,6 +209,21 @@ pub struct Bounds {
     /// **Requires a `known.rs` entry before any campaign uses it**, or this single known
     /// mechanism swamps the run exactly as chained set operations do at 12.5%.
     pub comma_joins: bool,
+    /// Whether the generator may emit **window functions** — `row_number()`, `rank()`,
+    /// `dense_rank()` over `PARTITION BY` / `ORDER BY`.
+    ///
+    /// **The largest surface where both engines document the same behaviour** (`SPECS.md`
+    /// §2.13, §3.14): eleven built-ins, three frame types, four `EXCLUDE` modes, named windows,
+    /// `FILTER`. Both implement all of it, so a divergence is a **bug** rather than a
+    /// catalogued difference — which is not true of most constructs this project generates.
+    ///
+    /// Stage `a` is the three ranking functions: no argument, no frame, integer result, so no
+    /// type discipline to get wrong. Frames and `EXCLUDE` — where peer semantics live and where
+    /// two readings of one paragraph most plausibly diverge — come next.
+    ///
+    /// **Costs the metamorphic oracle**: TLP and NoREC must refuse window queries, because
+    /// splitting rows changes what the window sees. Index-invariance still applies.
+    pub window_functions: bool,
     /// Whether the generator may emit a join, including the outer kinds.
     ///
     /// Forces a two-table schema when enabled, since a join needs somewhere to join to.
@@ -280,6 +295,7 @@ impl Bounds {
         case_expressions: false,
         indexes: false,
         comma_joins: false,
+        window_functions: false,
     };
 
     /// V1 plus correlated subqueries. One axis, as always.
@@ -352,6 +368,12 @@ impl Bounds {
         ..Bounds::V1
     };
 
+    /// V1 plus window functions. Cleanly separable — needs no other axis.
+    pub const V1_WINDOW: Bounds = Bounds {
+        window_functions: true,
+        ..Bounds::V1
+    };
+
     /// V1 plus joins. One axis, as always.
     pub const V1_JOINS: Bounds = Bounds {
         joins: true,
@@ -400,6 +422,7 @@ impl Bounds {
         // understood and would flood, as `chained_set_ops` does. It is enabled only in its own
         // preset, for reproducing and triaging the finding.
         comma_joins: false,
+        window_functions: true,
         wide_arithmetic: false,
         ..Bounds::V1
     };
@@ -478,6 +501,7 @@ impl GenerationAxes for Bounds {
             ("case", self.case_expressions),
             ("indexes", self.indexes),
             ("comma-joins", self.comma_joins),
+            ("window", self.window_functions),
         ]
     }
 
