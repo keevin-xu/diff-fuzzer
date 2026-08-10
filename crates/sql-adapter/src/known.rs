@@ -51,6 +51,32 @@ pub const INTEGER_OVERFLOW: LegalDifference = LegalDifference {
     citation: "SPECS.md §2.3 (SQLite) + §3.7 (DuckDB) + §4.9 (the pair)",
 };
 
+/// Comma-join precedence: SQLite binds all join operators equally, left to right.
+///
+/// **SQLite** (`SPECS.md` §2.11, quoting its own quirks page): *"SQLite gives all join operators
+/// equal precedence and processes them from left to right. But this is not quite correct…
+/// comma-joins have lower precedence than all others join operators."*
+///
+/// **Measured** (`examples/join_precedence_probe.rs`): `FROM a, b RIGHT JOIN c ON b.y = c.z` with
+/// no matching key returns `(NULL, NULL, 3)` on SQLite — consistent with `(a, b) RIGHT JOIN c` —
+/// and `(1, NULL, 3)` on DuckDB, consistent with `a, (b RIGHT JOIN c)`.
+///
+/// # Why this is catalogued despite being a defect rather than a licensed difference
+///
+/// Every other entry here is legal *by construction*: two engines keeping two documented
+/// promises that cannot both be satisfied. **This one is not.** SQLite says it is wrong. It is
+/// catalogued for a different reason: the mechanism is fully understood and would otherwise
+/// swamp every campaign that enables comma-joins, exactly as chained set operations do at 12.5%
+/// — thousands of findings, one cause, and a run that has to be thrown away.
+///
+/// **The distinction matters and must not be lost.** `INTEGER_OVERFLOW` means *"not a bug"*;
+/// this means *"a known bug, already understood, do not report it again"*. Suppressing them
+/// through the same mechanism is a convenience, not a claim that they are the same kind of thing.
+pub const COMMA_JOIN_PRECEDENCE: LegalDifference = LegalDifference {
+    name: "comma-join-precedence-known-sqlite-defect",
+    citation: "SPECS.md §2.11 (SQLite documents its own parser as incorrect) + measured",
+};
+
 /// Is this divergence one the engines are documented to be allowed to have?
 ///
 /// Returns the entry that covers it, or `None` — in which case the divergence stands and
@@ -85,9 +111,98 @@ pub fn legal_difference(
     (out_of_range && some_rows && has_arithmetic).then_some(INTEGER_OVERFLOW)
 }
 
+/// Is this divergence the known comma-join precedence defect?
+///
+/// Kept as a separate function rather than another branch of [`legal_difference`], because it
+/// answers a different question: not *"are the engines permitted to differ here?"* but *"is this
+/// the defect we already understand?"* Folding them together would let a genuine finding be
+/// suppressed by a rule written for a known one.
+///
+/// Narrow on two independent facts, both of which the mechanism requires:
+///
+///   1. the `FROM` clause lists **more than one** table — a comma-join, and
+///   2. the query also has an **explicit** join, since the defect is about how the two bind
+///      relative to each other. A comma-join alone has no precedence question to get wrong.
+///
+/// Either alone would be far too broad: most queries in a two-table schema have a join.
+pub fn known_comma_join_defect(case: &SqlCase) -> Option<LegalDifference> {
+    let comma_joined = case.query.from.len() > 1;
+    let explicit_join = case.query.join.is_some();
+
+    (comma_joined && explicit_join).then_some(COMMA_JOIN_PRECEDENCE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::SqlCase;
+
+    /// The known comma-join defect is recognised, and **only** when both halves are present.
+    ///
+    /// The narrowness is the whole point. Most queries in a two-table schema have a join, and
+    /// most have a single-table `FROM`; a rule keying on either alone would suppress a large
+    /// share of genuine findings under the name of a known defect. That is the failure mode a
+    /// legal-difference catalog exists to avoid — `POLICY.md`'s note that a filter fails
+    /// *silently* when it is wrong.
+    #[test]
+    fn the_comma_join_defect_needs_both_a_comma_join_and_an_explicit_join() {
+        let base = SqlCase::fixed_example();
+
+        // Neither: an ordinary single-table query.
+        assert!(known_comma_join_defect(&base).is_none());
+
+        // A comma-join alone — no precedence question to get wrong, because there is no other
+        // join operator to bind against.
+        let mut comma_only = base.clone();
+        comma_only.query.from = vec!["t0".to_string(), "t1".to_string()];
+        assert!(
+            known_comma_join_defect(&comma_only).is_none(),
+            "a comma-join with no explicit join has no precedence to resolve"
+        );
+
+        // An explicit join alone — the ordinary case, and by far the most common shape in this
+        // corpus. Suppressing these would blind the oracle to most of what it can see.
+        let mut join_only = base.clone();
+        join_only.query.join = Some(crate::schema::Join {
+            kind: crate::schema::JoinKind::Inner,
+            table: "t1".to_string(),
+            on: Expr::Literal(Literal::Integer(1)),
+        });
+        assert!(
+            known_comma_join_defect(&join_only).is_none(),
+            "an ordinary join must not be mistaken for the known defect"
+        );
+
+        // Both — the documented shape.
+        let mut both = join_only.clone();
+        both.query.from = vec!["t0".to_string(), "t1".to_string()];
+        assert_eq!(
+            known_comma_join_defect(&both).map(|entry| entry.name),
+            Some(COMMA_JOIN_PRECEDENCE.name)
+        );
+    }
+
+    /// The two catalog entries are distinguishable, and describe different kinds of thing.
+    ///
+    /// `INTEGER_OVERFLOW` means *"not a bug"* — two documented promises that cannot both hold.
+    /// `COMMA_JOIN_PRECEDENCE` means *"a known bug, already understood"* — SQLite says it is
+    /// wrong. They are suppressed by the same mechanism as a convenience; the names must keep
+    /// the distinction visible, because a reader who conflates them would conclude this project
+    /// found nothing when it found one thing.
+    #[test]
+    fn the_two_entries_are_not_the_same_kind_of_claim() {
+        assert_ne!(INTEGER_OVERFLOW.name, COMMA_JOIN_PRECEDENCE.name);
+        assert!(
+            COMMA_JOIN_PRECEDENCE.name.contains("defect"),
+            "the name must say this is a defect, not a licensed difference: {}",
+            COMMA_JOIN_PRECEDENCE.name
+        );
+        assert!(
+            COMMA_JOIN_PRECEDENCE.citation.contains("§2.11"),
+            "every entry cites its evidence"
+        );
+    }
+
     use crate::schema::{BinaryOp, Expr, Literal};
 
     fn rows() -> CanonicalResult {
