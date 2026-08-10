@@ -210,6 +210,15 @@ pub enum WindowFunction {
     Rank,
     /// Position **without** gaps after ties: 1, 2, 2, 3.
     DenseRank,
+    /// `SUM(x) OVER (…)`. **Only over an `INTEGER` column** — the S9.5 lesson: eight 32-bit
+    /// values cannot overflow an `i64`, and a wider column can.
+    Sum,
+    /// `COUNT(x) OVER (…)`. Numeric whatever it counts, so no type discipline is needed.
+    Count,
+    /// `MIN(x) OVER (…)`.
+    Min,
+    /// `MAX(x) OVER (…)`.
+    Max,
 }
 
 impl WindowFunction {
@@ -219,8 +228,133 @@ impl WindowFunction {
             WindowFunction::RowNumber => "row_number",
             WindowFunction::Rank => "rank",
             WindowFunction::DenseRank => "dense_rank",
+            WindowFunction::Sum => "SUM",
+            WindowFunction::Count => "COUNT",
+            WindowFunction::Min => "MIN",
+            WindowFunction::Max => "MAX",
         }
     }
+
+    /// Does this function take an argument?
+    ///
+    /// The ranking three do not; the aggregates do. Kept as a method so the renderer and the
+    /// generator cannot disagree about it.
+    pub fn takes_argument(self) -> bool {
+        !matches!(
+            self,
+            WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank
+        )
+    }
+
+    /// Does a **frame** change what this function computes?
+    ///
+    /// **No, for the ranking three** — and this is the fact that shapes the whole staging.
+    /// `row_number() OVER (… ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)` returns exactly what it
+    /// returns without the frame, because a rank is defined by position in the ordering rather
+    /// than by a window of rows. Generating frames on them would produce cases that look like
+    /// frame tests and are not.
+    ///
+    /// For an aggregate the frame is the whole point: `SUM(x) OVER (ORDER BY k ROWS BETWEEN 1
+    /// PRECEDING AND CURRENT ROW)` is a moving sum, and every boundary form gives a different
+    /// answer.
+    pub fn frame_applies(self) -> bool {
+        self.takes_argument()
+    }
+}
+
+/// How a window frame counts: by rows, by value range, or by peer group.
+///
+/// **The three differ only in the presence of ties**, which is precisely why they are worth
+/// generating: `ROWS` counts physical rows, `RANGE` counts by the `ORDER BY` *value* so all peers
+/// enter or leave together, and `GROUPS` counts peer groups as units. An implementation that
+/// treats peers as ordinary rows produces `ROWS` semantics everywhere and passes every test that
+/// has no ties in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameKind {
+    Rows,
+    Range,
+    Groups,
+}
+
+impl FrameKind {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            FrameKind::Rows => "ROWS",
+            FrameKind::Range => "RANGE",
+            FrameKind::Groups => "GROUPS",
+        }
+    }
+}
+
+/// One end of a frame.
+///
+/// `Preceding`/`Following` carry an offset whose meaning depends on [`FrameKind`]: rows, units of
+/// the ordering value, or peer groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u32),
+    CurrentRow,
+    Following(u32),
+    UnboundedFollowing,
+}
+
+impl FrameBound {
+    pub fn as_sql(self) -> String {
+        match self {
+            FrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+            FrameBound::Preceding(n) => format!("{n} PRECEDING"),
+            FrameBound::CurrentRow => "CURRENT ROW".to_string(),
+            FrameBound::Following(n) => format!("{n} FOLLOWING"),
+            FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+        }
+    }
+
+    /// Position on the frame's axis, for checking that the start does not follow the end.
+    /// A query whose start is after its end is a syntax error on both engines.
+    pub fn rank(self) -> i64 {
+        match self {
+            FrameBound::UnboundedPreceding => i64::MIN,
+            FrameBound::Preceding(n) => -(i64::from(n)),
+            FrameBound::CurrentRow => 0,
+            FrameBound::Following(n) => i64::from(n),
+            FrameBound::UnboundedFollowing => i64::MAX,
+        }
+    }
+}
+
+/// Which peers a frame leaves out.
+///
+/// **The highest-value part of the window surface.** `GROUP` removes the current row and all its
+/// peers; `TIES` removes the peers but *keeps* the current row. Both are one paragraph in each
+/// specification and both turn entirely on what counts as a peer — the likeliest place two
+/// readings of one document part company, and invisible in any corpus without ties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+impl FrameExclude {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            FrameExclude::NoOthers => "EXCLUDE NO OTHERS",
+            FrameExclude::CurrentRow => "EXCLUDE CURRENT ROW",
+            FrameExclude::Group => "EXCLUDE GROUP",
+            FrameExclude::Ties => "EXCLUDE TIES",
+        }
+    }
+}
+
+/// A window frame: `ROWS BETWEEN … AND … EXCLUDE …`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Frame {
+    pub kind: FrameKind,
+    pub start: FrameBound,
+    pub end: FrameBound,
+    pub exclude: FrameExclude,
 }
 
 /// Binary operators.
@@ -407,10 +541,17 @@ pub enum Expr {
     /// `DISTINCT` and `HAVING`. Index-invariance is unaffected and still applies.
     Window {
         function: WindowFunction,
+        /// The argument, for aggregates. `None` for the ranking three, which take none.
+        arg: Option<ColumnRef>,
         /// `PARTITION BY`. Empty means one partition covering every row.
         partition_by: Vec<ColumnRef>,
         /// `ORDER BY` inside the `OVER` clause. Empty is legal and changes the default frame.
         order_by: Vec<OrderKey>,
+        /// An explicit frame. `None` uses each engine's default, which the two documents
+        /// describe **differently but equivalently** (`SPECS.md` §2.13 vs §3.14) — worth
+        /// generating precisely because an implementation reading its own wording naively
+        /// would diverge.
+        frame: Option<Frame>,
     },
     /// `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ELSE v3 END`.
     ///

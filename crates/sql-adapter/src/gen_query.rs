@@ -19,8 +19,9 @@
 use crate::gen_schema::Bounds;
 use crate::ordering::orders_rows_totally;
 use crate::schema::{
-    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, InsertRows, Join, JoinKind, Literal,
-    OrderKey, SelectStmt, SetBranch, SetOp, SqlType, Table, UnaryOp, WindowFunction,
+    AggregateFunc, BinaryOp, ColumnRef, Direction, Expr, Frame, FrameBound, FrameExclude,
+    FrameKind, InsertRows, Join, JoinKind, Literal, OrderKey, SelectStmt, SetBranch, SetOp,
+    SqlType, Table, UnaryOp, WindowFunction,
 };
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
@@ -903,18 +904,27 @@ fn generate_projection(
         .collect()
 }
 
-/// A ranking window function over `PARTITION BY` / `ORDER BY`.
+/// A window function: ranking, or an aggregate over an explicit frame.
 ///
-/// # The determinism rule, which decides whether the result is comparable at all
+/// # Three rules, each of which keeps the query legal or the result comparable
 ///
-/// **`row_number()` is only emitted when the window's `ORDER BY` totally orders the rows.**
-/// With ties it assigns distinct numbers to indistinguishable rows, so two *correct* engines may
-/// number them differently — a legal difference that would flood the oracle, exactly as
-/// unordered `LIMIT` would. `rank()` and `dense_rank()` are safe under ties by definition: tied
-/// rows get the same value, which is what makes them the pair worth generating freely.
+/// **1. `row_number()` only under a total order.** It numbers indistinguishable rows
+/// arbitrarily, so under ties two *correct* engines may differ — a legal difference that would
+/// flood the oracle exactly as an unordered `LIMIT` would. `rank`/`dense_rank` are safe under
+/// ties by definition. Gated by the same `orders_rows_totally` that governs `LIMIT`.
 ///
-/// The same `orders_rows_totally` that gates `LIMIT` answers this, and for the same reason —
-/// it is a property of the *data*, not of the query.
+/// **2. Frames only on aggregates.** A frame does not change what a ranking function computes
+/// (`WindowFunction::frame_applies`), so attaching one would produce cases that *look* like
+/// frame tests and are not. This is why stage `a` deliberately had no frames: the two are
+/// separately measurable only if they are separately generated.
+///
+/// **3. A frame requires an `ORDER BY`, and `RANGE`/`GROUPS` require exactly one term.** Both
+/// engines reject `RANGE <n> PRECEDING` without a single ordering column, since "within `n` of
+/// the current value" is undefined otherwise. Generating it would be a self-inflicted
+/// `rows-vs-error` flood of the kind the `HAVING` axis produced at S9.5.
+///
+/// And `SUM` only over an `INTEGER` column — the S9.5 overflow lesson, applied to a new site
+/// before it could repeat.
 fn generate_window(rng: &mut SeededRng, table: &Table, rows: &[Vec<Literal>]) -> Expr {
     let key = &table.columns[rng.random_range(0..table.columns.len())];
     let order_by = vec![OrderKey {
@@ -932,30 +942,150 @@ fn generate_window(rng: &mut SeededRng, table: &Table, rows: &[Vec<Literal>]) ->
     // `PARTITION BY` a *different* column half the time. Partitioning by the ordering column
     // would make every partition a single row, which ranks trivially and tests nothing.
     let partition_by = if table.columns.len() > 1 && rng.random_range(0..100) < 50 {
-        let other = &table.columns[(0..table.columns.len())
-            .find(|index| table.columns[*index].name != key.name)
-            .expect("more than one column")];
+        let other = table
+            .columns
+            .iter()
+            .find(|candidate| candidate.name != key.name)
+            .expect("more than one column");
         vec![reference(table, &other.name)]
     } else {
         Vec::new()
     };
 
-    // `row_number` only when the order is total *and* there is no partitioning — partitioning
-    // splits the rows, and total order over the whole table does not imply total order within
-    // each partition… which it does, since a subset of a totally ordered set is totally ordered.
-    // Kept conservative anyway: the cost is a slightly narrower axis, the risk is a flood.
     let total_order = partition_by.is_empty() && orders_rows_totally(&order_by, table, rows);
-    let function = match rng.random_range(0..3) {
-        0 if total_order => WindowFunction::RowNumber,
-        0 => WindowFunction::Rank,
-        1 => WindowFunction::Rank,
-        _ => WindowFunction::DenseRank,
+
+    // Half ranking, half aggregate. The aggregates are what make a frame meaningful.
+    let numeric = table
+        .columns
+        .iter()
+        .find(|column| column.sql_type == SqlType::Integer);
+
+    let (function, arg) = match rng.random_range(0..100) {
+        0..=19 if total_order => (WindowFunction::RowNumber, None),
+        0..=19 => (WindowFunction::Rank, None),
+        20..=34 => (WindowFunction::Rank, None),
+        35..=49 => (WindowFunction::DenseRank, None),
+        // `COUNT` needs no numeric column: it counts rows whatever their type.
+        50..=64 => (WindowFunction::Count, Some(reference(table, &key.name))),
+        // `SUM` **only** over a 32-bit-declared column, so eight values cannot overflow an
+        // `i64`. Without a numeric column, fall back to counting rather than skew the mix.
+        65..=79 => match numeric {
+            Some(column) => (WindowFunction::Sum, Some(reference(table, &column.name))),
+            None => (WindowFunction::Count, Some(reference(table, &key.name))),
+        },
+        80..=89 => (WindowFunction::Min, Some(reference(table, &key.name))),
+        _ => (WindowFunction::Max, Some(reference(table, &key.name))),
+    };
+
+    // The frame: only where it changes the answer, and only in a shape both engines accept.
+    // A `ROWS` frame over a non-total order is arbitrary however its boundaries are written —
+    // `CURRENT ROW AND UNBOUNDED FOLLOWING` depends on peer order just as `2 FOLLOWING` does —
+    // so the whole frame kind is withheld, not merely its offsets.
+    let frame = if function.frame_applies() && rng.random_range(0..100) < 70 {
+        let kind = match rng.random_range(0..3) {
+            // `ROWS` only under a total order; otherwise fall back to `GROUPS`, which is the
+            // tie-safe counterpart and keeps the axis at its rate rather than thinning it.
+            0 if total_order => FrameKind::Rows,
+            0 => FrameKind::Groups,
+            1 => FrameKind::Range,
+            _ => FrameKind::Groups,
+        };
+
+        // **Two hazards this generator has already met elsewhere, arriving through a new door.**
+        // Both were found by a sweep that produced 169 findings, all of them ours.
+        //
+        // 1. **A `ROWS` frame needs a total order**, for exactly the reason `row_number()` does:
+        //    it counts *physical rows* forward from the current one, so when the ordering has
+        //    ties the frame's contents depend on the arbitrary order among peers, and two
+        //    correct engines legitimately differ. `RANGE` and `GROUPS` are safe — they work on
+        //    values and on peer groups, so peers enter and leave together.
+        //
+        // 2. **A `RANGE` offset does arithmetic on the ordering value.** "Within 2 of the
+        //    current value" computes `value + 2`, which overflows at `i64::MAX` — SQLite returns
+        //    `NULL`, DuckDB raises, and that is the catalogued difference at `SPECS.md` §4.9
+        //    arriving on an axis where `wide_arithmetic` is off. Restricting the offset form to a
+        //    32-bit-declared column keeps the arithmetic inside `i64`, the same guard `SUM` uses.
+        let rows_frame_is_safe = kind != FrameKind::Rows || total_order;
+
+        // **The third hazard from this one construct, and the third already-known lesson.**
+        // Restricting `RANGE` offsets to an `INTEGER` column was not enough: `INTEGER` does not
+        // mean the same thing to the two engines (`SPECS.md` §3.3, §4.3). DuckDB's is genuinely
+        // 32-bit, so `RANGE BETWEEN 2 PRECEDING` over a column holding `i32::MIN` underflows
+        // *there* while SQLite, whose integers are 64-bit, computes it happily.
+        //
+        // So the check is on the **data**, not the declared type — the same discipline
+        // `orders_rows_totally` follows, and for the same reason: whether the arithmetic is safe
+        // is a fact about the values, and only the case knows them.
+        let headroom = 2i64;
+        let range_offset_is_safe = kind != FrameKind::Range
+            || match key.sql_type {
+                SqlType::Integer | SqlType::BigInt => {
+                    let (low, high) = if key.sql_type == SqlType::Integer {
+                        (i64::from(i32::MIN), i64::from(i32::MAX))
+                    } else {
+                        (i64::MIN, i64::MAX)
+                    };
+                    let index = table.column(&key.name).map(|(index, _)| index);
+                    index.is_some_and(|index| {
+                        rows.iter().all(|row| match row.get(index) {
+                            Some(Literal::Integer(value)) => {
+                                *value >= low.saturating_add(headroom)
+                                    && *value <= high.saturating_sub(headroom)
+                            }
+                            // `NULL` never enters the arithmetic; anything else is not numeric
+                            // and cannot carry an offset at all.
+                            Some(Literal::Null) => true,
+                            _ => false,
+                        })
+                    })
+                }
+                _ => false,
+            };
+        let offsets_allowed = rows_frame_is_safe && range_offset_is_safe;
+
+        let bound = |rng: &mut SeededRng, preceding: bool| -> FrameBound {
+            match rng.random_range(0..3) {
+                0 if preceding => FrameBound::UnboundedPreceding,
+                0 => FrameBound::UnboundedFollowing,
+                1 => FrameBound::CurrentRow,
+                _ if !offsets_allowed => FrameBound::CurrentRow,
+                _ if preceding => FrameBound::Preceding(rng.random_range(1..=2)),
+                _ => FrameBound::Following(rng.random_range(1..=2)),
+            }
+        };
+
+        let mut start = bound(rng, true);
+        let mut end = bound(rng, false);
+        // A start after its end is a syntax error on both engines; swap rather than reject, so
+        // the axis keeps its rate instead of silently thinning.
+        if start.rank() > end.rank() {
+            std::mem::swap(&mut start, &mut end);
+        }
+
+        Some(Frame {
+            kind,
+            start,
+            end,
+            // **The point of the whole stage.** `GROUP` drops the current row and its peers;
+            // `TIES` drops the peers and keeps the current row. Both are one paragraph in each
+            // specification and both are invisible without ties in the data.
+            exclude: match rng.random_range(0..4) {
+                0 => FrameExclude::NoOthers,
+                1 => FrameExclude::CurrentRow,
+                2 => FrameExclude::Group,
+                _ => FrameExclude::Ties,
+            },
+        })
+    } else {
+        None
     };
 
     Expr::Window {
         function,
+        arg,
         partition_by,
         order_by,
+        frame,
     }
 }
 

@@ -219,6 +219,8 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
             function,
             partition_by,
             order_by,
+            frame,
+            ..
         } => {
             tags.insert("window");
             // Tagged by function, because the three differ in exactly the way that matters:
@@ -228,12 +230,32 @@ fn collect_expr_tags(expression: &Expr, tags: &mut BTreeSet<&'static str>) {
                 crate::schema::WindowFunction::RowNumber => "window-row-number",
                 crate::schema::WindowFunction::Rank => "window-rank",
                 crate::schema::WindowFunction::DenseRank => "window-dense-rank",
+                // The aggregates share a tag: what distinguishes a finding among them is the
+                // *frame*, tagged below, not which aggregate was applied over it.
+                _ => "window-aggregate",
             });
             if !partition_by.is_empty() {
                 tags.insert("window-partitioned");
             }
             if !order_by.is_empty() {
                 tags.insert("window-ordered");
+            }
+            // Frame kind and exclusion tagged separately: `GROUPS` and `EXCLUDE TIES` turn on
+            // peer semantics, and a finding there is a different problem from one in `ROWS`.
+            if let Some(frame) = frame {
+                tags.insert(match frame.kind {
+                    crate::schema::FrameKind::Rows => "frame-rows",
+                    crate::schema::FrameKind::Range => "frame-range",
+                    crate::schema::FrameKind::Groups => "frame-groups",
+                });
+                if !matches!(frame.exclude, crate::schema::FrameExclude::NoOthers) {
+                    tags.insert(match frame.exclude {
+                        crate::schema::FrameExclude::CurrentRow => "exclude-current-row",
+                        crate::schema::FrameExclude::Group => "exclude-group",
+                        crate::schema::FrameExclude::Ties => "exclude-ties",
+                        crate::schema::FrameExclude::NoOthers => unreachable!(),
+                    });
+                }
             }
         }
         Expr::Case {

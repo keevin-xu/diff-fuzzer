@@ -305,8 +305,10 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
         // why a divergence here would be a bug rather than a documented difference.
         Expr::Window {
             function,
+            arg,
             partition_by,
             order_by,
+            frame,
         } => {
             let mut over = String::new();
             if !partition_by.is_empty() {
@@ -320,7 +322,22 @@ fn render_expr(expression: &Expr, dialect: Dialect) -> String {
                 let keys: Vec<String> = order_by.iter().map(render_order_key).collect();
                 over.push_str(&format!("ORDER BY {}", keys.join(", ")));
             }
-            format!("{}() OVER ({over})", function.as_sql())
+            // The frame goes last inside `OVER`, after `PARTITION BY` and `ORDER BY`. Both
+            // engines require that order and both spell every part identically.
+            if let Some(frame) = frame {
+                if !over.is_empty() {
+                    over.push(' ');
+                }
+                over.push_str(&format!(
+                    "{} BETWEEN {} AND {} {}",
+                    frame.kind.as_sql(),
+                    frame.start.as_sql(),
+                    frame.end.as_sql(),
+                    frame.exclude.as_sql()
+                ));
+            }
+            let argument = arg.as_ref().map(render_column_ref).unwrap_or_default();
+            format!("{}({argument}) OVER ({over})", function.as_sql())
         }
         Expr::InList { not, left, list } => {
             let values: Vec<String> = list.iter().map(render_literal).collect();

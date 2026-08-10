@@ -2049,6 +2049,8 @@ mod tests {
                 distinct: false,
                 projection: vec![Expr::Window {
                     function,
+                    arg: None,
+                    frame: None,
                     partition_by: Vec::new(),
                     order_by: vec![OrderKey {
                         column: value.clone(),
@@ -2105,6 +2107,139 @@ mod tests {
                 run(&case(WindowFunction::RowNumber)),
                 vec![1, 2, 3],
                 "{engine}: row_number must number every row distinctly"
+            );
+        }
+    }
+
+    /// The four `EXCLUDE` modes agree on both engines — **checked at a tie**, the only place
+    /// they differ from each other.
+    ///
+    /// Rows 10, 10, 30 with `SUM(v) OVER (ORDER BY v GROUPS BETWEEN UNBOUNDED PRECEDING AND
+    /// UNBOUNDED FOLLOWING EXCLUDE …)`, so the frame is the whole partition and the exclusion is
+    /// the only thing that varies. For the **first** row (value 10, peer of the second):
+    ///
+    /// | mode | excluded | sum |
+    /// |---|---|---|
+    /// | `NO OTHERS` | nothing | 50 |
+    /// | `CURRENT ROW` | itself | 40 |
+    /// | `GROUP` | itself **and** its peer | 30 |
+    /// | `TIES` | its peer, **not** itself | 40 |
+    ///
+    /// The **third** row (value 30) is the one worth thinking about, and the one I first got
+    /// wrong: its peer group contains only itself, so `EXCLUDE GROUP` drops it and sums the
+    /// other two — **20**, not 50. The expectation written here originally said 50, the engines
+    /// disagreed with it, and they were right. That is what hand-verification is for: the
+    /// failure was in the reasoning, and finding it before hunting is the point.
+    ///
+    /// `CURRENT ROW` and `TIES` coincide here and diverge elsewhere; `GROUP` is the one that
+    /// removes both. An implementation treating peers as ordinary rows would give 40 for
+    /// `GROUP` and 50 for `TIES` — which is invisible in any corpus without ties, and is why
+    /// this is the highest-value part of the window surface.
+    #[test]
+    fn every_exclude_mode_agrees_on_both_engines_at_a_tie() {
+        use crate::schema::{
+            Column, Direction, Frame, FrameBound, FrameExclude, FrameKind, InsertRows, Literal,
+            OrderKey, SqlType, Table, WindowFunction,
+        };
+
+        let value = ColumnRef {
+            table: "t0".to_string(),
+            column: "v".to_string(),
+        };
+
+        let case = |exclude: FrameExclude| SqlCase {
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![Column {
+                    name: "v".to_string(),
+                    sql_type: SqlType::Integer,
+                }],
+            }],
+            indexes: Vec::new(),
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                rows: vec![
+                    vec![Literal::Integer(10)],
+                    vec![Literal::Integer(10)],
+                    vec![Literal::Integer(30)],
+                ],
+            }],
+            query: SelectStmt {
+                having: None,
+                distinct: false,
+                projection: vec![Expr::Window {
+                    function: WindowFunction::Sum,
+                    arg: Some(value.clone()),
+                    partition_by: Vec::new(),
+                    order_by: vec![OrderKey {
+                        column: value.clone(),
+                        direction: Direction::Ascending,
+                        nulls_first: true,
+                    }],
+                    frame: Some(Frame {
+                        kind: FrameKind::Groups,
+                        start: FrameBound::UnboundedPreceding,
+                        end: FrameBound::UnboundedFollowing,
+                        exclude,
+                    }),
+                }],
+                from: vec!["t0".to_string()],
+                join: None,
+                set_op: None,
+                group_by: Vec::new(),
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+            },
+        };
+
+        for engine in ["sqlite", "duckdb"] {
+            let run = |c: &SqlCase| -> Vec<i64> {
+                let outcome = if engine == "sqlite" {
+                    SqliteImpl
+                        .run(c)
+                        .unwrap_or_else(|e| panic!("{engine}: {e}"))
+                } else {
+                    DuckDbImpl
+                        .run(c)
+                        .unwrap_or_else(|e| panic!("{engine}: {e}"))
+                };
+                let SqlOutcome::Rows(rows) = outcome else {
+                    panic!("{engine}: expected rows")
+                };
+                let mut values: Vec<i64> = rows
+                    .into_iter()
+                    .map(|row| match row.as_slice() {
+                        [Cell::Integer(n)] => *n,
+                        other => panic!("{engine}: expected one integer, got {other:?}"),
+                    })
+                    .collect();
+                values.sort_unstable();
+                values
+            };
+
+            // Two rows at 10 and one at 30. Sums per row, sorted.
+            assert_eq!(
+                run(&case(FrameExclude::NoOthers)),
+                vec![50, 50, 50],
+                "{engine}: EXCLUDE NO OTHERS must include every row"
+            );
+            assert_eq!(
+                run(&case(FrameExclude::CurrentRow)),
+                vec![20, 40, 40],
+                "{engine}: EXCLUDE CURRENT ROW must drop only the row itself"
+            );
+            // **The discriminating pair.** GROUP drops the row and its peers; TIES keeps the row.
+            assert_eq!(
+                run(&case(FrameExclude::Group)),
+                vec![20, 30, 30],
+                "{engine}: EXCLUDE GROUP must drop the current row and all its peers — \
+                 including when that group is the row alone"
+            );
+            assert_eq!(
+                run(&case(FrameExclude::Ties)),
+                vec![40, 40, 50],
+                "{engine}: EXCLUDE TIES must drop peers but keep the current row"
             );
         }
     }
