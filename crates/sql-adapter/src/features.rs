@@ -43,7 +43,7 @@ use crate::schema::{Expr, JoinKind, Literal, SetOp};
 /// **The rule this produced: a new generation axis and its feature land in the same commit.**
 /// Eight separate checks in this project have silently narrowed while the thing they measure
 /// grew, and not one announced itself.
-pub const FEATURES: [&str; 27] = [
+pub const FEATURES: [&str; 28] = [
     // --- data: what is in the tables ---
     "null_in_data",
     "empty_table",
@@ -72,6 +72,12 @@ pub const FEATURES: [&str; 27] = [
     "membership_present",
     "multi_group_by",
     "index_present",
+    // Added with the `comma_joins` axis — **late, and the search is what noticed.** The axis
+    // landed at S10 without its feature, one step after the rule "a new axis and every check
+    // that enumerates land in the same commit" was written down. The predicate search then
+    // reported 361 findings and 0 rules: with no feature for a comma-join, no conjunction of
+    // features can describe what they share. That `unexplained` count is the machinery working.
+    "comma_join",
     // --- the interaction: where the data meets the query ---
     "null_in_join_key",
     "aggregate_over_empty",
@@ -215,6 +221,11 @@ fn query_features(case: &SqlCase, features: &mut FeatureVec) {
     }
     if !case.indexes.is_empty() {
         features.set("index_present");
+    }
+    // More than one table in `FROM` — a comma-join, and the construct behind the only
+    // divergence this project has predicted from documentation (`SPECS.md` §2.11).
+    if query.from.len() > 1 {
+        features.set("comma_join");
     }
     // `CASE` and membership can sit anywhere in the projection or the predicate, so both are
     // walked rather than checked at the top level.
@@ -426,9 +437,23 @@ mod tests {
     /// domain, applied to the one artifact that is written rather than derived.
     #[test]
     fn every_feature_occurs_at_least_once() {
+        // **Scanned across configurations, not just `V1_ALL`.** It used to generate only from
+        // `V1_ALL`, which deliberately excludes some axes — `comma_joins` is off there because
+        // its mechanism is known and would flood a campaign. A feature reachable *only* under
+        // another preset therefore looked unreachable, and this test failed on a correct
+        // feature. Same shape as the type-discipline test pinned to `V1`: a check fixed to one
+        // configuration is a check that shrinks as the configuration set grows.
         let mut seen = FeatureVec::default();
-        for seed in 0..3000 {
-            seen.0 |= extract(&generated(seed)).0;
+        for bounds in [
+            Bounds::V1_ALL,
+            Bounds::V1_COMMA_JOINS,
+            Bounds::V1_CHAINED_SET_OPS,
+            Bounds::V1_WIDE_ARITHMETIC,
+        ] {
+            let generator = SqlGenerator::new(bounds);
+            for seed in 0..3000 {
+                seen.0 |= extract(&generator.generate(&mut SeededRng::from_seed(seed))).0;
+            }
         }
 
         let missing: Vec<&str> = FEATURES
