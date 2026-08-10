@@ -43,7 +43,9 @@
 
 use crate::ast::SqlCase;
 use crate::outcome::{Cell, SqlOutcome};
-use crate::schema::{AggregateFunc, Expr, SelectStmt, UnaryOp};
+use crate::schema::{
+    AggregateFunc, ColumnRef, Expr, Literal, SelectStmt, SqlType, UnaryOp, WindowFunction,
+};
 use std::collections::HashMap;
 
 /// The four queries TLP compares: one whole, three parts.
@@ -873,6 +875,185 @@ pub fn violation_report(
              contradicting itself — no second engine is involved and no legal-difference \
              argument applies"
         ),
+    }
+}
+
+/// The same aggregate computed two ways: **as a window, and as a `GROUP BY`.**
+///
+/// # The only relation in this crate that reaches window functions
+///
+/// All five relations above refuse window queries outright, which left the project's largest
+/// documented surface judged by the differential oracle alone. `SUM(x) OVER (PARTITION BY g)`
+/// and `SUM(x) ... GROUP BY g` compute *the same totals by different machinery*: one attaches a
+/// group's total to every row of that group, the other returns one row per group. Collapse the
+/// windowed side to its distinct rows and the two must be equal.
+///
+/// The dedupe is exact rather than approximate, and it is worth seeing why: within a partition
+/// every row carries the *same* total, so `(g, total)` is a function of `g` and deduplicating
+/// cannot merge two groups — two distinct `g` values stay distinct because `g` is in the tuple.
+///
+/// # Why the grouping column must contain no `NULL`
+///
+/// The relation would be unsound if `PARTITION BY` and `GROUP BY` disagreed about whether two
+/// `NULL`s belong together. **Neither engine documents this.** SQLite defines a partition as
+/// "all rows that have the same value for all terms of the `PARTITION BY` clause" and says
+/// nothing about `NULL`; DuckDB's window page never raises it (`SPECS.md` §2.14, §3.15). The
+/// project's rule is that an unretrieved claim justifies nothing, so rather than assume the two
+/// agree, the relation **declines any case whose grouping column contains a `NULL`.**
+///
+/// That costs coverage, and it is the right trade: had the assumption been wrong, every
+/// `NULL`-bearing case would report a violation, and the violation would be *ours*. This crate
+/// has produced 245 such findings in one phase already.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowedGroups {
+    /// `SELECT g, F(x) OVER (PARTITION BY g) FROM t` — one row per table row.
+    pub windowed: SqlCase,
+    /// `SELECT g, F(x) FROM t GROUP BY g` — one row per group.
+    pub grouped: SqlCase,
+}
+
+/// Build the windowed/grouped pair, or `None` where the equivalence would not hold.
+///
+/// Derives its pair from the case's **table and data** rather than from its query. The other
+/// relations rewrite the generated `SELECT`; this one cannot, because an arbitrary generated
+/// window query has no `GROUP BY` counterpart. What is being fuzzed here is therefore the *data*
+/// — values, duplicates, group sizes, type widths — against two aggregation paths, and that is
+/// stated plainly so a clean run is not over-read as covering window *queries* generally.
+pub fn windowed_groups(case: &SqlCase) -> Option<WindowedGroups> {
+    let table = case.schema.first()?;
+    let rows = &case.data.iter().find(|d| d.table == table.name)?.rows;
+
+    // `SUM` only over a 32-bit column — the S9.5 rule. Eight `INTEGER`s cannot overflow an
+    // `i64`; a `BIGINT` can, and then the two paths could differ on overflow rather than on
+    // aggregation, which is a different question and one already catalogued.
+    let (value_index, value) = table
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, column)| column.sql_type == SqlType::Integer)?;
+
+    // The grouping column must be a *different* column — grouping a column by itself makes the
+    // two forms trivially equal — and must contain no `NULL`, for the reason given above.
+    //
+    // **Both conditions are applied in one search rather than in sequence.** Taking the first
+    // other column and *then* rejecting it for a `NULL` discards cases where a later column
+    // would have served: measured, that costs about a third of this relation's reach, since a
+    // `NULL` anywhere in one candidate column is common at eight rows.
+    let (_, key) = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != value_index)
+        .find(|(index, _)| {
+            rows.iter()
+                .all(|row| !matches!(row.get(*index), Some(Literal::Null) | None))
+        })?;
+
+    let key_ref = ColumnRef {
+        table: table.name.clone(),
+        column: key.name.clone(),
+    };
+    let value_ref = ColumnRef {
+        table: table.name.clone(),
+        column: value.name.clone(),
+    };
+
+    let base = SelectStmt {
+        distinct: false,
+        projection: Vec::new(),
+        from: vec![table.name.clone()],
+        filter: None,
+        join: None,
+        set_op: None,
+        having: None,
+        group_by: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+    };
+
+    let mut windowed = base.clone();
+    windowed.projection = vec![
+        Expr::Column(key_ref.clone()),
+        Expr::Window {
+            function: WindowFunction::Sum,
+            arg: Some(value_ref.clone()),
+            partition_by: vec![key_ref.clone()],
+            // No `ORDER BY` inside `OVER`, deliberately: an ordered window's default frame runs
+            // from the partition start to the current row, which computes a *running* total
+            // rather than the partition's. Unordered, the default frame is the whole partition,
+            // which is the quantity `GROUP BY` computes.
+            order_by: Vec::new(),
+            frame: None,
+        },
+    ];
+
+    let mut grouped = base;
+    grouped.projection = vec![
+        Expr::Column(key_ref.clone()),
+        Expr::Aggregate {
+            func: AggregateFunc::Sum,
+            arg: Some(Box::new(Expr::Column(value_ref))),
+        },
+    ];
+    grouped.group_by = vec![key_ref];
+
+    Some(WindowedGroups {
+        windowed: SqlCase {
+            query: windowed,
+            ..case.clone()
+        },
+        grouped: SqlCase {
+            query: grouped,
+            ..case.clone()
+        },
+    })
+}
+
+/// Do the windowed and grouped forms agree?
+///
+/// Compared as **sets**, because the windowed side repeats each group's row once per member and
+/// the grouped side emits it once. Neither query has an `ORDER BY`, so neither promises an order
+/// and both sides are sorted before comparing — the `DISTINCT` lesson from S9.4.
+pub fn check_windowed_groups(windowed: &SqlOutcome, grouped: &SqlOutcome) -> Relation {
+    let (SqlOutcome::Rows(left), SqlOutcome::Rows(right)) = (windowed, grouped) else {
+        return if std::mem::discriminant(windowed) == std::mem::discriminant(grouped) {
+            Relation::NotChecked("both sides returned an error")
+        } else {
+            Relation::Violated {
+                whole: 0,
+                partitions: 0,
+                only_in_whole: vec![format!("windowed: {windowed:?}")],
+                only_in_partitions: vec![format!("grouped: {grouped:?}")],
+            }
+        };
+    };
+
+    let render = |grid: &[Vec<Cell>]| {
+        let mut lines: Vec<String> = grid
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| format!("{cell:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        lines.sort();
+        lines.dedup();
+        lines
+    };
+
+    let left = render(left);
+    let right = render(right);
+    if left == right {
+        return Relation::Holds;
+    }
+
+    Relation::Violated {
+        whole: left.len(),
+        partitions: right.len(),
+        only_in_whole: difference(&left, &right),
+        only_in_partitions: difference(&right, &left),
     }
 }
 
@@ -2936,5 +3117,164 @@ mod tests {
             checked > 100,
             "only {checked} of 300 cases were checkable — too few to call the transform sound"
         );
+    }
+}
+
+#[cfg(test)]
+mod windowed_group_tests {
+    use super::*;
+    use crate::backends::{DuckDbImpl, SqliteImpl};
+    use crate::schema::{Column, InsertRows, Table};
+    use diff_fuzzer_core::traits::Implementation;
+
+    /// A table with a grouping column, a value column, and duplicate keys — the shape the
+    /// relation needs to say anything, since a group of one makes the two forms trivially equal.
+    fn grouped_case(key_values: &[Literal]) -> SqlCase {
+        SqlCase {
+            indexes: Vec::new(),
+            schema: vec![Table {
+                name: "t0".to_string(),
+                columns: vec![
+                    Column {
+                        name: "c0".to_string(),
+                        sql_type: SqlType::Integer,
+                    },
+                    Column {
+                        name: "c1".to_string(),
+                        sql_type: SqlType::Text,
+                    },
+                ],
+            }],
+            data: vec![InsertRows {
+                table: "t0".to_string(),
+                rows: key_values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, key)| vec![Literal::Integer(index as i64 + 1), key.clone()])
+                    .collect(),
+            }],
+            query: SelectStmt {
+                distinct: false,
+                projection: vec![Expr::Column(ColumnRef {
+                    table: "t0".to_string(),
+                    column: "c0".to_string(),
+                })],
+                from: vec!["t0".to_string()],
+                filter: None,
+                join: None,
+                set_op: None,
+                having: None,
+                group_by: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+            },
+        }
+    }
+
+    /// **The relation, run on both real engines**, over groups of size 3, 2 and 1.
+    ///
+    /// Like the `NOT IN` test above, this checks the *premise* rather than our code: if either
+    /// engine's windowed sum disagreed with its grouped sum, that is the engine contradicting
+    /// itself and exactly what the relation exists to catch.
+    #[test]
+    fn windowed_sum_equals_grouped_sum_on_both_engines() {
+        let text = |s: &str| Literal::Text(s.to_string());
+        let case = grouped_case(&[
+            text("a"),
+            text("a"),
+            text("a"),
+            text("b"),
+            text("b"),
+            text("c"),
+        ]);
+        let pair = windowed_groups(&case).expect("a NULL-free text key should be accepted");
+
+        for (name, windowed, grouped) in [
+            (
+                "sqlite",
+                SqliteImpl.run(&pair.windowed),
+                SqliteImpl.run(&pair.grouped),
+            ),
+            (
+                "duckdb",
+                DuckDbImpl.run(&pair.windowed),
+                DuckDbImpl.run(&pair.grouped),
+            ),
+        ] {
+            let windowed = windowed.expect("the windowed query should run");
+            let grouped = grouped.expect("the grouped query should run");
+            assert_eq!(
+                check_windowed_groups(&windowed, &grouped),
+                Relation::Holds,
+                "{name} disagreed with itself: windowed {windowed:?} vs grouped {grouped:?}",
+            );
+        }
+    }
+
+    /// The soundness guard, pinned so it cannot be relaxed without deciding to.
+    ///
+    /// Neither engine documents whether `PARTITION BY` and `GROUP BY` agree on `NULL` keys, so
+    /// the relation refuses those cases rather than assuming. Deleting this check would not fail
+    /// any other test — it would quietly start reporting violations we could not attribute.
+    #[test]
+    fn a_null_in_the_grouping_column_is_declined() {
+        let text = |s: &str| Literal::Text(s.to_string());
+        let with_null = grouped_case(&[text("a"), Literal::Null, text("a")]);
+        assert!(
+            windowed_groups(&with_null).is_none(),
+            "a NULL grouping key must be declined while the semantics are unretrieved",
+        );
+
+        let without_null = grouped_case(&[text("a"), text("b"), text("a")]);
+        assert!(
+            windowed_groups(&without_null).is_some(),
+            "the same shape without a NULL must still be accepted",
+        );
+    }
+
+    /// A fabricated disagreement must be caught, and the *evidence* must name the wrong group.
+    ///
+    /// The engines agree here, so without fault injection a passing run would be indistinguishable
+    /// from a check that never fires — the same reason every oracle in this crate has one.
+    #[test]
+    fn a_wrong_group_total_is_reported_with_its_row() {
+        let windowed = SqlOutcome::Rows(vec![
+            vec![Cell::Text("a".to_string()), Cell::Integer(6)],
+            vec![Cell::Text("a".to_string()), Cell::Integer(6)],
+            vec![Cell::Text("b".to_string()), Cell::Integer(9)],
+        ]);
+        let grouped = SqlOutcome::Rows(vec![
+            vec![Cell::Text("a".to_string()), Cell::Integer(6)],
+            vec![Cell::Text("b".to_string()), Cell::Integer(7)],
+        ]);
+
+        let Relation::Violated {
+            only_in_whole,
+            only_in_partitions,
+            ..
+        } = check_windowed_groups(&windowed, &grouped)
+        else {
+            panic!("a differing total must be a violation");
+        };
+        assert!(
+            only_in_whole.iter().any(|row| row.contains("9")),
+            "the windowed side's wrong total should be named: {only_in_whole:?}",
+        );
+        assert!(
+            only_in_partitions.iter().any(|row| row.contains("7")),
+            "the grouped side's total should be named: {only_in_partitions:?}",
+        );
+    }
+
+    /// Duplicate rows must not read as a violation — the dedupe is the relation, not a detail.
+    #[test]
+    fn repeated_rows_on_the_windowed_side_still_hold() {
+        let windowed = SqlOutcome::Rows(vec![
+            vec![Cell::Text("a".to_string()), Cell::Integer(6)],
+            vec![Cell::Text("a".to_string()), Cell::Integer(6)],
+            vec![Cell::Text("a".to_string()), Cell::Integer(6)],
+        ]);
+        let grouped = SqlOutcome::Rows(vec![vec![Cell::Text("a".to_string()), Cell::Integer(6)]]);
+        assert_eq!(check_windowed_groups(&windowed, &grouped), Relation::Holds);
     }
 }

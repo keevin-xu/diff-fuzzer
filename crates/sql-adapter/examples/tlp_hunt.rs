@@ -42,8 +42,8 @@ use sql_adapter::generator::SqlGenerator;
 use sql_adapter::metamorphic::{
     Partitioned, PartitionedAggregate, PartitionedGroups, PartitionedHaving, Relation,
     ViolationContext, check, check_aggregate, check_distinct, check_grouped, check_indexed,
-    check_norec, indexed_pair, norec, partition, partition_aggregate, partition_grouped,
-    partition_having, violation_report,
+    check_norec, check_windowed_groups, indexed_pair, norec, partition, partition_aggregate,
+    partition_grouped, partition_having, violation_report, windowed_groups,
 };
 use sql_adapter::outcome::SqlOutcome;
 use sql_adapter::render::Dialect;
@@ -179,6 +179,7 @@ fn main() {
     let (mut rows_checks, mut aggregate_checks, mut grouped_checks) = (0usize, 0usize, 0usize);
     let mut having_checks = 0usize;
     let mut index_checks = 0usize;
+    let mut window_group_checks = 0usize;
 
     // **Progress every 25,000 cases, flushed.** This is the third runner to need it and the
     // third time the defect has been the same: report only at the end, and an interrupted run
@@ -198,7 +199,8 @@ fn main() {
             println!(
                 "  … {done:>8} cases | tlp {tlp_checks} (rows {rows_checks} agg \
                  {aggregate_checks} grp {grouped_checks} hav {having_checks}) | index \
-                 {index_checks} | norec {norec_checks} | unchecked {skipped} | \
+                 {index_checks} | wingrp {window_group_checks} | norec {norec_checks} | \
+                 unchecked {skipped} | \
                  **violations {violations}** | {rate:.0}/sec"
             );
             let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -256,6 +258,55 @@ fn main() {
                         );
                         println!("  with:    {}", only_in_whole.join(" "));
                         println!("  without: {}", only_in_partitions.join(" "));
+                        println!("  saved {path}");
+                    }
+                }
+            }
+        }
+
+        // **The windowed/grouped relation, also ahead of the partitionability gate** — and for
+        // the same reason spelled out above the index check. It derives its own pair from the
+        // case's data rather than from its query, so TLP's ability to partition that query says
+        // nothing about whether this relation applies. Putting it below the `continue` would
+        // repeat, verbatim, the mistake that cost index-invariance 80% of its reach.
+        //
+        // It is also the **only relation here that reaches window functions**: the other five
+        // refuse them outright, which left the largest surface in the project judged by the
+        // differential oracle alone.
+        for engine in &engines {
+            if let Some(pair) = windowed_groups(&case)
+                && let (Some(windowed), Some(grouped)) =
+                    (run(engine, &pair.windowed), run(engine, &pair.grouped))
+            {
+                match check_windowed_groups(&windowed, &grouped) {
+                    Relation::Holds => window_group_checks += 1,
+                    Relation::NotChecked(_) => skipped += 1,
+                    Relation::Violated {
+                        only_in_whole,
+                        only_in_partitions,
+                        ..
+                    } => {
+                        violations += 1;
+                        let report = violation_report(
+                            ViolationContext {
+                                relation: "windowed-vs-grouped",
+                                engine,
+                                seed,
+                                generator: &generator.description(),
+                                case: &case,
+                            },
+                            &[("windowed", &pair.windowed), ("grouped", &pair.grouped)],
+                            &[("windowed", &windowed), ("grouped", &grouped)],
+                            &only_in_whole,
+                            &only_in_partitions,
+                        );
+                        let path = report.save(&directory).expect("write violation");
+                        println!(
+                            "WINDOW/GROUP VIOLATION  {engine}, seed {seed}: a windowed sum \
+                             disagreed with the same sum grouped"
+                        );
+                        println!("  windowed: {}", only_in_whole.join(" "));
+                        println!("  grouped:  {}", only_in_partitions.join(" "));
                         println!("  saved {path}");
                     }
                 }
@@ -466,6 +517,7 @@ fn main() {
     println!("    grouped          {grouped_checks:>8}");
     println!("    having           {having_checks:>8}");
     println!("  index-invariance   {index_checks:>8} engine-checks");
+    println!("  windowed-vs-grouped{window_group_checks:>8} engine-checks");
     println!("  NoREC held         {norec_checks:>8} engine-checks");
     let _ = checked;
     println!("  unchecked          {skipped:>8}");
