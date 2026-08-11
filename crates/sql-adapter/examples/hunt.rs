@@ -58,12 +58,36 @@ fn diverges(case: &SqlCase) -> bool {
     )
 }
 
+/// Parse the case count, which may be a plain `N` or a resumable range `A..B`.
+///
+/// # Why a range rather than always starting at zero
+///
+/// A campaign is a long process, and long processes get interrupted — by a machine, a harness
+/// limit, or a person. Both halves of the S10.11 campaign were killed after 300,000 and 50,000
+/// cases with the seed loop hardcoded to `0..total`, so the only way to continue was to redo
+/// work already done. That is the same lesson the axis table learned an hour earlier: printing
+/// progress makes a run **inspectable** after an interruption, but only an addressable range
+/// makes it **resumable**, and they are not the same property.
+///
+/// Seeds are the natural unit here because generation is deterministic in the seed: case 300,000
+/// is the same case whether it is the 300,000th of one run or the first of another.
+fn parse_range(value: Option<String>, default_end: usize) -> (u64, u64) {
+    let Some(value) = value else {
+        return (0, default_end as u64);
+    };
+    match value.split_once("..") {
+        Some((start, end)) => (
+            start.trim().parse().unwrap_or(0),
+            end.trim().parse().unwrap_or(default_end as u64),
+        ),
+        None => (0, value.trim().parse().unwrap_or(default_end as u64)),
+    }
+}
+
 fn main() {
     let mut arguments = std::env::args().skip(1);
-    let total: usize = arguments
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(5_000);
+    let (first_seed, last_seed) = parse_range(arguments.next(), 5_000);
+    let total: usize = (last_seed - first_seed) as usize;
     let label = arguments.next().unwrap_or_else(|| "hunt".to_string());
     // A third argument switches on the overflow-reachable bounds, so the two settings can
     // be measured against each other rather than one being chosen by argument.
@@ -139,9 +163,9 @@ fn main() {
     // resumable by inspection: whatever it got through is on screen.
     let progress_every = 100_000usize;
 
-    for seed in 0..total as u64 {
-        if seed > 0 && (seed as usize).is_multiple_of(progress_every) {
-            let done = seed as usize;
+    for seed in first_seed..last_seed {
+        if seed > first_seed && ((seed - first_seed) as usize).is_multiple_of(progress_every) {
+            let done = (seed - first_seed) as usize;
             let rate = done as f64 / started.elapsed().as_secs_f64();
             println!(
                 "  … {done:>9} cases | agreed {agreed} diverged {diverged} skipped {skipped} \

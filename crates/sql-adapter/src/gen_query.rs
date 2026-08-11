@@ -26,6 +26,17 @@ use crate::schema::{
 use diff_fuzzer_core::SeededRng;
 use rand::RngExt;
 
+/// The largest cross product a generated join may ask an engine to build.
+///
+/// Not a correctness bound — an engine is entitled to be slow — but a **budget** bound. Above
+/// this, a single case can consume as much time as thousands of ordinary ones, and a campaign's
+/// runtime stops being a function of its case count.
+///
+/// 100,000 is ten times the measured mean product (9,999) on `V1_ALL_LARGE`, so ordinary joins
+/// are untouched; it excludes the 1.7% of cases whose product exceeds it and the 0.2% above a
+/// million, which together dominated the runtime.
+const MAX_JOIN_PRODUCT: usize = 100_000;
+
 /// Build one `SELECT` over one of the schema's tables.
 ///
 /// Takes the **data** as well as the schema, which looks unnecessary until you ask whether a
@@ -46,12 +57,37 @@ pub fn generate_query(
     // joining *every* query would silently strip ordered queries out of the corpus — the same
     // confound the set-op axis produced, where a run reporting clean agreement had quietly
     // stopped testing ordering. Enabling an axis must add cases, never remove them.
+    // **A join over two large tables is quadratic, and the cost is invisible in every statistic
+    // this project collects.**
+    //
+    // `t0 JOIN t1 ON (t0.c0 <> t1.c0)` over two 2,000-row tables asks the engine to build up to
+    // 4,000,000 rows from a case that reads as small. Corpus statistics count *cases*, not work,
+    // so nothing flagged it; and a throughput sample of a few thousand cases contains almost
+    // none of the rare large-table pairs, so the measured rate was **4× optimistic**. Measured
+    // over 20,000 cases: worst product 3,468,255, with 41 cases above a million.
+    //
+    // The campaign made it concrete — 1.5M cases projected to **25 hours** instead of 5.
+    //
+    // So the join is skipped when the product would be excessive. This deliberately does not cap
+    // *table* size: a large single-table query is exactly what reaches the index selectivity
+    // this configuration exists for (`SPECS.md` §3.13). What it gives up is joins over two large
+    // tables, which test nothing a join over two moderate tables does not — the join logic does
+    // not change at scale, only the row count does.
+    let row_count = |name: &str| {
+        data.iter()
+            .find(|insert| insert.table == name)
+            .map_or(0, |insert| insert.rows.len())
+    };
     let join = if bounds.joins && tables.len() > 1 && rng.random_range(0..100) < 60 {
         let other = tables
             .iter()
             .find(|candidate| candidate.name != table.name)
             .expect("more than one table");
-        generate_join(rng, table, other)
+        if row_count(&table.name).saturating_mul(row_count(&other.name)) > MAX_JOIN_PRODUCT {
+            None
+        } else {
+            generate_join(rng, table, other)
+        }
     } else {
         None
     };
@@ -2027,6 +2063,14 @@ mod tests {
             ("V1_NOT_IN_LIST", Bounds::V1_NOT_IN_LIST),
             ("V1_CASE", Bounds::V1_CASE),
             ("V1_WINDOW", Bounds::V1_WINDOW),
+            // **Added at G-S10, and their absence is this test's own lesson repeating.** The
+            // comment above records that pinning to `V1` meant testing only code written before
+            // it; the list was then extended for each new axis until S10, which added three
+            // configurations and extended nothing. `V1_ALL_LARGE` is the one the campaign
+            // actually ran on.
+            ("V1_COMMA_JOINS", Bounds::V1_COMMA_JOINS),
+            ("V1_LARGE", Bounds::V1_LARGE),
+            ("V1_ALL_LARGE", Bounds::V1_ALL_LARGE),
         ] {
             for seed in 0..500 {
                 let mut rng = SeededRng::from_seed(seed);

@@ -3025,7 +3025,14 @@ mod tests {
         // Measured across **all three** forms, not just the row one. Pinning only `partition`
         // was how the grouped form's contribution went unmeasured: the row figure is unchanged
         // by adding a second or third form, so it cannot show whether they earn their place.
-        for (name, bounds, floor) in [("V1", Bounds::V1, 50), ("V1_ALL", Bounds::V1_ALL, 40)] {
+        // **`V1_ALL_LARGE` added at G-S10 — it is the configuration the campaign ran on**, and
+        // its absence here is this project's most-repeated defect: a check pinned to the
+        // configurations that existed when it was written, while the ones under test moved on.
+        for (name, bounds, floor) in [
+            ("V1", Bounds::V1, 50),
+            ("V1_ALL", Bounds::V1_ALL, 40),
+            ("V1_ALL_LARGE", Bounds::V1_ALL_LARGE, 40),
+        ] {
             let generator = SqlGenerator::new(bounds);
             let (mut rows, mut aggregate, mut grouped, mut having) = (0, 0, 0, 0);
             for seed in 0..300 {
@@ -3053,6 +3060,58 @@ mod tests {
                  {grouped} grouped, {having} having), below the {floor}% this test pins"
             );
         }
+    }
+
+    /// **Judgeability across all six relations**, not just the four TLP forms.
+    ///
+    /// The partitionability test above measures TLP's reach and is correct about it. It was also
+    /// the only coverage figure this module pinned, so "how much can the metamorphic oracle
+    /// judge?" was answered by a number describing *one* of its oracles — the same mistake found
+    /// in `axis_table` and `corpus_shape` at S10.8/S10.9, where the window axis read as entirely
+    /// unjudged because every TLP form refuses window queries while `windowed_groups` judges 29%
+    /// of them.
+    ///
+    /// Three of the six relations do not need a partitionable query at all: index-invariance
+    /// applies to any case with an index, NoREC to any case with a `WHERE`, and
+    /// windowed-vs-grouped to any case with a suitable table.
+    #[test]
+    fn every_relation_contributes_to_judgeability() {
+        let generator = SqlGenerator::new(Bounds::V1_ALL_LARGE);
+        let (mut judged, mut by_index, mut by_norec, mut by_window) = (0, 0, 0, 0);
+        let total = 1_000;
+
+        for seed in 0..total {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            let tlp = partition(&case).is_some()
+                || partition_aggregate(&case).is_some()
+                || partition_grouped(&case).is_some()
+                || partition_having(&case).is_some();
+            let index = indexed_pair(&case).is_some();
+            let no_rec = norec(&case).is_some();
+            let window = windowed_groups(&case).is_some();
+
+            by_index += usize::from(index);
+            by_norec += usize::from(no_rec);
+            by_window += usize::from(window);
+            judged += usize::from(tlp || index || no_rec || window);
+        }
+
+        // Each of the three non-TLP relations must actually reach cases, or it is dead weight —
+        // the same standard the grouped form is held to below.
+        assert!(by_index > 0, "index-invariance reached nothing");
+        assert!(by_norec > 0, "NoREC reached nothing");
+        assert!(
+            by_window > 0,
+            "windowed-vs-grouped reached nothing; it is the only relation covering the window \
+             axis, so a zero here means that surface is metamorphically blind again",
+        );
+
+        let percent = 100 * judged / total as usize;
+        assert!(
+            percent >= 90,
+            "only {percent}% judged by any relation (index {by_index}, norec {by_norec}, \
+             window {by_window}) — measured 97% at S10.9",
+        );
     }
 
     /// The grouped form must actually reach cases the other two cannot, or it is dead weight
