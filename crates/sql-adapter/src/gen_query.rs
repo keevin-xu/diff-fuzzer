@@ -59,6 +59,25 @@ pub fn generate_query(
     // table — so it gets no `ORDER BY` and no `LIMIT`, the same reasoning as grouping.
     let query_join = join.clone();
     let joined = join.is_some();
+
+    // **Whether this query reads from more than one relation** — which is what decides if the
+    // *base table's* row distinctness still says anything about the *result's* row order.
+    //
+    // It does not. An outer join pads unmatched rows with `NULL`s and an inner join repeats a
+    // row once per match, so a column that is distinct in `t0` is full of duplicates in
+    // `t0 JOIN t1`. Four lines above, that reasoning is already spelled out for `ORDER BY` and
+    // `LIMIT` — *"an outer join manufactures rows that are in no table"* — and it was never
+    // carried to window functions, which arrived five phases later.
+    //
+    // The cost was a campaign finding: `row_number() OVER (ORDER BY t0.c2 …)` over a
+    // `RIGHT OUTER JOIN` where padding made `c2` `NULL` in 19 of 20 rows. The ordering
+    // determines nothing, the two engines number the tied rows differently, and **both are
+    // correct**. Caught 7,230 cases into a 1.5M-case run.
+    //
+    // `bounds.comma_joins` is included conservatively rather than the later `from.len()`,
+    // because the comma-join decision is made after the projection is built: a cross product
+    // duplicates every key value, so the same argument applies.
+    let multi_relation = joined || bounds.comma_joins;
     let rows = data
         .iter()
         .find(|insert| insert.table == table.name)
@@ -80,7 +99,10 @@ pub fn generate_query(
     };
 
     let (projection, group_by) = match shape {
-        QueryShape::Rows => (generate_projection(rng, table, bounds, rows), Vec::new()),
+        QueryShape::Rows => (
+            generate_projection(rng, table, bounds, rows, multi_relation),
+            Vec::new(),
+        ),
         QueryShape::WholeTableAggregate => {
             let count = rng.random_range(1..=2);
             let projection = (0..count)
@@ -883,6 +905,7 @@ fn generate_projection(
     table: &Table,
     bounds: Bounds,
     rows: &[Vec<Literal>],
+    multi_relation: bool,
 ) -> Vec<Expr> {
     let count = rng.random_range(1..=table.columns.len());
 
@@ -892,7 +915,7 @@ fn generate_projection(
             // Mostly bare columns: they keep minimized repros readable, and a divergence in
             // a projected column is easier to argue about than one inside an expression.
             if bounds.window_functions && rng.random_range(0..100) < 35 {
-                generate_window(rng, table, rows)
+                generate_window(rng, table, rows, multi_relation)
             } else if bounds.case_expressions && rng.random_range(0..100) < 30 {
                 generate_case(rng, table, column.sql_type, bounds, rows)
             } else if rng.random_range(0..100) < 70 {
@@ -925,7 +948,12 @@ fn generate_projection(
 ///
 /// And `SUM` only over an `INTEGER` column — the S9.5 overflow lesson, applied to a new site
 /// before it could repeat.
-fn generate_window(rng: &mut SeededRng, table: &Table, rows: &[Vec<Literal>]) -> Expr {
+fn generate_window(
+    rng: &mut SeededRng,
+    table: &Table,
+    rows: &[Vec<Literal>],
+    multi_relation: bool,
+) -> Expr {
     let key = &table.columns[rng.random_range(0..table.columns.len())];
     let order_by = vec![OrderKey {
         column: reference(table, &key.name),
@@ -952,7 +980,11 @@ fn generate_window(rng: &mut SeededRng, table: &Table, rows: &[Vec<Literal>]) ->
         Vec::new()
     };
 
-    let total_order = partition_by.is_empty() && orders_rows_totally(&order_by, table, rows);
+    // **`!multi_relation` first, because the other two terms are computed from the base table
+    // and are simply not evidence about a joined result.** `orders_rows_totally` inspects `t0`'s
+    // own rows; a join pads or repeats them, and the distinctness it found no longer holds.
+    let total_order =
+        !multi_relation && partition_by.is_empty() && orders_rows_totally(&order_by, table, rows);
 
     // Half ranking, half aggregate. The aggregates are what make a frame meaningful.
     let numeric = table
@@ -2193,5 +2225,67 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod window_join_tests {
+    use crate::gen_schema::Bounds;
+    use crate::generator::SqlGenerator;
+    use crate::schema::{Expr, WindowFunction};
+    use diff_fuzzer_core::SeededRng;
+    use diff_fuzzer_core::traits::Generator;
+
+    /// **A joined query must never carry `row_number()` or a `ROWS` frame.**
+    ///
+    /// Both depend on the rows having a determinate order, and a join destroys the base table's
+    /// distinctness — outer joins pad with `NULL`s, inner joins repeat a row per match. The
+    /// engines then number tied rows differently and *both are right*, which reaches the
+    /// campaign as a divergence that is ours.
+    ///
+    /// This is the fourth construct to reintroduce the determinism-under-ties hazard through a
+    /// new door (after `row_number` itself, `ROWS` frames, and `RANGE` offsets). Pinned as a
+    /// property over many seeds rather than one example, because the earlier guards were each
+    /// correct for the case they were written against and wrong for the next one.
+    #[test]
+    fn a_joined_query_never_gets_an_order_dependent_window() {
+        let generator = SqlGenerator::new(Bounds::V1_ALL_LARGE);
+        let mut checked = 0;
+
+        for seed in 0..4_000u64 {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            let multi_relation = case.query.join.is_some() || case.query.from.len() > 1;
+            if !multi_relation {
+                continue;
+            }
+            checked += 1;
+
+            for expression in &case.query.projection {
+                if let Expr::Window {
+                    function, frame, ..
+                } = expression
+                {
+                    assert_ne!(
+                        *function,
+                        WindowFunction::RowNumber,
+                        "seed {seed}: row_number() over a joined query numbers tied rows \
+                         arbitrarily, so the two engines may legally differ",
+                    );
+                    if let Some(frame) = frame {
+                        assert_ne!(
+                            frame.kind,
+                            crate::schema::FrameKind::Rows,
+                            "seed {seed}: a ROWS frame counts physical rows, which a join \
+                             makes arbitrary among ties",
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked > 200,
+            "only {checked} joined cases in 4,000 — the test would pass without testing anything",
+        );
     }
 }
