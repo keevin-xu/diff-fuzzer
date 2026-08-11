@@ -34,7 +34,7 @@
 
 use diff_fuzzer_core::SeededRng;
 use diff_fuzzer_core::traits::{Generator, Implementation};
-use sql_adapter::FINDINGS_ROOT;
+use sql_adapter::METAMORPHIC_ROOT;
 use sql_adapter::ast::SqlCase;
 use sql_adapter::backends::{DuckDbImpl, SqliteImpl};
 use sql_adapter::gen_schema::Bounds;
@@ -184,7 +184,7 @@ fn main() {
     };
 
     let generator = SqlGenerator::new(bounds);
-    let directory = format!("{FINDINGS_ROOT}/runs/{label}");
+    let directory = format!("{METAMORPHIC_ROOT}/{label}");
 
     println!("generator: {}", generator.description());
     println!("cases:     {total}");

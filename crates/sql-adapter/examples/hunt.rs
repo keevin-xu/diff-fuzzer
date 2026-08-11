@@ -16,7 +16,7 @@ use diff_fuzzer_core::minimize::minimize;
 use diff_fuzzer_core::traits::{
     Generator, Implementation, Normalizer, Oracle, SkipReason, Verdict,
 };
-use sql_adapter::FINDINGS_ROOT;
+use sql_adapter::DIFFERENTIAL_ROOT;
 use sql_adapter::ast::SqlCase;
 use sql_adapter::backends::{DuckDbImpl, SqliteImpl};
 use sql_adapter::generator::SqlGenerator;
@@ -116,7 +116,7 @@ fn main() {
     let mut known_legal = 0usize;
 
     let generator = SqlGenerator::new(bounds);
-    let directory = format!("{FINDINGS_ROOT}/runs/{label}");
+    let directory = format!("{DIFFERENTIAL_ROOT}/{label}");
     let environment = Environment::detect();
 
     println!("generator: {}", generator.description());

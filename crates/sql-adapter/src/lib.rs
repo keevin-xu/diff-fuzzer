@@ -97,6 +97,25 @@ pub mod validation;
 /// a hash.
 pub const FINDINGS_ROOT: &str = "findings/sql";
 
+/// Where **differential** findings go: two engines disagreed with each other.
+///
+/// # Why the two oracles write to separate trees
+///
+/// They were writing to the same `runs/{label}` directory, so two campaigns sharing a label
+/// interleaved their findings — and the two are not the same kind of claim at all. A
+/// differential finding names **two engines that disagreed**, and answering it means deciding
+/// which one is wrong. A metamorphic violation names **one engine contradicting itself**, where
+/// no second engine is involved and no legal-difference argument is available.
+///
+/// Mixing them in one directory makes a reader do that disambiguation per file, from the
+/// contents, forever. Splitting it costs one path segment.
+pub const DIFFERENTIAL_ROOT: &str = "findings/sql/differential";
+
+/// Where **metamorphic** violations go: one engine contradicted itself.
+///
+/// See [`DIFFERENTIAL_ROOT`] for why this is a separate tree rather than a naming convention.
+pub const METAMORPHIC_ROOT: &str = "findings/sql/metamorphic";
+
 /// Where this domain's non-diverging cases live.
 ///
 /// A case that was judged and **agreed** is evidence, not absence of evidence: a later
@@ -121,6 +140,19 @@ mod tests {
             NEGATIVES_ROOT.starts_with(FINDINGS_ROOT),
             "negatives root {NEGATIVES_ROOT} must be under findings root {FINDINGS_ROOT}"
         );
+    }
+
+    /// The two oracles must not write to the same tree.
+    ///
+    /// Both derive from [`FINDINGS_ROOT`] and both live under it, but they must stay distinct —
+    /// they were a single `runs/{label}` path until S10.11, where a shared label silently mixed
+    /// findings of two different kinds. Asserted rather than assumed, because the failure mode
+    /// is a directory that looks fine and means two things.
+    #[test]
+    fn the_two_oracles_write_to_separate_trees() {
+        assert_ne!(DIFFERENTIAL_ROOT, METAMORPHIC_ROOT);
+        assert!(DIFFERENTIAL_ROOT.starts_with(FINDINGS_ROOT));
+        assert!(METAMORPHIC_ROOT.starts_with(FINDINGS_ROOT));
     }
 
     /// This domain must not write where the tensor domain writes.
