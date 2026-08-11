@@ -469,6 +469,34 @@ impl Bounds {
         ..Bounds::V1
     };
 
+    /// **The campaign configuration**: everything in [`Bounds::V1_ALL`], at up to 2,000 rows.
+    ///
+    /// # Why the row count is the one thing added
+    ///
+    /// S10.9 measured `V1_ALL` and found five constructs at **0%** — chained set operations and
+    /// comma-joins (both deliberately off, each a catalogued legal difference that would flood),
+    /// and large tables with the index-over-large-table pairing (simply never enabled). Of
+    /// those, large data is the only one that opens a mechanism the project has **never
+    /// exercised**: DuckDB documents its ART index serving queries below **0.1% selectivity**
+    /// (`SPECS.md` §3.13), and eight rows cannot express 0.1% of anything.
+    ///
+    /// Comma-joins were considered and left out. They would add corpus but no *differential*
+    /// signal: the catalog now suppresses every divergence in that shape, deliberately and for
+    /// a good reason — if the engines parse the query differently they are running different
+    /// queries — so the differential oracle is blind there by construction (`PENDING` 2.29).
+    ///
+    /// # What it costs, stated up front
+    ///
+    /// Roughly half the throughput, and a lower ordered share: single-column `ORDER BY`
+    /// totality is near-impossible on a large table, since 25% of cells are `NULL` and two
+    /// `NULL`s tie. `PENDING` 2.28 carries the fix (multi-column ordering) and this preset is
+    /// deliberately shipped before it, so the campaign's ordering coverage is a known
+    /// limitation rather than a discovered one.
+    pub const V1_ALL_LARGE: Bounds = Bounds {
+        max_rows: 2_000,
+        ..Bounds::V1_ALL
+    };
+
     /// V1 plus set operations. One axis, as always.
     pub const V1_SET_OPS: Bounds = Bounds {
         set_ops: true,

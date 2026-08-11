@@ -152,6 +152,7 @@ fn main() {
         // remaining refusals are set operations, `LIMIT`, and queries with no `WHERE` — so the
         // two campaigns can now be run over the same surface and their zeros compared directly.
         None => Bounds::V1_ALL,
+        Some("all-large") => Bounds::V1_ALL_LARGE,
         Some("comma-joins") => Bounds::V1_COMMA_JOINS,
         // **An unrecognised name is a hard error, not a silent fallback to the default.**
         //
@@ -169,7 +170,7 @@ fn main() {
             eprintln!(
                 "unknown axis {unknown:?}. valid: rows, all, aggregates, setops, chained, \
                  joins, comma-joins, subqueries, not-in, not-in-list, not-in-correlated, \
-                 distinct, having, multi-group-by, case, window, indexes, large"
+                 distinct, having, multi-group-by, case, window, indexes, large, all-large"
             );
             std::process::exit(2);
         }

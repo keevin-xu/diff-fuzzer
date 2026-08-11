@@ -337,6 +337,7 @@ fn main() {
         .unwrap_or(5_000);
     let bounds = match arguments.next().as_deref() {
         Some("all") => Bounds::V1_ALL,
+        Some("all-large") => Bounds::V1_ALL_LARGE,
         Some("joins") => Bounds::V1_JOINS,
         Some("subqueries") => Bounds::V1_SUBQUERIES,
         Some("setops") => Bounds::V1_SET_OPS,

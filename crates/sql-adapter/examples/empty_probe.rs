@@ -26,6 +26,9 @@ fn main() {
         ("V1_NOT_IN_LIST", Bounds::V1_NOT_IN_LIST),
         ("V1_JOINS", Bounds::V1_JOINS),
         ("V1_AGGREGATES", Bounds::V1_AGGREGATES),
+        // The campaign configuration, so the 51% constraint in PENDING 2.19 is checked against
+        // the corpus that will actually run rather than against a proxy for it.
+        ("V1_ALL_LARGE", Bounds::V1_ALL_LARGE),
     ] {
         let generator = SqlGenerator::new(bounds);
         let (mut empty, mut ran, mut rows_total) = (0usize, 0usize, 0usize);

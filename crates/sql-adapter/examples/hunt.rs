@@ -85,6 +85,7 @@ fn main() {
         Some("large") => sql_adapter::gen_schema::Bounds::V1_LARGE,
         Some("subqueries") => sql_adapter::gen_schema::Bounds::V1_SUBQUERIES,
         Some("all") => sql_adapter::gen_schema::Bounds::V1_ALL,
+        Some("all-large") => sql_adapter::gen_schema::Bounds::V1_ALL_LARGE,
         Some("comma-joins") => sql_adapter::gen_schema::Bounds::V1_COMMA_JOINS,
         None => sql_adapter::gen_schema::Bounds::V1,
         // **An unrecognised name is a hard error, not a silent fallback to the default.**
@@ -103,7 +104,7 @@ fn main() {
             eprintln!(
                 "unknown axis {unknown:?}. valid: wide, aggregates, setops, chained, joins, \
                  comma-joins, not-in, not-in-list, not-in-correlated, distinct, having, \
-                 multi-group-by, case, window, indexes, large, subqueries, all"
+                 multi-group-by, case, window, indexes, large, subqueries, all, all-large"
             );
             std::process::exit(2);
         }
