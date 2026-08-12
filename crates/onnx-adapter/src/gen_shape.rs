@@ -29,9 +29,14 @@
 //! is therefore **measured on both sides** before it is trusted (N3.8), not assumed free.
 
 use diff_fuzzer_core::axes::GenerationAxes;
+use diff_fuzzer_core::rng::SeededRng;
+use rand::RngExt;
 
-use crate::case::{ElemType, OpKind};
+use crate::attrs::Attrs;
+use crate::case::{ElemType, OnnxCase, OpKind, TensorData, TensorValue};
+use crate::gen_value;
 use crate::ops::{self, Family, Tier};
+use crate::validation::input_name;
 
 /// A fingerprint of the code that decides what a case looks like.
 ///
@@ -350,6 +355,335 @@ impl GenerationAxes for Bounds {
     fn logic_version(&self) -> Option<String> {
         Some(format!("{GENERATOR_FINGERPRINT:08x}"))
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// Shape generation
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// Build one valid case for `op`, at `elem`, with shapes drawn from `bounds`.
+///
+/// **Correct-by-construction.** Every branch below produces a case that satisfies the
+/// operator's own rules — the right arity, the right types, shapes that make the operator
+/// meaningful, and attributes in range. Nothing is generated and then filtered: a rejected
+/// case tests the validator rather than the operator, and a case that is invalid *and*
+/// crashes a runtime is our bug rather than theirs.
+///
+/// Returns `None` when the specification forbids the pair, which is a fact about ONNX rather
+/// than about any runtime and must not be confused with one.
+pub fn generate_case(
+    op: OpKind,
+    elem: ElemType,
+    bounds: &Bounds,
+    rng: &mut SeededRng,
+) -> Option<OnnxCase> {
+    if !ops::spec(op).data_types.contains(&elem) || bounds.opset < ops::spec(op).since {
+        return None;
+    }
+    let opset = bounds.opset;
+
+    let case = match ops::spec(op).family {
+        Family::UnaryElementwise => {
+            let dims = shape(bounds, rng);
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+        }
+
+        Family::BinaryElementwise | Family::Comparison => {
+            // One shape for both operands. Broadcasting changes the output shape and needs its
+            // own rule and its own tests; admitting it here silently would leave `output_spec`
+            // quietly wrong. It is a deliberate omission, not an oversight.
+            let dims = shape(bounds, rng);
+            let count = element_count(&dims) as usize;
+            let left = TensorValue::new("a", dims.clone(), gen_value::ordinary(elem, count, rng));
+            // `Div`'s divisor avoids integer zeros: whether ONNX specifies integer division by
+            // zero has not been retrieved, so the answer is not known to be determined and the
+            // generator must not produce it. Floats are unrestricted — dividing by zero is
+            // IEEE-754 defined. See `gen_value::nonzero` and `PENDING` 1.11.
+            let right = if op == OpKind::Div {
+                TensorValue::new("b", dims.clone(), gen_value::nonzero(elem, count, rng))
+            } else {
+                TensorValue::new("b", dims.clone(), gen_value::ordinary(elem, count, rng))
+            };
+            OnnxCase::new(op, opset, vec![left, right])
+        }
+
+        Family::Select => {
+            let dims = shape(bounds, rng);
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    // The condition is genuinely boolean whatever the data type is.
+                    tensor("a", &dims, ElemType::Bool, rng),
+                    tensor("b", &dims, elem, rng),
+                    tensor("c", &dims, elem, rng),
+                ],
+            )
+        }
+
+        Family::Cast => {
+            let dims = shape(bounds, rng);
+            // Cast to a *different* type, or the case exercises no conversion at all.
+            let permitted = bounds.element_types();
+            let targets: Vec<ElemType> = permitted.iter().copied().filter(|t| *t != elem).collect();
+            let target = *targets.get(rng.random_range(0..targets.len().max(1)))?;
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+                .with_attrs(Attrs::new().int("to", i64::from(target.wire())))
+        }
+
+        Family::Transpose => {
+            let dims = shape_bounded(bounds, 1, bounds.degenerate_shapes, rng);
+            // A genuine permutation: Fisher-Yates over the axis indices, so every ordering is
+            // reachable and none is malformed by construction.
+            let mut perm: Vec<i64> = (0..dims.len() as i64).collect();
+            for index in (1..perm.len()).rev() {
+                perm.swap(index, rng.random_range(0..=index));
+            }
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+                .with_attrs(Attrs::new().ints("perm", perm))
+        }
+
+        Family::Concat => {
+            let dims = shape_nonempty(bounds, 1, rng);
+            let axis = rng.random_range(0..dims.len());
+            // Every input shares the shape except along `axis`, where they may differ. Keeping
+            // them equal there too would be valid but would never exercise the join.
+            //
+            // The extent along `axis` is capped by what the budget allows given the *other*
+            // dimensions — replacing a budgeted dimension with an unbudgeted one is exactly
+            // the bug that `shape_bounded` documents.
+            let rest = element_count(&dims) / dims[axis].max(1);
+            let ceiling = bounds
+                .max_dim
+                .min((bounds.element_budget as i64 / rest.max(1)).max(1));
+            let count = rng.random_range(2..=3);
+            let inputs = (0..count)
+                .map(|index| {
+                    let mut own = dims.clone();
+                    own[axis] = rng.random_range(1..=ceiling);
+                    tensor(&input_name(index), &own, elem, rng)
+                })
+                .collect();
+            OnnxCase::new(op, opset, inputs).with_attrs(Attrs::new().int("axis", axis as i64))
+        }
+
+        Family::Gather => {
+            // A non-empty shape from the start: the axis must have at least one element or no
+            // index into it is valid. Requested, not repaired — see `shape_bounded`.
+            let dims = shape_nonempty(bounds, 1, rng);
+            let axis = rng.random_range(0..dims.len());
+            let extent = dims[axis];
+            // Indices are **data**: their values decide the answer, so they stay fed. Drawn
+            // strictly inside the axis extent — an out-of-range index is undefined behaviour
+            // in ONNX, and a case whose answer is undetermined is a false finding waiting to
+            // be triaged.
+            let index_count = rng.random_range(1..=3usize);
+            let indices: Vec<i64> = (0..index_count)
+                .map(|_| rng.random_range(0..extent))
+                .collect();
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, rng),
+                    TensorValue::new("b", vec![index_count as i64], TensorData::I64(indices)),
+                ],
+            )
+            .with_attrs(Attrs::new().int("axis", axis as i64))
+        }
+
+        Family::Reshape => {
+            let dims = shape(bounds, rng);
+            let total: i64 = dims.iter().product::<i64>().max(0);
+            // A target whose element count matches exactly — the one rule `Reshape` has.
+            let target = factorization(total, bounds, rng);
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, rng),
+                    TensorValue::new("b", vec![target.len() as i64], TensorData::I64(target))
+                        .as_initializer(),
+                ],
+            )
+        }
+
+        Family::Squeeze => {
+            // `Squeeze` may only remove a dimension of extent 1, so one is placed deliberately
+            // rather than hoped for. Setting a dimension *down* to 1 only shrinks the tensor,
+            // so it cannot breach the budget.
+            let mut dims = shape_nonempty(bounds, 1, rng);
+            let axis = rng.random_range(0..dims.len());
+            dims[axis] = 1;
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, rng),
+                    TensorValue::new("b", vec![1], TensorData::I64(vec![axis as i64]))
+                        .as_initializer(),
+                ],
+            )
+        }
+
+        Family::Unsqueeze => {
+            let dims = shape(bounds, rng);
+            // A new axis may be inserted anywhere from 0 to rank inclusive.
+            let axis = rng.random_range(0..=dims.len());
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, rng),
+                    TensorValue::new("b", vec![1], TensorData::I64(vec![axis as i64]))
+                        .as_initializer(),
+                ],
+            )
+        }
+
+        Family::Shape | Family::Size => {
+            let dims = shape(bounds, rng);
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+        }
+
+        Family::Slice => {
+            let dims = shape_nonempty(bounds, 1, rng);
+            // A half-open range inside the first axis. `start < end <= extent` keeps the result
+            // non-empty and the answer determined.
+            let start = rng.random_range(0..dims[0]);
+            let end = rng.random_range(start + 1..=dims[0]);
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, rng),
+                    TensorValue::new("b", vec![1], TensorData::I64(vec![start])).as_initializer(),
+                    TensorValue::new("c", vec![1], TensorData::I64(vec![end])).as_initializer(),
+                ],
+            )
+        }
+
+        Family::Pad => {
+            let dims = shape_bounded(bounds, 1, bounds.degenerate_shapes, rng);
+            // `pads` is [begin_0..begin_n, end_0..end_n] — two entries per dimension. Only
+            // non-negative amounts: a negative pad *crops*, which is legal but is a different
+            // operation and deserves its own deliberate coverage rather than arriving by luck.
+            let mut pads: Vec<i64> = Vec::with_capacity(dims.len() * 2);
+            for _ in 0..dims.len() * 2 {
+                pads.push(rng.random_range(0..=2));
+            }
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, rng),
+                    TensorValue::new("b", vec![pads.len() as i64], TensorData::I64(pads))
+                        .as_initializer(),
+                ],
+            )
+            .with_attrs(Attrs::new().string("mode", "constant"))
+        }
+    };
+    Some(case)
+}
+
+/// A shape within the bounds, respecting the **element budget**.
+fn shape(bounds: &Bounds, rng: &mut SeededRng) -> Vec<i64> {
+    shape_bounded(bounds, 0, bounds.degenerate_shapes, rng)
+}
+
+/// A shape with at least `min_rank` dimensions, **none of them zero**.
+///
+/// For operators that need a non-empty axis to be meaningful — `Gather` must have something to
+/// index, `Slice` something to slice, `Concat` something to join.
+fn shape_nonempty(bounds: &Bounds, min_rank: usize, rng: &mut SeededRng) -> Vec<i64> {
+    shape_bounded(bounds, min_rank, false, rng)
+}
+
+/// The one place a shape is drawn, respecting the **element budget**.
+///
+/// # Why every caller goes through here
+///
+/// Rank and dimension multiply, so drawing each dimension independently from `1..=max_dim`
+/// would blow the budget on most ranks. Each dimension is capped by what the budget has left
+/// after the ones already chosen, which bounds the *work* rather than the knobs.
+///
+/// **`allow_zero` is a parameter rather than a repair afterwards, and that is the point.** The
+/// first version generated a shape and then raised a zero dimension to 1 where an operator
+/// needed a non-empty axis. That broke the budget silently: a zero dimension contributes
+/// nothing to the running product, so `[0,8,8,8]` is within any budget — and raising the zero
+/// to 1 turns it into 512 elements. A generated 300-element tensor against a 256 budget is
+/// what caught it.
+///
+/// The general shape of that mistake is worth naming, because it is the one this project keeps
+/// re-learning: **construct-then-repair defeats a constraint that construction established.**
+/// The constraint has to be an input to construction.
+fn shape_bounded(
+    bounds: &Bounds,
+    min_rank: usize,
+    allow_zero: bool,
+    rng: &mut SeededRng,
+) -> Vec<i64> {
+    let lowest = if bounds.degenerate_shapes {
+        min_rank
+    } else {
+        min_rank.max(1)
+    };
+    let rank = rng.random_range(lowest..=bounds.max_rank.max(lowest));
+
+    let mut dims = Vec::with_capacity(rank);
+    let mut remaining = bounds.element_budget.max(1) as i64;
+    for _ in 0..rank {
+        // The largest this dimension may be without the running product exceeding the budget.
+        let ceiling = bounds.max_dim.min(remaining.max(1));
+        // Zero-length dimensions are legal ONNX and are where implementations differ, so they
+        // are reachable — but only where the operator tolerates them and the axis is enabled.
+        let low = if allow_zero { 0 } else { 1 };
+        let dim = rng.random_range(low..=ceiling.max(low));
+        dims.push(dim);
+        // A zero dimension makes the tensor empty, so nothing further can exceed the budget.
+        if dim == 0 {
+            remaining = bounds.element_budget.max(1) as i64;
+        } else {
+            remaining = (remaining / dim).max(1);
+        }
+    }
+    dims
+}
+
+/// How many elements a shape implies.
+fn element_count(dims: &[i64]) -> i64 {
+    dims.iter().product::<i64>().max(0)
+}
+
+/// A shape whose element count is exactly `total`, for `Reshape`.
+///
+/// Built by repeatedly splitting off a divisor, so the product is correct **by construction**
+/// rather than by a check afterwards. A `Reshape` whose target does not match the input's
+/// element count is invalid, and generating one would be our bug appearing as a runtime's.
+fn factorization(total: i64, bounds: &Bounds, rng: &mut SeededRng) -> Vec<i64> {
+    if total == 0 {
+        // An empty tensor: any shape containing a zero has the same element count. Keep it
+        // simple and honest rather than inventing an arbitrary rank.
+        return vec![0];
+    }
+    let mut remaining = total;
+    let mut dims = Vec::new();
+    while remaining > 1 && dims.len() + 1 < bounds.max_rank.max(1) {
+        // Divisors of what is left, so the running product stays exact.
+        let divisors: Vec<i64> = (1..=remaining).filter(|d| remaining % d == 0).collect();
+        let divisor = divisors[rng.random_range(0..divisors.len())];
+        dims.push(divisor);
+        remaining /= divisor;
+    }
+    dims.push(remaining);
+    dims
+}
+
+/// A tensor of the given shape and type, filled with ordinary values.
+fn tensor(name: &str, dims: &[i64], elem: ElemType, rng: &mut SeededRng) -> TensorValue {
+    let count = dims.iter().product::<i64>().max(0) as usize;
+    TensorValue::new(name, dims.to_vec(), gen_value::ordinary(elem, count, rng))
 }
 
 #[cfg(test)]

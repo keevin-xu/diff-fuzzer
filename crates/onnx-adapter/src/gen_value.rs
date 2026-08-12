@@ -38,6 +38,53 @@ pub fn ordinary(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData
     }
 }
 
+/// Ordinary values with **no zeros**, for a divisor.
+///
+/// # Why this exists: an undetermined answer must not be generated
+///
+/// Integer division by zero was found, at N3, to make `tract` and `candle` panic while
+/// `onnx.reference` returns `0`. That looks like a conformance finding and **may not be one**:
+/// the reference's `Div` is a thin wrapper over numpy, so its `0` is numpy's answer, and
+/// whether ONNX *specifies* integer division by zero has not been retrieved.
+///
+/// Until it is, the case's answer is not known to be determined — and
+/// `03-CONCEPTS.md` §7 is explicit that the generator must refuse to produce cases whose
+/// answer the specification does not pin down. A case permitting two correct answers is a
+/// false finding paid for in triage.
+///
+/// This follows the precedent `02-METHODOLOGY.md` records: SQL needed to know whether
+/// `PARTITION BY` and `GROUP BY` treat two `NULL`s alike, neither engine documented it, and
+/// rather than assume, the relation **declined cases with a `NULL` key** — sound either way.
+/// Declining here is sound either way too. If the specification turns out to pin the answer
+/// down, this restriction is lifted and the finding is real; if it does not, we were right to
+/// refuse. `PENDING` 1.11.
+///
+/// Floats are **not** restricted: division by zero is defined by IEEE-754 and produces
+/// `±inf`/`NaN`, which is specified behaviour and exactly the surface this domain wants.
+pub fn nonzero(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData {
+    match elem {
+        ElemType::I32 => TensorData::I32(
+            (0..count)
+                .map(|_| {
+                    let value = rng.random_range(-100..99);
+                    if value >= 0 { value + 1 } else { value }
+                })
+                .collect(),
+        ),
+        ElemType::I64 => TensorData::I64(
+            (0..count)
+                .map(|_| {
+                    let value = rng.random_range(-100i64..99);
+                    if value >= 0 { value + 1 } else { value }
+                })
+                .collect(),
+        ),
+        // Floats and booleans are unrestricted: float division by zero is IEEE-754 defined,
+        // and `Div` does not accept booleans at all.
+        other => ordinary(other, count, rng),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +131,40 @@ mod tests {
             "only {} distinct values in 64",
             distinct.len()
         );
+    }
+
+    /// The divisor pool must contain no zeros, or the restriction is decoration.
+    #[test]
+    fn nonzero_never_produces_zero_for_integers() {
+        for elem in [ElemType::I32, ElemType::I64] {
+            let mut rng = SeededRng::from_seed(11);
+            let data = nonzero(elem, 4_000, &mut rng);
+            let zeros = data.to_bit_keys().iter().filter(|b| **b == 0).count();
+            assert_eq!(zeros, 0, "{elem:?} divisor pool contained {zeros} zeros");
+        }
+    }
+
+    /// ...and it must still produce both signs, or excluding zero has quietly excluded half
+    /// the number line as well.
+    #[test]
+    fn nonzero_still_spans_both_signs() {
+        let mut rng = SeededRng::from_seed(12);
+        let TensorData::I64(values) = nonzero(ElemType::I64, 2_000, &mut rng) else {
+            panic!("wrong variant");
+        };
+        assert!(values.iter().any(|v| *v > 0), "no positive divisors");
+        assert!(values.iter().any(|v| *v < 0), "no negative divisors");
+    }
+
+    /// Floats keep their zeros: dividing by zero is IEEE-754 defined and is exactly the
+    /// surface this domain exists to test. Restricting them would be giving away signal.
+    #[test]
+    fn nonzero_does_not_restrict_floats() {
+        let mut rng = SeededRng::from_seed(13);
+        let restricted = nonzero(ElemType::F32, 64, &mut rng);
+        let mut rng = SeededRng::from_seed(13);
+        let plain = ordinary(ElemType::F32, 64, &mut rng);
+        assert_eq!(restricted, plain, "float divisors must be unrestricted");
     }
 
     #[test]
