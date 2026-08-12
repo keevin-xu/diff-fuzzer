@@ -30,6 +30,7 @@
 //! | [`case`] | what a test case *is* |
 //! | [`attrs`] | an operator's static parameters |
 //! | [`ops`] | per-operator arity, types, output shape, and probe models |
+//! | [`census`] | which runtime supports which operator, **measured** |
 //! | [`outcome`] | what a runtime gives back, **including its failures, as values** |
 //! | [`validation`] | is this case well-formed? |
 //! | [`model`] | case → protobuf bytes |
@@ -43,6 +44,7 @@
 
 pub mod attrs;
 pub mod case;
+pub mod census;
 pub mod environment;
 pub mod generator;
 pub mod model;
