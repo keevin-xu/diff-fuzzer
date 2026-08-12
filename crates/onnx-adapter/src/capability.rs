@@ -150,6 +150,95 @@ impl Capabilities {
     }
 }
 
+/// Wrap a runtime so that a failure on an operator it does not claim becomes `Unsupported`.
+///
+/// # Why this exists, and why it was pulled forward from N5
+///
+/// A runtime that does not implement an operator reports it as a **typed error string**, not as
+/// a machine-readable "unsupported". The adapter records that conservatively as `Rejected` —
+/// the variant that accuses nobody — because telling a polite refusal from a genuine failure
+/// needs exactly the knowledge this module holds.
+///
+/// The consequence, measured at N3: once the generator widened to 33 operators, the oracle
+/// reported around twenty divergence signatures that were **all** capability gaps the census
+/// had already measured — `candle` implements neither `Max` nor `Round`, `tract` declines `Abs`
+/// on `f64`. Each surfaced as "one runtime rejected while others answered", which is a real
+/// disagreement in form and no finding at all in substance.
+///
+/// The roadmap placed this at N5, after the generator and the oracle. **That ordering was
+/// wrong**: a corpus cannot be judged until a gap can be told from a defect, so this is a
+/// prerequisite rather than a refinement. `PENDING` 1.12.
+///
+/// # What it does not do
+///
+/// It never turns a failure *into* a crash, and it never excuses one. A `Crashed` outcome
+/// passes through untouched — a runtime that panicked has panicked whatever any table says
+/// about what it claims. Only `Rejected` is reclassified, and only downward, to `Unsupported`.
+pub struct WithCapabilities<'a, I> {
+    inner: I,
+    capabilities: &'a Capabilities,
+}
+
+impl<'a, I> WithCapabilities<'a, I> {
+    pub fn new(inner: I, capabilities: &'a Capabilities) -> Self {
+        Self {
+            inner,
+            capabilities,
+        }
+    }
+}
+
+impl<I> diff_fuzzer_core::traits::Implementation for WithCapabilities<'_, I>
+where
+    I: diff_fuzzer_core::traits::Implementation<
+            In = crate::case::OnnxCase,
+            Out = crate::outcome::OnnxOutcome,
+        >,
+{
+    type In = crate::case::OnnxCase;
+    type Out = crate::outcome::OnnxOutcome;
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn run(
+        &self,
+        input: &crate::case::OnnxCase,
+    ) -> Result<crate::outcome::OnnxOutcome, diff_fuzzer_core::traits::RunError> {
+        use crate::outcome::OnnxOutcome;
+
+        let outcome = self.inner.run(input)?;
+        let OnnxOutcome::Rejected { detail } = outcome else {
+            // `Ok`, `Unsupported`, `Crashed` and `TimedOut` pass through untouched. In
+            // particular a crash is never reclassified: this can only ever say "that failure
+            // was a gap", never "that crash was not one".
+            return Ok(outcome);
+        };
+
+        // The element type the census keyed on — **not** `inputs[0]`, which for `Where` is the
+        // boolean condition rather than the data type. See `ops::data_elem_type`.
+        let elem = crate::ops::data_elem_type(input);
+
+        if self.capabilities.claims(self.inner.name(), input.op, elem) {
+            // It claims the operator and still refused this case. That is a statement about
+            // *this input*, and stays a comparable value — rows-versus-error was one of the SQL
+            // domain's most productive signals.
+            Ok(OnnxOutcome::Rejected { detail })
+        } else {
+            Ok(OnnxOutcome::Unsupported {
+                reason: format!(
+                    "{} does not implement {} at {elem:?} (census {}): {}",
+                    self.inner.name(),
+                    input.op.onnx_name(),
+                    self.capabilities.taken(),
+                    detail.lines().next().unwrap_or("")
+                ),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +336,103 @@ mod tests {
         );
         assert_eq!(caps.opset(), OPSET);
         assert!(!caps.taken().is_empty());
+    }
+
+    /// **The classification, and the two directions it must not run.**
+    #[test]
+    fn a_gap_becomes_unsupported_but_a_crash_never_changes() {
+        use crate::outcome::OnnxOutcome;
+        use crate::testing::Panicking;
+        use diff_fuzzer_core::traits::Implementation;
+
+        let caps = sample();
+        let case = crate::ops::probe(OpKind::Add, ElemType::F32, OPSET).unwrap();
+
+        /// A runtime that refuses everything with a typed error, named as a runtime the census
+        /// covered so the lookup finds it.
+        struct RefusesEverything(&'static str);
+        impl Implementation for RefusesEverything {
+            type In = crate::case::OnnxCase;
+            type Out = OnnxOutcome;
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn run(
+                &self,
+                _: &crate::case::OnnxCase,
+            ) -> Result<OnnxOutcome, diff_fuzzer_core::traits::RunError> {
+                Ok(OnnxOutcome::Rejected {
+                    detail: "no idea what that is".into(),
+                })
+            }
+        }
+
+        // ONNX Runtime *claims* `Add` at f32, so a refusal stays a comparable value.
+        let claimed = WithCapabilities::new(RefusesEverything("onnxruntime"), &caps);
+        assert!(
+            matches!(claimed.run(&case).unwrap(), OnnxOutcome::Rejected { .. }),
+            "a runtime that claims the operator and still refuses is making a statement about \
+             this input, which must stay comparable"
+        );
+
+        // A runtime the census never saw claims nothing, so the same refusal is a gap.
+        let unclaimed = WithCapabilities::new(RefusesEverything("never-censused"), &caps);
+        assert!(
+            matches!(
+                unclaimed.run(&case).unwrap(),
+                OnnxOutcome::Unsupported { .. }
+            ),
+            "a refusal from a runtime that claims nothing is a gap, not a disagreement"
+        );
+
+        // A crash is never reclassified, whatever the table says. This is the direction that
+        // must not run: the whole thesis is that crashes are findings.
+        let crasher = WithCapabilities::new(Panicking::new(), &caps);
+        assert!(
+            matches!(crasher.run(&case).unwrap(), OnnxOutcome::Crashed { .. }),
+            "a crash must survive classification — nothing may excuse one"
+        );
+    }
+
+    /// The reclassified reason must name the census it came from, so a stale matrix is
+    /// traceable from a report rather than being invisible in it.
+    #[test]
+    fn a_reclassified_gap_names_its_evidence() {
+        use crate::outcome::OnnxOutcome;
+        use diff_fuzzer_core::traits::Implementation;
+
+        struct Refuses;
+        impl Implementation for Refuses {
+            type In = crate::case::OnnxCase;
+            type Out = OnnxOutcome;
+            fn name(&self) -> &str {
+                "never-censused"
+            }
+            fn run(
+                &self,
+                _: &crate::case::OnnxCase,
+            ) -> Result<OnnxOutcome, diff_fuzzer_core::traits::RunError> {
+                Ok(OnnxOutcome::Rejected {
+                    detail: "unsupported op_type Max".into(),
+                })
+            }
+        }
+
+        let caps = sample();
+        let case = crate::ops::probe(OpKind::Max, ElemType::F32, OPSET).unwrap();
+        let OnnxOutcome::Unsupported { reason } =
+            WithCapabilities::new(Refuses, &caps).run(&case).unwrap()
+        else {
+            panic!("expected a gap");
+        };
+        assert!(
+            reason.contains("Max"),
+            "the operator must be named: {reason}"
+        );
+        assert!(
+            reason.contains(caps.taken()),
+            "the census date must be named so a stale matrix is traceable: {reason}"
+        );
     }
 
     /// The stored census must load and agree with a freshly taken one about a runtime both

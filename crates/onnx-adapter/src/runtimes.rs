@@ -740,6 +740,60 @@ mod tests {
         }
     }
 
+    /// **Finding 001, pinned as a test.** `tract` returns `Sign(0) = 1` for integer tensors;
+    /// the specification requires `0`.
+    ///
+    /// > "Calculate the sign of the given input tensor element-wise. If input > 0, output 1.
+    /// > if input < 0, output -1. **if input == 0, output 0.**"
+    /// > — [ONNX `Sign` reference](https://onnx.ai/onnx/operators/onnx__Sign.html)
+    ///
+    /// `onnx.reference` and ONNX Runtime both produce `0`; `tract` produces `1`. The float
+    /// paths are correct, so this is specifically the integer path.
+    ///
+    /// **The assertion is written to fail when the bug is FIXED**, not while it exists. A
+    /// finding recorded only in prose rots: nobody notices when it is fixed, and the report
+    /// goes stale. This way a `tract` upgrade that corrects it turns the suite red, which is
+    /// the moment to update `FINDING-001` and close it out.
+    #[test]
+    fn finding_001_tract_sign_of_integer_zero() {
+        use crate::case::{ElemType, TensorData};
+
+        let case = OnnxCase::new(
+            OpKind::Sign,
+            OPSET,
+            vec![TensorValue::new(
+                "a",
+                vec![3],
+                TensorData::I32(vec![-1, 0, 1]),
+            )],
+        );
+
+        // ONNX Runtime is the control: it agrees with the specification.
+        let OnnxOutcome::Ok(correct) = OrtRuntime.run(&case).expect("never Err") else {
+            panic!("ONNX Runtime should compute Sign on int32");
+        };
+        assert_eq!(
+            correct[0].data,
+            TensorData::I32(vec![-1, 0, 1]),
+            "the control must match the specification, or this test proves nothing"
+        );
+
+        let OnnxOutcome::Ok(observed) = TractRuntime.run(&case).expect("never Err") else {
+            panic!("tract claims Sign at int32 — the census recorded it as supported");
+        };
+        assert_eq!(
+            observed[0].data,
+            TensorData::I32(vec![-1, 1, 1]),
+            "tract's Sign(0) on integers changed. If it now returns 0 the bug is FIXED — \
+             update docs/scratch-explanations/onnx-runtimes/FINDING-001 and delete this test. \
+             Expected the known-wrong [-1, 1, 1]; got {:?}",
+            observed[0].data
+        );
+
+        // `ElemType` is referenced so the doc link above stays honest about the type involved.
+        assert_eq!(case.inputs[0].elem_type(), ElemType::I32);
+    }
+
     /// Special values must reach a runtime and come back intact. `Identity` performs no
     /// arithmetic, so anything lost here is lost in the plumbing.
     #[test]

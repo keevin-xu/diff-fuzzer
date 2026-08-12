@@ -317,6 +317,134 @@ mod tests {
         }
     }
 
+    /// **The special-value axis, and the rules that ride on it.**
+    ///
+    /// Turned on explicitly here because the default leaves it off: N4 measures what special
+    /// values buy against the ordinary-value baseline, and *a rate without a baseline is not a
+    /// measurement*. These tests verify the mechanism works before that measurement is taken.
+    #[test]
+    fn special_values_reach_the_corpus_when_the_axis_is_on() {
+        let generator = OnnxGenerator::new(Bounds::default().with_special_values());
+        let (mut nan, mut inf, mut negative_zero) = (false, false, false);
+
+        for seed in wide_seeds(3_000) {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            for input in &case.inputs {
+                if let Some(values) = input.as_f32() {
+                    for value in values {
+                        nan |= value.is_nan();
+                        inf |= value.is_infinite();
+                        negative_zero |= value.to_bits() == (-0.0f32).to_bits();
+                    }
+                }
+            }
+        }
+        assert!(nan, "no NaN in 3,000 cases with the axis on");
+        assert!(inf, "no infinity");
+        assert!(negative_zero, "no negative zero");
+    }
+
+    /// The baseline must genuinely contain none, or it is not a control.
+    #[test]
+    fn the_baseline_configuration_produces_no_special_values() {
+        let generator = OnnxGenerator::without_special_values();
+        for seed in wide_seeds(3_000) {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            for input in &case.inputs {
+                if let Some(values) = input.as_f32() {
+                    assert!(
+                        values.iter().all(|v| v.is_finite()),
+                        "seed {seed} produced a non-finite value with the axis off"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **`Max` and `Min` never receive a `NaN`**, even with the axis on.
+    ///
+    /// ONNX does not specify which operand wins, and IEEE-754 does not supply the answer either
+    /// — they are not basic operations, and its own `maxNum`/`minNum` semantics changed between
+    /// the 2008 and 2019 revisions. A case no document determines is a false finding waiting to
+    /// be triaged. `SPECS.md` §2.2c.
+    #[test]
+    fn max_and_min_never_receive_a_nan() {
+        let generator = OnnxGenerator::new(Bounds::default().with_special_values());
+        let mut checked = 0;
+
+        for seed in wide_seeds(6_000) {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            if !matches!(case.op, OpKind::Max | OpKind::Min) {
+                continue;
+            }
+            checked += 1;
+            for input in &case.inputs {
+                if let Some(values) = input.as_f32() {
+                    assert!(
+                        values.iter().all(|v| !v.is_nan()),
+                        "seed {seed}: {:?} received a NaN, whose result ONNX does not specify",
+                        case.op
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > 50,
+            "only {checked} Max/Min cases — the check is nearly vacuous"
+        );
+    }
+
+    /// ...but the *other* float operators still do, or the exclusion has quietly become a
+    /// global ban on `NaN` and the domain's densest surface has gone untested.
+    #[test]
+    fn other_float_operators_still_receive_nan() {
+        let generator = OnnxGenerator::new(Bounds::default().with_special_values());
+        let mut seen_nan_elsewhere = false;
+
+        for seed in wide_seeds(6_000) {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            if matches!(case.op, OpKind::Max | OpKind::Min) {
+                continue;
+            }
+            for input in &case.inputs {
+                if let Some(values) = input.as_f32() {
+                    seen_nan_elsewhere |= values.iter().any(|v| v.is_nan());
+                }
+            }
+        }
+        assert!(
+            seen_nan_elsewhere,
+            "no operator receives a NaN — the Max/Min exclusion has become a global ban"
+        );
+    }
+
+    /// Integer division by zero is never generated, whatever the value axis says. ONNX does not
+    /// specify it, so the answer is undetermined. `SPECS.md` §2.2b.
+    #[test]
+    fn integer_division_never_has_a_zero_divisor() {
+        for bounds in [Bounds::default(), Bounds::default().with_special_values()] {
+            let generator = OnnxGenerator::new(bounds);
+            let mut checked = 0;
+            for seed in wide_seeds(6_000) {
+                let case = generator.generate(&mut SeededRng::from_seed(seed));
+                if case.op != OpKind::Div {
+                    continue;
+                }
+                let divisor = &case.inputs[1].data;
+                let integral = matches!(divisor.elem_type(), ElemType::I32 | ElemType::I64);
+                if !integral {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    divisor.to_bit_keys().iter().all(|b| *b != 0),
+                    "seed {seed}: integer Div with a zero divisor"
+                );
+            }
+            assert!(checked > 20, "only {checked} integer Div cases");
+        }
+    }
+
     /// The configuration description must reach the generator's own report.
     #[test]
     fn the_description_records_the_configuration() {

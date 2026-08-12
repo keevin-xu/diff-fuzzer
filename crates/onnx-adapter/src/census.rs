@@ -225,6 +225,15 @@ pub fn take(
 
     for (op, elem) in ops::candidates(opset) {
         let case = ops::probe(op, elem, opset).expect("candidates only yields buildable pairs");
+        // Derived from the case by the same function the capability model uses, rather than
+        // taken from the loop variable. Two paths computing a key independently is how they
+        // come to disagree — and for `Where` they did, since its first input is the boolean
+        // condition and its data type is on the second.
+        debug_assert_eq!(
+            ops::data_elem_type(&case),
+            elem,
+            "the census key and the derived data type disagree for {op:?}"
+        );
         for runtime in runtimes {
             let outcome = runtime.run(&case).expect("failures are values, never Err");
             let detail = match &outcome {

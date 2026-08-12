@@ -38,6 +38,118 @@ pub fn ordinary(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData
     }
 }
 
+/// The values worth injecting deliberately, because sampling never produces them.
+///
+/// Uniform sampling essentially never yields `0.0`, `±inf`, `NaN`, a subnormal or `f32::MAX`,
+/// and **both of this project's prior real findings were special-value bugs** — a `matmul`
+/// overflow giving `inf` on one backend and `NaN` on another, and a reduction seeded with the
+/// smallest finite float instead of `−inf`. Neither would have been found by sampling.
+///
+/// Every entry is here because it has broken something somewhere: overflow to infinity, the
+/// sign of zero, the subnormal boundary, and the largest finite magnitudes.
+const SPECIAL_F32: [f32; 10] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    f32::INFINITY,
+    f32::NEG_INFINITY,
+    f32::NAN,
+    f32::MIN_POSITIVE, // the smallest normal — the subnormal boundary
+    f32::MAX,
+    f32::MIN,
+];
+
+/// The integer equivalents: boundaries where wrapping and saturation differ.
+const SPECIAL_I64: [i64; 7] = [
+    0,
+    1,
+    -1,
+    i64::MAX,
+    i64::MIN,
+    i32::MAX as i64,
+    i32::MIN as i64,
+];
+
+/// Values with special ones injected at `rate`.
+///
+/// `exclude_nan` exists for `Max` and `Min`, whose `NaN` behaviour **ONNX does not specify** —
+/// the operator page never mentions it, and unlike `Add`/`Sub`/`Mul`/`Div`/`Sqrt` they are not
+/// IEEE-754 basic operations, so IEEE does not supply the answer either. IEEE-754's own
+/// `maxNum`/`minNum` semantics changed between its 2008 and 2019 revisions. A case whose answer
+/// no document determines is a false finding waiting to be triaged, so it is not generated.
+/// `SPECS.md` §2.2c, `PENDING` 1.13.
+pub fn with_specials(
+    elem: ElemType,
+    count: usize,
+    rate: f64,
+    exclude_nan: bool,
+    rng: &mut SeededRng,
+) -> TensorData {
+    match elem {
+        ElemType::F32 => TensorData::F32(
+            (0..count)
+                .map(|_| {
+                    if rng.random_bool(rate) {
+                        pick_f32(exclude_nan, rng)
+                    } else {
+                        rng.random_range(-100.0..100.0)
+                    }
+                })
+                .collect(),
+        ),
+        ElemType::F64 => TensorData::F64(
+            (0..count)
+                .map(|_| {
+                    if rng.random_bool(rate) {
+                        f64::from(pick_f32(exclude_nan, rng))
+                    } else {
+                        f64::from(rng.random_range(-100.0f32..100.0))
+                    }
+                })
+                .collect(),
+        ),
+        ElemType::I32 => TensorData::I32(
+            (0..count)
+                .map(|_| {
+                    if rng.random_bool(rate) {
+                        // Saturating, so an i64 boundary lands on the i32 boundary rather than
+                        // wrapping into an arbitrary value that tests nothing in particular.
+                        SPECIAL_I64[rng.random_range(0..SPECIAL_I64.len())]
+                            .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                            as i32
+                    } else {
+                        rng.random_range(-100..100)
+                    }
+                })
+                .collect(),
+        ),
+        ElemType::I64 => TensorData::I64(
+            (0..count)
+                .map(|_| {
+                    if rng.random_bool(rate) {
+                        SPECIAL_I64[rng.random_range(0..SPECIAL_I64.len())]
+                    } else {
+                        rng.random_range(-100i64..100)
+                    }
+                })
+                .collect(),
+        ),
+        // A boolean has no special values: both of its two values are ordinary.
+        ElemType::Bool => ordinary(ElemType::Bool, count, rng),
+    }
+}
+
+fn pick_f32(exclude_nan: bool, rng: &mut SeededRng) -> f32 {
+    loop {
+        let value = SPECIAL_F32[rng.random_range(0..SPECIAL_F32.len())];
+        if exclude_nan && value.is_nan() {
+            continue;
+        }
+        return value;
+    }
+}
+
 /// Ordinary values with **no zeros**, for a divisor.
 ///
 /// # Why this exists: an undetermined answer must not be generated

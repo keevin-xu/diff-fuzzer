@@ -385,7 +385,7 @@ pub fn generate_case(
     let case = match ops::spec(op).family {
         Family::UnaryElementwise => {
             let dims = shape(bounds, rng);
-            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
         }
 
         Family::BinaryElementwise | Family::Comparison => {
@@ -393,16 +393,18 @@ pub fn generate_case(
             // own rule and its own tests; admitting it here silently would leave `output_spec`
             // quietly wrong. It is a deliberate omission, not an oversight.
             let dims = shape(bounds, rng);
-            let count = element_count(&dims) as usize;
-            let left = TensorValue::new("a", dims.clone(), gen_value::ordinary(elem, count, rng));
-            // `Div`'s divisor avoids integer zeros: whether ONNX specifies integer division by
-            // zero has not been retrieved, so the answer is not known to be determined and the
-            // generator must not produce it. Floats are unrestricted — dividing by zero is
-            // IEEE-754 defined. See `gen_value::nonzero` and `PENDING` 1.11.
+            let left = tensor("a", &dims, elem, op, bounds, rng);
+            // **`Div`'s divisor avoids integer zeros whatever the value axis says.** Retrieved:
+            // the ONNX `Div` page specifies truncating division for integers and never mentions
+            // a zero divisor, so the answer is undetermined and the case must not be generated.
+            // Two runtimes panic on it; the reference returns numpy's `0`. Floats keep their
+            // zeros — division by zero there is IEEE-754 defined and is exactly the surface this
+            // domain wants. `SPECS.md` §2.2b, `PENDING` 1.11.
             let right = if op == OpKind::Div {
+                let count = element_count(&dims) as usize;
                 TensorValue::new("b", dims.clone(), gen_value::nonzero(elem, count, rng))
             } else {
-                TensorValue::new("b", dims.clone(), gen_value::ordinary(elem, count, rng))
+                tensor("b", &dims, elem, op, bounds, rng)
             };
             OnnxCase::new(op, opset, vec![left, right])
         }
@@ -414,9 +416,9 @@ pub fn generate_case(
                 opset,
                 vec![
                     // The condition is genuinely boolean whatever the data type is.
-                    tensor("a", &dims, ElemType::Bool, rng),
-                    tensor("b", &dims, elem, rng),
-                    tensor("c", &dims, elem, rng),
+                    tensor("a", &dims, ElemType::Bool, op, bounds, rng),
+                    tensor("b", &dims, elem, op, bounds, rng),
+                    tensor("c", &dims, elem, op, bounds, rng),
                 ],
             )
         }
@@ -427,7 +429,7 @@ pub fn generate_case(
             let permitted = bounds.element_types();
             let targets: Vec<ElemType> = permitted.iter().copied().filter(|t| *t != elem).collect();
             let target = *targets.get(rng.random_range(0..targets.len().max(1)))?;
-            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
                 .with_attrs(Attrs::new().int("to", i64::from(target.wire())))
         }
 
@@ -439,7 +441,7 @@ pub fn generate_case(
             for index in (1..perm.len()).rev() {
                 perm.swap(index, rng.random_range(0..=index));
             }
-            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
                 .with_attrs(Attrs::new().ints("perm", perm))
         }
 
@@ -461,7 +463,7 @@ pub fn generate_case(
                 .map(|index| {
                     let mut own = dims.clone();
                     own[axis] = rng.random_range(1..=ceiling);
-                    tensor(&input_name(index), &own, elem, rng)
+                    tensor(&input_name(index), &own, elem, op, bounds, rng)
                 })
                 .collect();
             OnnxCase::new(op, opset, inputs).with_attrs(Attrs::new().int("axis", axis as i64))
@@ -485,7 +487,7 @@ pub fn generate_case(
                 op,
                 opset,
                 vec![
-                    tensor("a", &dims, elem, rng),
+                    tensor("a", &dims, elem, op, bounds, rng),
                     TensorValue::new("b", vec![index_count as i64], TensorData::I64(indices)),
                 ],
             )
@@ -501,7 +503,7 @@ pub fn generate_case(
                 op,
                 opset,
                 vec![
-                    tensor("a", &dims, elem, rng),
+                    tensor("a", &dims, elem, op, bounds, rng),
                     TensorValue::new("b", vec![target.len() as i64], TensorData::I64(target))
                         .as_initializer(),
                 ],
@@ -519,7 +521,7 @@ pub fn generate_case(
                 op,
                 opset,
                 vec![
-                    tensor("a", &dims, elem, rng),
+                    tensor("a", &dims, elem, op, bounds, rng),
                     TensorValue::new("b", vec![1], TensorData::I64(vec![axis as i64]))
                         .as_initializer(),
                 ],
@@ -534,7 +536,7 @@ pub fn generate_case(
                 op,
                 opset,
                 vec![
-                    tensor("a", &dims, elem, rng),
+                    tensor("a", &dims, elem, op, bounds, rng),
                     TensorValue::new("b", vec![1], TensorData::I64(vec![axis as i64]))
                         .as_initializer(),
                 ],
@@ -543,7 +545,7 @@ pub fn generate_case(
 
         Family::Shape | Family::Size => {
             let dims = shape(bounds, rng);
-            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, rng)])
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
         }
 
         Family::Slice => {
@@ -556,7 +558,7 @@ pub fn generate_case(
                 op,
                 opset,
                 vec![
-                    tensor("a", &dims, elem, rng),
+                    tensor("a", &dims, elem, op, bounds, rng),
                     TensorValue::new("b", vec![1], TensorData::I64(vec![start])).as_initializer(),
                     TensorValue::new("c", vec![1], TensorData::I64(vec![end])).as_initializer(),
                 ],
@@ -576,7 +578,7 @@ pub fn generate_case(
                 op,
                 opset,
                 vec![
-                    tensor("a", &dims, elem, rng),
+                    tensor("a", &dims, elem, op, bounds, rng),
                     TensorValue::new("b", vec![pads.len() as i64], TensorData::I64(pads))
                         .as_initializer(),
                 ],
@@ -680,10 +682,31 @@ fn factorization(total: i64, bounds: &Bounds, rng: &mut SeededRng) -> Vec<i64> {
     dims
 }
 
-/// A tensor of the given shape and type, filled with ordinary values.
-fn tensor(name: &str, dims: &[i64], elem: ElemType, rng: &mut SeededRng) -> TensorValue {
-    let count = dims.iter().product::<i64>().max(0) as usize;
-    TensorValue::new(name, dims.to_vec(), gen_value::ordinary(elem, count, rng))
+/// A tensor of the given shape and type, filled according to `bounds`.
+///
+/// **One place decides how a data tensor is filled**, so the special-value rate and the
+/// `NaN` exclusions apply everywhere rather than at whichever call site remembered them. That
+/// is the same rule as `shape_bounded`: a property belongs in the construction path, not at the
+/// sites where it was first needed.
+fn tensor(
+    name: &str,
+    dims: &[i64],
+    elem: ElemType,
+    op: OpKind,
+    bounds: &Bounds,
+    rng: &mut SeededRng,
+) -> TensorValue {
+    let count = element_count(dims) as usize;
+    let data = if bounds.special_values {
+        // `Max` and `Min` never receive a `NaN`: ONNX does not specify which operand wins, and
+        // IEEE-754 does not supply the answer either since they are not basic operations and
+        // its own `maxNum`/`minNum` semantics changed between revisions. `SPECS.md` §2.2c.
+        let exclude_nan = matches!(op, OpKind::Max | OpKind::Min);
+        gen_value::with_specials(elem, count, bounds.special_value_rate, exclude_nan, rng)
+    } else {
+        gen_value::ordinary(elem, count, rng)
+    };
+    TensorValue::new(name, dims.to_vec(), data)
 }
 
 #[cfg(test)]

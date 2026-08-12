@@ -28,6 +28,26 @@ fn main() {
 
     let generator = OnnxGenerator::default();
     let reference = ReferenceRuntime::start().expect("reference");
+
+    // The capability model, pulled forward from N5 (`PENDING` 1.12). Without it, a runtime that
+    // does not implement an operator reports a typed error string, the adapter records it as
+    // `Rejected`, and the oracle correctly reports "one rejected while others answered" — a real
+    // disagreement in form and no finding at all in substance.
+    let path = format!("{}/census.json", onnx_adapter::FINDINGS_ROOT);
+    let caps = onnx_adapter::capability::Capabilities::load(&path)
+        .expect("run the n2_census example first — the corpus is not judgeable without it");
+    let drift = caps.is_stale_for(&onnx_adapter::environment::environment().components);
+    if !drift.is_empty() {
+        eprintln!("REFUSING: the census was taken under different versions: {drift:?}");
+        std::process::exit(1);
+    }
+    let tract = onnx_adapter::capability::WithCapabilities::new(TractRuntime, &caps);
+    let ort = onnx_adapter::capability::WithCapabilities::new(OrtRuntime, &caps);
+    #[cfg(feature = "candle")]
+    let candle = onnx_adapter::capability::WithCapabilities::new(
+        onnx_adapter::runtimes::CandleRuntime,
+        &caps,
+    );
     let mut crashes: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     let mut diverged: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     let mut invalid = 0;
@@ -41,14 +61,11 @@ fn main() {
 
         #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
         let mut participants: Vec<(&str, OnnxOutcome)> = vec![
-            ("tract", TractRuntime.run(&case).unwrap()),
-            ("onnxruntime", OrtRuntime.run(&case).unwrap()),
+            ("tract", tract.run(&case).unwrap()),
+            ("onnxruntime", ort.run(&case).unwrap()),
         ];
         #[cfg(feature = "candle")]
-        participants.push((
-            "candle",
-            onnx_adapter::runtimes::CandleRuntime.run(&case).unwrap(),
-        ));
+        participants.push(("candle", candle.run(&case).unwrap()));
 
         // Group participants by what they produced; more than one group is a disagreement.
         use diff_fuzzer_core::Normalizer;

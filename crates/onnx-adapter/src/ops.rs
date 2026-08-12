@@ -413,6 +413,32 @@ fn i64_input(case: &OnnxCase, index: usize) -> Vec<i64> {
     }
 }
 
+/// The element type a case is *about* — the one the census keys on.
+///
+/// # Why this is a function and not `inputs[0].elem_type()`
+///
+/// For almost every operator the first input carries the data type. **`Where` is the
+/// exception**: its first input is the boolean *condition*, and its data type is on the second.
+///
+/// The census keys each cell on the data type, so a lookup reading `inputs[0]` would ask about
+/// `Where`/`Bool` while the census recorded `Where`/`F32`. Both answers are wrong in different
+/// directions, and neither failure is visible — a capability lookup that silently consults the
+/// wrong key returns a confident `false` and reclassifies a real disagreement as a gap.
+///
+/// `02-METHODOLOGY.md`: *a value matched by equality needs a single definition.* This is that
+/// definition; the census and the capability model both call it, so they cannot disagree.
+pub fn data_elem_type(case: &OnnxCase) -> ElemType {
+    let index = match spec(case.op).family {
+        // `cond, x, y` — the data type is on `x`.
+        Family::Select => 1,
+        _ => 0,
+    };
+    case.inputs
+        .get(index)
+        .or_else(|| case.inputs.first())
+        .map_or(ElemType::F32, TensorValue::elem_type)
+}
+
 /// Build the minimal valid model that probes `op` at `elem`.
 ///
 /// `None` when the operator does not accept that element type, which is a *specification*
