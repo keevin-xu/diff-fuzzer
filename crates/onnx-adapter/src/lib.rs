@@ -30,6 +30,8 @@
 //! | [`case`] | what a test case *is* |
 //! | [`attrs`] | an operator's static parameters |
 //! | [`ops`] | per-operator arity, types, output shape, and probe models |
+//! | [`gen_shape`] | what a case may contain — the axes and bounds |
+//! | [`gen_value`] | filling tensors once shape and type are decided |
 //! | [`census`] | which runtime supports which operator, **measured** |
 //! | [`capability`] | what each runtime *claims*, so a crash can be told from a gap |
 //! | [`outcome`] | what a runtime gives back, **including its failures, as values** |
@@ -48,6 +50,8 @@ pub mod capability;
 pub mod case;
 pub mod census;
 pub mod environment;
+pub mod gen_shape;
+pub mod gen_value;
 pub mod generator;
 pub mod model;
 pub mod normalize;
