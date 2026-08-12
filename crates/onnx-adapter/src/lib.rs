@@ -23,15 +23,24 @@
 //!
 //! # Layout
 //!
-//! - [`pb`] — the ONNX protobuf types, generated at build time from `proto/onnx.proto`.
-//! - [`model`] — building a single-node model and serializing it to bytes.
-//! - [`environment`] — the versions a finding applies to, including the `onnx` release
-//!   that *is* the specification revision under test.
+//! Read the modules in dependency order; each depends only on the ones above it.
 //!
-//! Everything else (the case type, the generator, the runtimes, the oracle) arrives in
-//! later phases. This crate is deliberately small right now: PHASE-N0 exists to prove the
-//! plumbing before anything is built on it.
+//! | module | what it answers |
+//! |---|---|
+//! | [`case`] | what a test case *is* |
+//! | [`attrs`] | an operator's static parameters |
+//! | [`outcome`] | what a runtime gives back, **including its failures, as values** |
+//! | [`validation`] | is this case well-formed? |
+//! | [`model`] | case → protobuf bytes |
+//! | [`runtimes`], [`reference`] | bytes → each participant → outcome |
+//! | [`normalize`] | outcome → comparable form |
+//! | [`oracle`] | comparable forms → verdict |
+//! | [`testing`] | implementations that are **wrong on purpose** |
+//! | [`generator`] | seed → case |
+//! | [`environment`] | the versions a finding applies to |
+//! | [`pb`] | the ONNX protobuf types, generated at build time |
 
+pub mod attrs;
 pub mod case;
 pub mod environment;
 pub mod generator;

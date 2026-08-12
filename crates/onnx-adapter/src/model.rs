@@ -109,6 +109,9 @@ pub fn build(case: &OnnxCase) -> ModelProto {
         output: vec![OnnxCase::OUTPUT_NAME.to_owned()],
         name: Some(format!("{}_0", case.op.onnx_name().to_lowercase())),
         op_type: Some(case.op.onnx_name().to_owned()),
+        // Order is preserved from the case, which is what keeps serialization
+        // byte-identical for the same case. See `attrs.rs`.
+        attribute: case.attrs.to_protos(),
         ..Default::default()
     };
 
@@ -276,6 +279,43 @@ mod tests {
         let decoded = ModelProto::decode(to_bytes(&original).as_slice())
             .expect("bytes we just wrote must decode");
         assert_eq!(original, decoded);
+    }
+
+    /// Attributes must reach the node, in order, with their tags intact. An attribute that
+    /// does not arrive is an operator silently running with its default parameter.
+    #[test]
+    fn attributes_reach_the_node() {
+        let case = well_formed(OpKind::Identity, &[2, 3], DEFAULT_OPSET).with_attrs(
+            crate::attrs::Attrs::new()
+                .int("axis", 1)
+                .ints("perm", vec![1, 0]),
+        );
+        let graph = build(&case).graph.expect("graph");
+
+        let names: Vec<&str> = graph.node[0]
+            .attribute
+            .iter()
+            .filter_map(|a| a.name.as_deref())
+            .collect();
+        assert_eq!(names, vec!["axis", "perm"]);
+        assert_eq!(graph.node[0].attribute[0].i, Some(1));
+        assert_eq!(graph.node[0].attribute[1].ints, vec![1, 0]);
+    }
+
+    /// Changing an attribute must change the bytes, or the attribute is not part of what
+    /// the runtimes were asked to compute.
+    #[test]
+    fn attributes_change_the_serialized_bytes() {
+        let base = well_formed(OpKind::Identity, &[2], DEFAULT_OPSET);
+        let with_axis = base
+            .clone()
+            .with_attrs(crate::attrs::Attrs::new().int("axis", 0));
+        let other_axis = base
+            .clone()
+            .with_attrs(crate::attrs::Attrs::new().int("axis", 1));
+
+        assert_ne!(build_bytes(&base), build_bytes(&with_axis));
+        assert_ne!(build_bytes(&with_axis), build_bytes(&other_axis));
     }
 
     /// Two different cases must not produce the same bytes. A builder that ignored part of

@@ -27,6 +27,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::attrs::Attrs;
+
 /// A tensor's element type, as ONNX numbers them on the wire.
 ///
 /// Only the types this domain generates. The schema defines 27; these five are what the
@@ -286,6 +288,20 @@ pub mod f32_bits {
     }
 }
 
+/// The same treatment for a single `f32` — used by float *attributes*, which can also
+/// legitimately be an infinity. See [`f32_bits`].
+pub mod f32_bits_scalar {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(value.to_bits())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+        Ok(f32::from_bits(u32::deserialize(deserializer)?))
+    }
+}
+
 /// The same treatment for `f64`. See [`f32_bits`].
 pub mod f64_bits {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -374,11 +390,35 @@ pub struct OnnxCase {
     pub opset: i64,
     pub op: OpKind,
     pub inputs: Vec<TensorValue>,
+    /// The node's static parameters — `axis`, `perm`, `to`, and friends.
+    ///
+    /// Empty for the elementwise operators, which take none. Whether a given parameter is
+    /// an attribute or an *input* is per-operator and per-opset, and it changes between
+    /// versions; see [`crate::attrs`].
+    #[serde(default)]
+    pub attrs: Attrs,
 }
 
 impl OnnxCase {
     pub fn new(op: OpKind, opset: i64, inputs: Vec<TensorValue>) -> Self {
-        Self { opset, op, inputs }
+        Self {
+            opset,
+            op,
+            inputs,
+            attrs: Attrs::new(),
+        }
+    }
+
+    /// The same case with attributes attached.
+    ///
+    /// `#[serde(default)]` on the field means a finding stored before attributes existed
+    /// still deserializes, with none. That is the backward-compatible-deserializer rule
+    /// from `08-RISKS.md` §11: an earlier domain broke every stored finding by widening a
+    /// field's type, and the fix was to make old records keep loading.
+    #[must_use]
+    pub fn with_attrs(mut self, attrs: Attrs) -> Self {
+        self.attrs = attrs;
+        self
     }
 
     /// The name the single output is given in the graph.

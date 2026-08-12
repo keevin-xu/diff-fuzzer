@@ -77,6 +77,9 @@ pub enum Invalid {
 
     #[error("opset {opset} is out of the supported range {min}..={max}")]
     OpsetOutOfRange { opset: i64, min: i64, max: i64 },
+
+    #[error("attribute names must be unique and non-empty; {name:?} is not")]
+    BadAttributeName { name: String },
 }
 
 /// The opset range this adapter is willing to build models for.
@@ -149,6 +152,19 @@ pub fn validate(case: &OnnxCase) -> Vec<Invalid> {
                 });
             }
         }
+    }
+
+    // Attribute names must be unique. ONNX looks an attribute up by name, so a duplicate
+    // makes the node ambiguous — and which one wins is not something the specification
+    // pins down, which makes it exactly the kind of case the generator must never emit.
+    let mut seen_attrs: Vec<&str> = Vec::new();
+    for (name, _) in case.attrs.iter() {
+        if name.is_empty() || seen_attrs.contains(&name) {
+            problems.push(Invalid::BadAttributeName {
+                name: name.to_owned(),
+            });
+        }
+        seen_attrs.push(name);
     }
 
     // Shape and type agreement across inputs.
@@ -322,6 +338,40 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Invalid::BadInputName { .. }))
         );
+    }
+
+    #[test]
+    fn duplicate_attribute_names_are_caught() {
+        let case = well_formed(OpKind::Identity, &[2], OPSET)
+            .with_attrs(crate::attrs::Attrs::new().int("axis", 0).int("axis", 1));
+        assert!(
+            validate(&case)
+                .iter()
+                .any(|p| matches!(p, Invalid::BadAttributeName { .. })),
+            "ONNX looks attributes up by name; a duplicate makes the node ambiguous"
+        );
+    }
+
+    #[test]
+    fn an_empty_attribute_name_is_caught() {
+        let case = well_formed(OpKind::Identity, &[2], OPSET)
+            .with_attrs(crate::attrs::Attrs::new().int("", 0));
+        assert!(
+            validate(&case)
+                .iter()
+                .any(|p| matches!(p, Invalid::BadAttributeName { .. }))
+        );
+    }
+
+    /// Attributes are optional: a case with none must still be valid, or every elementwise
+    /// operator would be rejected.
+    #[test]
+    fn a_case_with_no_attributes_is_valid() {
+        for op in OpKind::ALL {
+            let case = well_formed(op, &[2], OPSET);
+            assert!(case.attrs.is_empty());
+            assert_eq!(validate(&case), vec![]);
+        }
     }
 
     #[test]
