@@ -30,6 +30,18 @@ _to_delete/
 .env
 .env.*
 
+# ── Python environment for the ONNX reference implementation ─────────
+#
+# `onnx.reference` is the specification's own executable definition and is the
+# ONNX domain's ground truth. It is reached by subprocess, so the project needs an
+# interpreter it controls rather than whatever `python3` happens to be — this
+# machine's system Python is 3.14 with no `onnx` in it.
+#
+# The directory is ignored; the *pin* is not. `crates/onnx-adapter/requirements.txt`
+# is committed and is the reproducible artifact, because the `onnx` version IS the
+# specification revision every finding is judged against.
+.venv-onnx/
+
 # NOTE: Cargo.lock is intentionally NOT ignored — commit it.
 #   Reproducibility is a core project value (pinned deps -> reproducible divergences).
 *.md

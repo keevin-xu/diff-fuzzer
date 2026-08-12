@@ -1,0 +1,40 @@
+[package]
+name = "onnx-adapter"
+description = "The ONNX adapter: single-operator model construction, runtime implementations, and conformance comparison against onnx.reference."
+# Inherited from [workspace.package] in the root Cargo.toml rather than repeated. One
+# version number for the whole project means a saved finding names a version that
+# actually identifies the code that produced it.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The dependency arrow points this way and never the other way: the adapter knows about
+# the engine, the engine knows nothing about ONNX. Cargo enforces that, not discipline.
+diff-fuzzer-core = { path = "../diff-fuzzer-core" }
+# For the RNG traits only. The generator is always the engine's `SeededRng` — a second
+# source of randomness would mean a finding that cannot be replayed from its seed.
+rand.workspace = true
+# A finding must serialize whole. The seed alone does not reproduce a case: it only does
+# so for the exact generator that produced it, and generators change.
+serde.workspace = true
+serde_json.workspace = true
+
+# The protobuf runtime. `prost` is the decode/encode half; the *types* are generated at
+# build time from `proto/onnx.proto` by the build script. See DECISIONS N0.1 for why the
+# schema is compiled here rather than taken from `onnx-protobuf` or `onnx-pb`, both of
+# which lag the current schema.
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+# A pure-Rust protobuf compiler. It replaces the `protoc` binary that `prost-build` would
+# otherwise shell out to, so this crate builds on any machine that can run cargo — protoc
+# is not installed on the development machine and requiring it would be a reproducibility
+# hazard, not merely an inconvenience.
+protox.workspace = true
+
+# Note what is NOT here: `tensor-adapter` or `sql-adapter`. The triage and predicate
+# machinery this domain reuses will be *copied* rather than depended on — depending on
+# either would drag libtorch, wgpu, SQLite and DuckDB into every ONNX build.

@@ -1,0 +1,5 @@
+ml_dtypes==0.5.4
+numpy==2.5.2
+onnx==1.22.0
+protobuf==7.35.1
+typing_extensions==4.16.0

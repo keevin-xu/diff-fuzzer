@@ -10,6 +10,10 @@ members = [
     "crates/diff-fuzzer-core",
     "crates/tensor-adapter",
     "crates/sql-adapter",
+    # `onnx-adapter` is the third domain (ONNX runtime conformance). Like the other two it
+    # depends only on the engine, and no adapter may depend on another: an ONNX build must
+    # never compile libtorch or DuckDB.
+    "crates/onnx-adapter",
 ]
 
 # Resolver 3 is the current dependency resolver (required for edition 2024).
@@ -93,3 +97,21 @@ tracing-subscriber = "0.3.23"
 # not assumed here (`planning/sql-duckdb/PENDING.md` 1.7).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 duckdb = { version = "1.10505.0", features = ["bundled"] }
+
+# ---------------------------------------------------------------------------------
+# ONNX domain (crates/onnx-adapter). Used by that crate only.
+# ---------------------------------------------------------------------------------
+#
+# The ONNX *schema* is compiled from `crates/onnx-adapter/proto/onnx.proto` at build
+# time rather than taken from a published crate. Measured 2026-08-12: the canonical
+# schema shipped with onnx 1.22.0 defines 27 TensorProto data types at IR version 13,
+# while `onnx-protobuf` 0.2.3 knows 23 and `onnx-pb` 0.1.4 knows 17 and still depends on
+# prost 0.6. Compiling the schema ourselves means the types we build models with are the
+# same revision as the reference implementation that judges them. See DECISIONS N0.1.
+prost = "0.14.4"
+prost-build = "0.14.4"
+# Pure-Rust protobuf compiler, standing in for the `protoc` binary. `protoc` is not
+# installed on the development machine, and making the build depend on a system binary
+# whose version nobody records is exactly the reproducibility hazard this project avoids
+# elsewhere by bundling SQLite and DuckDB from source.
+protox = "0.9.1"
