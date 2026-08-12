@@ -231,7 +231,7 @@ fn every_operator_is_exercised_through_the_driver() {
             seen.push(op);
         }
     }
-    for op in OpKind::ALL {
+    for op in OpKind::ELEMENTWISE {
         assert!(seen.contains(&op), "{op:?} never reached the driver");
     }
 }

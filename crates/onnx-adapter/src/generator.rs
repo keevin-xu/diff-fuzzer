@@ -48,7 +48,10 @@ pub struct OnnxGenerator {
 impl Default for OnnxGenerator {
     fn default() -> Self {
         Self {
-            operators: OpKind::ALL.to_vec(),
+            // The skeleton generator builds identically-shaped inputs, which is right
+            // for these and wrong for `Reshape`, `Gather` and friends. Those need
+            // per-operator construction, which is the real generator's job at N3.
+            operators: OpKind::ELEMENTWISE.to_vec(),
             max_rank: 3,
             max_dim: 4,
             special_value_rate: 0.25,
@@ -136,7 +139,7 @@ impl Generator for OnnxGenerator {
 
         // Every input shares the shape. Broadcasting is an N3 decision with its own shape
         // rule and its own tests, not something to slip in here.
-        let inputs = (0..op.arity())
+        let inputs = (0..op.arity_range().0)
             .map(|index| {
                 let values: Vec<f32> = (0..count).map(|_| self.value(rng)).collect();
                 TensorValue::f32(&input_name(index), dims.clone(), values)

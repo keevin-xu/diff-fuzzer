@@ -35,7 +35,7 @@
 
 use prost::Message;
 
-use crate::case::{ElemType, OnnxCase, OpKind, TensorValue};
+use crate::case::{ElemType, OnnxCase, OpKind};
 use crate::pb::{
     GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorShapeProto, TypeProto,
     ValueInfoProto, tensor_shape_proto, type_proto,
@@ -115,10 +115,11 @@ pub fn build(case: &OnnxCase) -> ModelProto {
         ..Default::default()
     };
 
-    let elem_type = case
-        .inputs
-        .first()
-        .map_or(ElemType::F32, TensorValue::elem_type);
+    // The output's type and shape are **computed per operator**, not copied from the first
+    // input. Five operators return a different type than they were given — the comparisons
+    // return `Bool`, `Shape` and `Size` return `I64` — and every structural operator changes
+    // the shape. See `ops::output_spec`, and `SPECS.md` §2.1 for where those facts came from.
+    let (elem_type, output_dims) = crate::ops::output_spec(case);
 
     let graph = GraphProto {
         node: vec![node],
@@ -128,11 +129,7 @@ pub fn build(case: &OnnxCase) -> ModelProto {
             .iter()
             .map(|t| value_info(&t.name, t.elem_type(), &t.dims))
             .collect(),
-        output: vec![value_info(
-            OnnxCase::OUTPUT_NAME,
-            elem_type,
-            &case.output_dims(),
-        )],
+        output: vec![value_info(OnnxCase::OUTPUT_NAME, elem_type, &output_dims)],
         ..Default::default()
     };
 
@@ -179,8 +176,10 @@ mod tests {
 
     #[test]
     fn a_case_becomes_a_single_node_graph() {
-        for op in OpKind::ALL {
-            let case = well_formed(op, &[2, 3], DEFAULT_OPSET);
+        // Every operator in the catalog, via its probe — not just the elementwise ones,
+        // because the structural operators are exactly where the builder could be wrong.
+        for (op, elem) in crate::ops::candidates(DEFAULT_OPSET) {
+            let case = crate::ops::probe(op, elem, DEFAULT_OPSET).unwrap();
             let model = build(&case);
             let graph = model.graph.as_ref().expect("a model must carry a graph");
 
@@ -188,10 +187,10 @@ mod tests {
             assert_eq!(graph.node[0].op_type.as_deref(), Some(op.onnx_name()));
             assert_eq!(
                 graph.node[0].input.len(),
-                op.arity(),
+                case.inputs.len(),
                 "{op:?} node arity must match the case"
             );
-            assert_eq!(graph.input.len(), op.arity());
+            assert_eq!(graph.input.len(), case.inputs.len());
             assert_eq!(graph.output.len(), 1);
         }
     }
@@ -252,9 +251,9 @@ mod tests {
     /// byte-identical input" is not a claim that can be made.
     #[test]
     fn serialization_is_deterministic() {
-        for op in OpKind::ALL {
-            let case = well_formed(op, &[2, 3], DEFAULT_OPSET);
-            assert_eq!(build_bytes(&case), build_bytes(&case), "{op:?}");
+        for (op, elem) in crate::ops::candidates(DEFAULT_OPSET) {
+            let case = crate::ops::probe(op, elem, DEFAULT_OPSET).unwrap();
+            assert_eq!(build_bytes(&case), build_bytes(&case), "{op:?} at {elem:?}");
             assert!(!build_bytes(&case).is_empty());
         }
     }

@@ -534,7 +534,7 @@ mod tests {
     /// moment it exists, rather than whenever someone remembers to extend the list.
     #[test]
     fn every_runtime_runs_every_operator_and_they_agree() {
-        for op in OpKind::ALL {
+        for op in OpKind::ELEMENTWISE {
             let case = well_formed(op, &[2, 3], OPSET);
 
             let results: Vec<(String, OnnxOutcome)> = in_process()

@@ -38,10 +38,11 @@ use crate::case::{ElemType, OnnxCase, OpKind, TensorData, TensorValue};
 /// validator drifts away from what its tests claim to check.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Invalid {
-    #[error("{op} takes {expected} input(s), got {actual}")]
+    #[error("{op} takes {min}..={max} input(s), got {actual}")]
     WrongArity {
         op: &'static str,
-        expected: usize,
+        min: usize,
+        max: usize,
         actual: usize,
     },
 
@@ -110,11 +111,14 @@ pub fn validate(case: &OnnxCase) -> Vec<Invalid> {
         });
     }
 
-    let expected_arity = case.op.arity();
-    if case.inputs.len() != expected_arity {
+    // A **range**, because several operators are variadic or have optional inputs. Checking
+    // against a single number would reject legal models for six of them.
+    let (min_inputs, max_inputs) = case.op.arity_range();
+    if case.inputs.len() < min_inputs || case.inputs.len() > max_inputs {
         problems.push(Invalid::WrongArity {
             op: op_name,
-            expected: expected_arity,
+            min: min_inputs,
+            max: max_inputs,
             actual: case.inputs.len(),
         });
     }
@@ -167,23 +171,25 @@ pub fn validate(case: &OnnxCase) -> Vec<Invalid> {
         seen_attrs.push(name);
     }
 
-    // Shape and type agreement across inputs.
+    // Shape and type agreement across inputs — **only where the operator requires it**.
     //
-    // Every operator here is elementwise over identically-shaped inputs. ONNX would permit
-    // broadcasting for `Add`/`Sub`/`Mul`, and that is a **deliberate N3 decision rather
-    // than an N1 omission**: broadcasting changes the output shape, so it needs its own
-    // shape rule and its own tests, and adding it silently here would leave `output_dims`
-    // quietly wrong.
+    // This was once an unconditional rule, which was correct for the four elementwise
+    // operators it was written against and wrong for every structural one added later:
+    // `Reshape` takes an `I64` shape vector, `Gather` an `I64` index vector, `Where` a
+    // `Bool` condition. The catalog now says which agreement each operator actually
+    // demands. Broadcasting is still refused — a deliberate N3 decision, since it changes
+    // the output shape and needs its own rule and tests.
+    let agreement = crate::ops::input_agreement(case.op);
     if let Some(first) = case.inputs.first() {
         for other in case.inputs.iter().skip(1) {
-            if other.dims != first.dims {
+            if agreement.shapes && other.dims != first.dims {
                 problems.push(Invalid::ShapeMismatch {
                     op: op_name,
                     first: first.dims.clone(),
                     second: other.dims.clone(),
                 });
             }
-            if other.elem_type() != first.elem_type() {
+            if agreement.elem_types && other.elem_type() != first.elem_type() {
                 problems.push(Invalid::ElemTypeMismatch { op: op_name });
             }
         }
@@ -212,7 +218,7 @@ pub fn well_formed(op: OpKind, dims: &[i64], opset: i64) -> OnnxCase {
 /// its operands, `Sub` would notice and `Add` would not.
 pub fn well_formed_typed(op: OpKind, dims: &[i64], opset: i64, elem: ElemType) -> OnnxCase {
     let count = dims.iter().product::<i64>().max(0) as usize;
-    let inputs = (0..op.arity())
+    let inputs = (0..op.arity_range().0)
         .map(|index| {
             let base = (index as i64 + 1) * 10;
             let data = match elem {
@@ -260,7 +266,7 @@ mod tests {
     /// operator is covered automatically rather than when someone remembers.
     #[test]
     fn well_formed_cases_validate_for_every_operator() {
-        for op in OpKind::ALL {
+        for op in OpKind::ELEMENTWISE {
             for dims in [vec![], vec![1], vec![2, 3], vec![2, 3, 4], vec![0, 3]] {
                 let case = well_formed(op, &dims, OPSET);
                 assert_eq!(
@@ -281,7 +287,7 @@ mod tests {
         assert!(validate(&case).iter().any(|p| matches!(
             p,
             Invalid::WrongArity {
-                expected: 2,
+                min: 2,
                 actual: 1,
                 ..
             }
@@ -367,7 +373,7 @@ mod tests {
     /// operator would be rejected.
     #[test]
     fn a_case_with_no_attributes_is_valid() {
-        for op in OpKind::ALL {
+        for op in OpKind::ELEMENTWISE {
             let case = well_formed(op, &[2], OPSET);
             assert!(case.attrs.is_empty());
             assert_eq!(validate(&case), vec![]);
@@ -444,7 +450,11 @@ mod tests {
     #[test]
     fn well_formed_cases_validate_for_every_element_type() {
         for elem in ElemType::ALL {
-            for op in OpKind::ALL {
+            for op in OpKind::ELEMENTWISE {
+                // `Add`/`Sub`/`Mul` exclude `Bool`; only `Identity` accepts every type.
+                if !crate::ops::spec(op).data_types.contains(&elem) {
+                    continue;
+                }
                 let case = well_formed_typed(op, &[2, 3], OPSET, elem);
                 assert_eq!(
                     validate(&case),

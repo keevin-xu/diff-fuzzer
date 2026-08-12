@@ -317,69 +317,160 @@ pub mod f64_bits {
     }
 }
 
-/// The operators this domain can currently build.
+/// The operators this domain builds.
 ///
-/// Deliberately four. `08-RISKS.md` §4 is about checks that enumerate what existed when
-/// they were written, and the countermeasure is a review rule: **adding a variant here
-/// must be the same commit that extends `validate`, the arity table, and the tests.** A
-/// small set keeps that rule cheap to honour while the skeleton is being built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// **Tier A and Tier B**, chosen by how tightly their *value* semantics are specified rather
+/// than by popularity — legal-difference noise is what consumed the SQL domain, and these
+/// admit no rounding argument. Per-operator facts (arity, accepted types, output type and
+/// shape) live in [`crate::ops`], retrieved from the schema registry rather than recalled.
+///
+/// **Adding a variant is a commit that also touches** `ops::spec`, `ops::output_spec`,
+/// `ops::probe`, and the census. The exhaustive `match` in `ops::spec` is what makes the
+/// compiler enforce that instead of a reviewer having to remember it — `08-RISKS.md` §4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OpKind {
-    /// Elementwise addition. Tier B — IEEE-754 governs it.
-    Add,
-    /// Elementwise subtraction. Tier B.
-    Sub,
-    /// Elementwise multiplication. Tier B.
-    Mul,
-    /// Passes its input through unchanged. Tier A — no arithmetic at all, which makes it
-    /// the operator that tests the *plumbing* rather than any kernel.
+    // ── Tier A — structural ───────────────────────────────────────────────────────
     Identity,
+    Reshape,
+    Transpose,
+    Concat,
+    Squeeze,
+    Unsqueeze,
+    Shape,
+    Size,
+    Slice,
+    Pad,
+    // ── Tier A — discrete, value-reading ──────────────────────────────────────────
+    Gather,
+    Where,
+    Cast,
+    Equal,
+    Greater,
+    Less,
+    And,
+    Or,
+    Xor,
+    Not,
+    // ── Tier B — IEEE-754 elementwise ─────────────────────────────────────────────
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    Abs,
+    Neg,
+    Sign,
+    Sqrt,
+    Floor,
+    Ceil,
+    Round,
 }
 
 impl OpKind {
     /// The `op_type` string ONNX knows this operator by.
+    ///
+    /// Identical to the Rust variant name for every operator here, which is why this is a
+    /// mechanical mapping rather than a table with room to disagree with itself.
     pub fn onnx_name(self) -> &'static str {
         match self {
+            OpKind::Identity => "Identity",
+            OpKind::Reshape => "Reshape",
+            OpKind::Transpose => "Transpose",
+            OpKind::Concat => "Concat",
+            OpKind::Squeeze => "Squeeze",
+            OpKind::Unsqueeze => "Unsqueeze",
+            OpKind::Shape => "Shape",
+            OpKind::Size => "Size",
+            OpKind::Slice => "Slice",
+            OpKind::Pad => "Pad",
+            OpKind::Gather => "Gather",
+            OpKind::Where => "Where",
+            OpKind::Cast => "Cast",
+            OpKind::Equal => "Equal",
+            OpKind::Greater => "Greater",
+            OpKind::Less => "Less",
+            OpKind::And => "And",
+            OpKind::Or => "Or",
+            OpKind::Xor => "Xor",
+            OpKind::Not => "Not",
             OpKind::Add => "Add",
             OpKind::Sub => "Sub",
             OpKind::Mul => "Mul",
-            OpKind::Identity => "Identity",
+            OpKind::Div => "Div",
+            OpKind::Min => "Min",
+            OpKind::Max => "Max",
+            OpKind::Abs => "Abs",
+            OpKind::Neg => "Neg",
+            OpKind::Sign => "Sign",
+            OpKind::Sqrt => "Sqrt",
+            OpKind::Floor => "Floor",
+            OpKind::Ceil => "Ceil",
+            OpKind::Round => "Round",
         }
     }
 
-    /// How many inputs this operator takes.
+    /// How many inputs this operator accepts, inclusive `(min, max)`.
     ///
-    /// A table rather than a scatter of `if op == ...` checks, because arity is a property
-    /// of the operator and every place that needs it should read the same answer. The SQL
-    /// domain fixed one property at four separate sites because each site knew it locally.
-    pub fn arity(self) -> usize {
-        match self {
-            OpKind::Add | OpKind::Sub | OpKind::Mul => 2,
-            OpKind::Identity => 1,
-        }
+    /// Delegates to the catalog so there is one answer rather than two that can drift.
+    pub fn arity_range(self) -> (usize, usize) {
+        crate::ops::arity_range(self)
     }
 
     /// Whether this operator's output depends on the *values* of its inputs.
     ///
-    /// Not decoration. The N2 go/no-go minimum requires at least 8 qualifying operators to
-    /// be value-dependent, precisely so the bar cannot be met by operators that cannot
-    /// exercise the adversarial-value thesis. That check needs this to be a property of
-    /// the operator, recorded once.
+    /// Delegates to the catalog so there is one answer, not two that can drift. Load-bearing
+    /// for the N2 go/no-go bar, which requires a stated number of value-dependent operators
+    /// precisely so it cannot be cleared by operators that read nothing.
     pub fn is_value_dependent(self) -> bool {
-        match self {
-            OpKind::Add | OpKind::Sub | OpKind::Mul => true,
-            // Identity copies whatever it is given: the output depends on the input's
-            // *bits*, but no arithmetic is performed, so no kernel is exercised.
-            OpKind::Identity => false,
-        }
+        crate::ops::spec(self).value_dependent
     }
 
-    /// Every operator, for tests that must cover all of them.
+    /// Every operator, so an exhaustive test cannot silently cover only the ones that
+    /// existed when it was written.
+    pub const ALL: [OpKind; 33] = [
+        OpKind::Identity,
+        OpKind::Reshape,
+        OpKind::Transpose,
+        OpKind::Concat,
+        OpKind::Squeeze,
+        OpKind::Unsqueeze,
+        OpKind::Shape,
+        OpKind::Size,
+        OpKind::Slice,
+        OpKind::Pad,
+        OpKind::Gather,
+        OpKind::Where,
+        OpKind::Cast,
+        OpKind::Equal,
+        OpKind::Greater,
+        OpKind::Less,
+        OpKind::And,
+        OpKind::Or,
+        OpKind::Xor,
+        OpKind::Not,
+        OpKind::Add,
+        OpKind::Sub,
+        OpKind::Mul,
+        OpKind::Div,
+        OpKind::Min,
+        OpKind::Max,
+        OpKind::Abs,
+        OpKind::Neg,
+        OpKind::Sign,
+        OpKind::Sqrt,
+        OpKind::Floor,
+        OpKind::Ceil,
+        OpKind::Round,
+    ];
+
+    /// The elementwise subset the N1 skeleton generator produces.
     ///
-    /// Exists so a test cannot silently cover only the variants that existed when it was
-    /// written — the failure mode `08-RISKS.md` §4 describes. A new variant joins this
-    /// list and every exhaustive test picks it up automatically.
-    pub const ALL: [OpKind; 4] = [OpKind::Add, OpKind::Sub, OpKind::Mul, OpKind::Identity];
+    /// Separate from [`Self::ALL`] on purpose: the generator builds identically-shaped
+    /// inputs, which is right for these and wrong for `Reshape`, `Gather` and friends. Those
+    /// need per-operator construction, which arrives with the real generator at N3. Naming
+    /// the subset keeps that limitation visible instead of implicit.
+    pub const ELEMENTWISE: [OpKind; 4] = [OpKind::Add, OpKind::Sub, OpKind::Mul, OpKind::Identity];
 }
 
 /// One test case: an operator, its inputs, and the opset that defines its meaning.
@@ -423,18 +514,6 @@ impl OnnxCase {
 
     /// The name the single output is given in the graph.
     pub const OUTPUT_NAME: &'static str = "out";
-
-    /// The shape this case's output should have.
-    ///
-    /// Every operator here is shape-preserving over equally-shaped inputs, which is a
-    /// consequence of `validate` refusing to build anything else — broadcasting is a
-    /// deliberate N3 decision, not an N1 omission.
-    pub fn output_dims(&self) -> Vec<i64> {
-        self.inputs
-            .first()
-            .map(|t| t.dims.clone())
-            .unwrap_or_default()
-    }
 
     /// Total elements across all inputs. Used as a cheap size measure by shrinking and by
     /// corpus-shape reporting.
@@ -517,9 +596,23 @@ mod tests {
         // Iterating `ALL` rather than listing operators, so a new variant is covered the
         // moment it is added rather than whenever someone remembers to extend this test.
         for op in OpKind::ALL {
-            assert!(op.arity() >= 1, "{op:?} must take at least one input");
+            let (min, max) = op.arity_range();
+            assert!(min >= 1, "{op:?} must take at least one input");
+            assert!(max >= min, "{op:?} has an inverted arity range");
             assert!(!op.onnx_name().is_empty());
         }
+    }
+
+    /// Operator names must be distinct and must match the ONNX spelling exactly — a typo
+    /// here builds a node no runtime recognises, which would read as universal
+    /// non-support rather than as our error.
+    #[test]
+    fn operator_names_are_distinct() {
+        let mut names: Vec<&str> = OpKind::ALL.iter().map(|o| o.onnx_name()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "two operators share an ONNX name");
     }
 
     #[test]

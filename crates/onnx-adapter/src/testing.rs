@@ -359,7 +359,7 @@ mod tests {
     /// fires on everything — which detects nothing and reports everything.
     #[test]
     fn the_oracle_is_silent_when_nothing_is_wrong() {
-        for op in OpKind::ALL {
+        for op in OpKind::ELEMENTWISE {
             let case = well_formed(op, &[2, 3], OPSET);
             assert_eq!(
                 judge(&case, &[&OrtRuntime, &TractRuntime]),
@@ -375,7 +375,7 @@ mod tests {
     fn the_oracle_catches_a_corrupted_value() {
         let wrong = WrongValues::new(TractRuntime, 1.0);
 
-        for op in OpKind::ALL {
+        for op in OpKind::ELEMENTWISE {
             let case = well_formed(op, &[2, 3], OPSET);
 
             // Only meaningful if the fault actually changed something. Classified rather

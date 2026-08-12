@@ -1,0 +1,779 @@
+//! What each operator *is* — arity, accepted types, output type, output shape, and the
+//! minimal valid model that probes it.
+//!
+//! # Why this module exists before the generator
+//!
+//! The capability census (PHASE-N2) must answer *"does runtime R support operator O at
+//! element type D?"*, and the only honest way to answer it is to **build a minimal valid
+//! model and attempt it**. `08-RISKS.md` §3 names the alternative — reading a support table
+//! — as trusting a claim about intent rather than measuring behaviour.
+//!
+//! That means per-operator knowledge has to exist before the census can run. It is the same
+//! knowledge N3's generator needs, so it is built once, here.
+//!
+//! # Everything here was retrieved, not recalled
+//!
+//! The signatures, type constraints and `since` versions come from
+//! `onnx.defs.get_schema(name, max_inclusive_version=22)` against the pinned `onnx` 1.22.0 —
+//! the specification's own schema registry. They are recorded with the retrieval date in
+//! `SPECS.md` §2.1.
+//!
+//! Three of those facts contradict what a reasonable person would assume, and each would
+//! have produced invalid models read as capability gaps:
+//!
+//! - **`Squeeze` and `Unsqueeze` take `axes` as an *input*, not an attribute.** It was an
+//!   attribute through opset 12 and moved at 13.
+//! - **The comparisons return `Bool` whatever they were given**, and `Shape`/`Size` return
+//!   `I64`. An output type assumed equal to the input is wrong for five operators.
+//! - **`Round` first appears at opset 22**, the ceiling this domain currently builds at.
+//!
+//! # The output shape is computed, not stored
+//!
+//! `onnx.checker` requires a graph output to declare a `shape` (measured — `SPECS.md` §2.2).
+//! It accepts symbolic dimensions, so this could have declared "unknown". It declares the
+//! **exact** dimensions instead, computed per operator by [`output_spec`], because a wrong
+//! shape is then *rejected by the checker* rather than silently tolerated. The stricter
+//! option is the one that can fail, and a check that cannot fail is not evidence.
+
+use crate::attrs::Attrs;
+use crate::case::{ElemType, OnnxCase, OpKind, TensorData, TensorValue};
+
+/// How tightly an operator's *value* semantics are specified.
+///
+/// The ordering that defends against legal-difference noise — the failure that consumed the
+/// SQL domain. Tier A admits no rounding argument at all; Tier B is IEEE-754 governed and
+/// should be bit-exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// Structural, integer, or logical. **Any divergence is a bug.**
+    A,
+    /// IEEE-754 elementwise float. Bit-exact expected.
+    B,
+}
+
+/// The shape of an operator's signature, which is what drives output inference.
+///
+/// Grouping by family rather than writing a 31-arm match in every function: operators in a
+/// family share their shape rule, so the rule is written once and a new operator joins a
+/// family rather than adding another place to get it wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// One input, same shape and type out. `Identity`, `Abs`, `Sqrt`, `Not`.
+    UnaryElementwise,
+    /// Two inputs of one shape and type, same out. `Add`, `And`.
+    BinaryElementwise,
+    /// Two inputs, **`Bool` out**. `Equal`, `Greater`, `Less`.
+    Comparison,
+    /// `cond: Bool`, `x`, `y` — shape and type of `x`.
+    Select,
+    /// One input, output type given by the `to` attribute.
+    Cast,
+    /// data + shape input; output dims are the shape input's *values*.
+    Reshape,
+    /// One input, dims permuted by `perm`.
+    Transpose,
+    /// Inputs joined along `axis`.
+    Concat,
+    /// data + indices; `axis` replaced by the indices' shape.
+    Gather,
+    /// data + axes input; the listed dimensions removed.
+    Squeeze,
+    /// data + axes input; ones inserted at the listed positions.
+    Unsqueeze,
+    /// One input, **`I64` rank-1** out.
+    Shape,
+    /// One input, **`I64` scalar** out.
+    Size,
+    /// data + starts + ends.
+    Slice,
+    /// data + pads.
+    Pad,
+}
+
+/// Everything the harness needs to know about one operator.
+#[derive(Debug, Clone)]
+pub struct OpSpec {
+    pub kind: OpKind,
+    pub tier: Tier,
+    pub family: Family,
+    /// The operator revision in force at opset 22, from the schema registry.
+    pub since: i64,
+    /// Element types the **primary data input** accepts, restricted to those this adapter
+    /// can build. Retrieved from the schema's type constraints.
+    pub data_types: &'static [ElemType],
+    /// Whether the output depends on the input **values** rather than only on their shapes.
+    ///
+    /// Load-bearing for the N2 go/no-go: the agreed minimum requires ≥8 qualifying operators
+    /// to be value-dependent, so that the bar cannot be cleared by operators which cannot
+    /// exercise the adversarial-value thesis at all.
+    pub value_dependent: bool,
+}
+
+const FLOATS: &[ElemType] = &[ElemType::F32, ElemType::F64];
+const NUMERIC: &[ElemType] = &[ElemType::F32, ElemType::F64, ElemType::I32, ElemType::I64];
+const BOOL_ONLY: &[ElemType] = &[ElemType::Bool];
+const ANY: &[ElemType] = &[
+    ElemType::F32,
+    ElemType::F64,
+    ElemType::I32,
+    ElemType::I64,
+    ElemType::Bool,
+];
+
+/// The catalog. One row per operator; see `SPECS.md` §2.1 for the retrieval.
+pub fn spec(kind: OpKind) -> OpSpec {
+    use Family as F;
+    use OpKind as O;
+    use Tier::{A, B};
+
+    let (tier, family, since, data_types, value_dependent) = match kind {
+        // ── Tier A: structural. Output depends on shapes, not values. ──────────────
+        O::Identity => (A, F::UnaryElementwise, 21, ANY, false),
+        O::Reshape => (A, F::Reshape, 21, ANY, false),
+        O::Transpose => (A, F::Transpose, 21, ANY, false),
+        O::Concat => (A, F::Concat, 13, ANY, false),
+        O::Squeeze => (A, F::Squeeze, 21, ANY, false),
+        O::Unsqueeze => (A, F::Unsqueeze, 21, ANY, false),
+        O::Shape => (A, F::Shape, 21, ANY, false),
+        O::Size => (A, F::Size, 21, ANY, false),
+        O::Slice => (A, F::Slice, 13, ANY, false),
+        O::Pad => (A, F::Pad, 21, ANY, false),
+
+        // ── Tier A: value-dependent. Discrete answers, no rounding argument. ───────
+        // `Gather` and `Where` read values (indices, condition) to decide the answer.
+        O::Gather => (A, F::Gather, 13, ANY, true),
+        O::Where => (A, F::Select, 16, ANY, true),
+        O::Cast => (A, F::Cast, 21, ANY, true),
+        O::Equal => (A, F::Comparison, 19, ANY, true),
+        O::Greater | O::Less => (A, F::Comparison, 13, NUMERIC, true),
+        O::And | O::Or | O::Xor => (A, F::BinaryElementwise, 7, BOOL_ONLY, true),
+        O::Not => (A, F::UnaryElementwise, 1, BOOL_ONLY, true),
+
+        // ── Tier B: IEEE-754 elementwise. The densest special-value surface. ───────
+        O::Add | O::Sub | O::Mul | O::Div => (B, F::BinaryElementwise, 14, NUMERIC, true),
+        O::Min | O::Max => (B, F::BinaryElementwise, 13, NUMERIC, true),
+        O::Abs | O::Neg | O::Sign => (B, F::UnaryElementwise, 13, NUMERIC, true),
+        // Float-only: the schema's type constraint excludes integers for these.
+        O::Sqrt | O::Floor | O::Ceil => (B, F::UnaryElementwise, 13, FLOATS, true),
+        // `Round` does not exist below opset 22.
+        O::Round => (B, F::UnaryElementwise, 22, FLOATS, true),
+    };
+
+    OpSpec {
+        kind,
+        tier,
+        family,
+        since,
+        data_types,
+        value_dependent,
+    }
+}
+
+/// How many inputs an operator accepts, as an inclusive `(min, max)` range.
+///
+/// A **range**, not a number, because several of these are variadic or have optional
+/// inputs — `Concat`, `Min` and `Max` take one or more, `Squeeze` takes one or two,
+/// `Slice` three to five, `Pad` two to four. A single expected arity would have been wrong
+/// for six operators, and `validate` would have rejected perfectly legal models.
+///
+/// The upper bound for the variadic operators is capped at what this domain actually builds
+/// rather than at the schema's `2147483647`: a bound nothing enforces is not a bound, and a
+/// case with a thousand inputs is not something the generator should be free to emit.
+pub fn arity_range(kind: OpKind) -> (usize, usize) {
+    match spec(kind).family {
+        Family::UnaryElementwise
+        | Family::Shape
+        | Family::Size
+        | Family::Cast
+        | Family::Transpose => (1, 1),
+        Family::BinaryElementwise
+        | Family::Comparison
+        | Family::Reshape
+        | Family::Gather
+        | Family::Unsqueeze
+        | Family::Pad => (2, 2),
+        Family::Select => (3, 3),
+        // Variadic in the schema; capped here at what is built.
+        Family::Concat => (1, 8),
+        // `axes` is optional: omitting it squeezes every length-1 dimension.
+        Family::Squeeze => (1, 2),
+        // data, starts, ends, then optional axes and steps.
+        Family::Slice => (3, 5),
+    }
+}
+
+/// What an operator requires of its inputs *relative to each other*.
+///
+/// The elementwise operators need every input to share a shape and an element type. Most
+/// others do **not**, and applying the elementwise rule to them is wrong in a way that looks
+/// like a validator working: `Reshape`'s second input is an `I64` shape vector, `Gather`'s
+/// second is an `I64` index vector, and `Where`'s first is a `Bool` condition. Each is
+/// deliberately a different shape and type from the data input.
+///
+/// This existed as an unconditional rule until the operator catalog was added, at which
+/// point it rejected six perfectly legal probes. Recorded because the failure mode is the
+/// project's most common one — a rule that was right for the constructs it was written
+/// against, and silent about the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputAgreement {
+    /// Every input must have the same dimensions.
+    pub shapes: bool,
+    /// Every input must have the same element type.
+    pub elem_types: bool,
+}
+
+pub fn input_agreement(kind: OpKind) -> InputAgreement {
+    let (shapes, elem_types) = match spec(kind).family {
+        // Elementwise: one shape, one type, throughout.
+        Family::UnaryElementwise | Family::BinaryElementwise | Family::Comparison => (true, true),
+        // `Concat` joins along an axis, so shapes differ there by design — but every input
+        // must still be the same type.
+        Family::Concat => (false, true),
+        // `Where` is `cond: Bool, x: T, y: T` — one shape, two types.
+        Family::Select => (true, false),
+        // The rest take structural inputs (shape vectors, index vectors, pad amounts) whose
+        // shape and type are deliberately unlike the data input's.
+        _ => (false, false),
+    };
+    InputAgreement { shapes, elem_types }
+}
+
+/// The element type and shape of a case's single output.
+///
+/// This is genuine shape inference over the subset of ONNX this domain builds. It is
+/// deliberately **not** defensive: if a case is malformed the result is meaningless, and
+/// `validate` plus the reference implementation are what catch that. Making this function
+/// tolerant would hide the very errors those gates exist to report.
+pub fn output_spec(case: &OnnxCase) -> (ElemType, Vec<i64>) {
+    let spec = spec(case.op);
+    let first = case.inputs.first();
+    let dims = first.map(|t| t.dims.clone()).unwrap_or_default();
+    let elem = first.map_or(ElemType::F32, TensorValue::elem_type);
+
+    match spec.family {
+        Family::UnaryElementwise | Family::BinaryElementwise => (elem, dims),
+
+        // Whatever went in, a truth value comes out.
+        Family::Comparison => (ElemType::Bool, dims),
+
+        // `cond, x, y` — the answer has x's shape and type, not the condition's.
+        Family::Select => case
+            .inputs
+            .get(1)
+            .map_or((elem, dims.clone()), |x| (x.elem_type(), x.dims.clone())),
+
+        // The `to` attribute names the output type directly.
+        Family::Cast => {
+            let target = match case.attrs.get("to") {
+                Some(crate::attrs::AttrValue::Int(wire)) => {
+                    ElemType::from_wire(*wire as i32).unwrap_or(elem)
+                }
+                _ => elem,
+            };
+            (target, dims)
+        }
+
+        // The *values* of the second input are the output shape.
+        Family::Reshape => {
+            let target = case
+                .inputs
+                .get(1)
+                .and_then(|t| match &t.data {
+                    TensorData::I64(v) => Some(v.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| dims.clone());
+            (elem, target)
+        }
+
+        Family::Transpose => {
+            let permuted = match case.attrs.get("perm") {
+                Some(crate::attrs::AttrValue::Ints(perm)) => perm
+                    .iter()
+                    .map(|p| dims.get(*p as usize).copied().unwrap_or(0))
+                    .collect(),
+                // ONNX default: reverse the dimensions.
+                _ => dims.iter().rev().copied().collect(),
+            };
+            (elem, permuted)
+        }
+
+        Family::Concat => {
+            let axis = normalized_axis(&case.attrs, dims.len());
+            let mut joined = dims.clone();
+            if let Some(slot) = joined.get_mut(axis) {
+                *slot = case
+                    .inputs
+                    .iter()
+                    .map(|t| t.dims.get(axis).copied().unwrap_or(0))
+                    .sum();
+            }
+            (elem, joined)
+        }
+
+        // data[..axis] ++ indices.dims ++ data[axis+1..]
+        Family::Gather => {
+            let axis = normalized_axis(&case.attrs, dims.len());
+            let index_dims = case
+                .inputs
+                .get(1)
+                .map(|t| t.dims.clone())
+                .unwrap_or_default();
+            let mut out = dims[..axis.min(dims.len())].to_vec();
+            out.extend(index_dims);
+            if axis < dims.len() {
+                out.extend_from_slice(&dims[axis + 1..]);
+            }
+            (elem, out)
+        }
+
+        Family::Squeeze => {
+            let axes = axes_input(case);
+            let out = dims
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !axes.contains(&(*index as i64)))
+                .map(|(_, d)| *d)
+                .collect();
+            (elem, out)
+        }
+
+        Family::Unsqueeze => {
+            let axes = axes_input(case);
+            let mut out = dims.clone();
+            // Ascending, so each insertion index still means what it said.
+            let mut sorted = axes.clone();
+            sorted.sort_unstable();
+            for axis in sorted {
+                let at = (axis as usize).min(out.len());
+                out.insert(at, 1);
+            }
+            (elem, out)
+        }
+
+        // The shape *of* a tensor is a rank-1 int64 vector.
+        Family::Shape => (ElemType::I64, vec![dims.len() as i64]),
+        // The size is a scalar: rank 0, not rank 1 with one element.
+        Family::Size => (ElemType::I64, Vec::new()),
+
+        Family::Slice => {
+            let starts = i64_input(case, 1);
+            let ends = i64_input(case, 2);
+            let mut out = dims.clone();
+            for (index, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+                if let Some(slot) = out.get_mut(index) {
+                    let extent = (*slot).min(*end) - *start;
+                    *slot = extent.max(0);
+                }
+            }
+            (elem, out)
+        }
+
+        // `pads` is [begin_0..begin_n, end_0..end_n].
+        Family::Pad => {
+            let pads = i64_input(case, 1);
+            let rank = dims.len();
+            let out = dims
+                .iter()
+                .enumerate()
+                .map(|(index, d)| {
+                    let before = pads.get(index).copied().unwrap_or(0);
+                    let after = pads.get(index + rank).copied().unwrap_or(0);
+                    d + before + after
+                })
+                .collect();
+            (elem, out)
+        }
+    }
+}
+
+/// The `axis` attribute, with ONNX's negative-index convention resolved.
+fn normalized_axis(attrs: &Attrs, rank: usize) -> usize {
+    let raw = match attrs.get("axis") {
+        Some(crate::attrs::AttrValue::Int(v)) => *v,
+        _ => 0,
+    };
+    // A negative axis counts from the end, which is legal ONNX everywhere it appears.
+    if raw < 0 {
+        (rank as i64 + raw).max(0) as usize
+    } else {
+        raw as usize
+    }
+}
+
+/// The `axes` **input** (not attribute) of `Squeeze`/`Unsqueeze`.
+fn axes_input(case: &OnnxCase) -> Vec<i64> {
+    i64_input(case, 1)
+}
+
+fn i64_input(case: &OnnxCase, index: usize) -> Vec<i64> {
+    match case.inputs.get(index).map(|t| &t.data) {
+        Some(TensorData::I64(v)) => v.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Build the minimal valid model that probes `op` at `elem`.
+///
+/// `None` when the operator does not accept that element type, which is a *specification*
+/// fact rather than a capability one — it must not be confused with a runtime declining the
+/// operator. Feeding an operator a type its schema forbids would produce an invalid model,
+/// and a runtime rejecting *that* says nothing about the runtime.
+///
+/// Values are ordinary. A probe answers "is this operator implemented", and hostile values
+/// would confuse that with "does it handle `NaN` correctly" — a different question, asked by
+/// the generator at N3.
+pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
+    let spec = spec(op);
+    if !spec.data_types.contains(&elem) || opset < spec.since {
+        return None;
+    }
+
+    let case = match spec.family {
+        Family::UnaryElementwise => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)]),
+        Family::BinaryElementwise | Family::Comparison => OnnxCase::new(
+            op,
+            opset,
+            vec![data("a", &[2, 3], elem, 0), data("b", &[2, 3], elem, 1)],
+        ),
+        Family::Select => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &[2, 3], ElemType::Bool, 0),
+                data("b", &[2, 3], elem, 1),
+                data("c", &[2, 3], elem, 2),
+            ],
+        ),
+        Family::Cast => {
+            // Cast to something genuinely different, or the probe would not exercise a
+            // conversion at all.
+            let target = if elem == ElemType::I64 {
+                ElemType::F32
+            } else {
+                ElemType::I64
+            };
+            OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)])
+                .with_attrs(Attrs::new().int("to", i64::from(target.wire())))
+        }
+        Family::Reshape => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &[2, 3], elem, 0),
+                TensorValue::new("b", vec![2], TensorData::I64(vec![3, 2])),
+            ],
+        ),
+        Family::Transpose => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)])
+            .with_attrs(Attrs::new().ints("perm", vec![1, 0])),
+        Family::Concat => OnnxCase::new(
+            op,
+            opset,
+            vec![data("a", &[2, 3], elem, 0), data("b", &[2, 3], elem, 1)],
+        )
+        .with_attrs(Attrs::new().int("axis", 0)),
+        Family::Gather => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &[3, 2], elem, 0),
+                TensorValue::new("b", vec![2], TensorData::I64(vec![0, 2])),
+            ],
+        )
+        .with_attrs(Attrs::new().int("axis", 0)),
+        Family::Squeeze => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                // A length-1 dimension, since that is the only kind `Squeeze` may remove.
+                data("a", &[1, 3], elem, 0),
+                TensorValue::new("b", vec![1], TensorData::I64(vec![0])),
+            ],
+        ),
+        Family::Unsqueeze => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &[3], elem, 0),
+                TensorValue::new("b", vec![1], TensorData::I64(vec![0])),
+            ],
+        ),
+        Family::Shape | Family::Size => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)]),
+        Family::Slice => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &[4], elem, 0),
+                TensorValue::new("b", vec![1], TensorData::I64(vec![1])),
+                TensorValue::new("c", vec![1], TensorData::I64(vec![3])),
+            ],
+        ),
+        Family::Pad => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &[2], elem, 0),
+                // `pads` is [begin.., end..], so 2 * rank entries.
+                TensorValue::new("b", vec![2], TensorData::I64(vec![1, 1])),
+            ],
+        )
+        .with_attrs(Attrs::new().string("mode", "constant")),
+    };
+    Some(case)
+}
+
+/// Ordinary, distinct values of the requested type.
+///
+/// `offset` differs per input so a probe cannot pass by symmetry — a runtime that swapped
+/// its operands would go unnoticed on `Add` and be caught on `Sub`.
+fn data(name: &str, dims: &[i64], elem: ElemType, offset: usize) -> TensorValue {
+    let count = dims.iter().product::<i64>().max(0) as usize;
+    let base = (offset as i64 + 1) * 10;
+    let payload = match elem {
+        ElemType::F32 => TensorData::F32((0..count).map(|i| (base + i as i64) as f32).collect()),
+        ElemType::F64 => TensorData::F64((0..count).map(|i| (base + i as i64) as f64).collect()),
+        ElemType::I32 => TensorData::I32((0..count).map(|i| (base + i as i64) as i32).collect()),
+        ElemType::I64 => TensorData::I64((0..count).map(|i| base + i as i64).collect()),
+        ElemType::Bool => {
+            TensorData::Bool((0..count).map(|i| (i + offset).is_multiple_of(2)).collect())
+        }
+    };
+    TensorValue::new(name, dims.to_vec(), payload)
+}
+
+/// Every (operator, element type) pair the specification permits at `opset`.
+///
+/// This is the census's candidate list: the surface that *could* be supported, against which
+/// what each runtime *does* support is measured.
+pub fn candidates(opset: i64) -> Vec<(OpKind, ElemType)> {
+    let mut pairs = Vec::new();
+    for op in OpKind::ALL {
+        for elem in ElemType::ALL {
+            if probe(op, elem, opset).is_some() {
+                pairs.push((op, elem));
+            }
+        }
+    }
+    pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::validation::validate;
+
+    const OPSET: i64 = 22;
+
+    /// Every operator must be probeable at **some** element type, or it is in the catalog
+    /// while nothing can ever test it.
+    #[test]
+    fn every_operator_has_at_least_one_probe() {
+        for op in OpKind::ALL {
+            let any = ElemType::ALL
+                .into_iter()
+                .any(|e| probe(op, e, OPSET).is_some());
+            assert!(any, "{op:?} has no probe at any element type");
+        }
+    }
+
+    /// Every probe must satisfy our own validator. A probe that fails here would be *our*
+    /// invalid model, and a runtime rejecting it would be read as a capability gap.
+    #[test]
+    fn every_probe_is_well_formed() {
+        for (op, elem) in candidates(OPSET) {
+            let case = probe(op, elem, OPSET).expect("candidates only yields buildable pairs");
+            let problems = validate(&case);
+            assert!(
+                problems.is_empty(),
+                "{op:?} at {elem:?} produced an invalid probe: {problems:?}"
+            );
+        }
+    }
+
+    /// The type constraints must actually exclude something, or `data_types` is decoration.
+    #[test]
+    fn type_constraints_are_enforced() {
+        // Retrieved facts, from SPECS.md §2.1.
+        assert!(
+            probe(OpKind::Sqrt, ElemType::I64, OPSET).is_none(),
+            "Sqrt is float-only"
+        );
+        assert!(
+            probe(OpKind::And, ElemType::F32, OPSET).is_none(),
+            "And is bool-only"
+        );
+        assert!(
+            probe(OpKind::Not, ElemType::I32, OPSET).is_none(),
+            "Not is bool-only"
+        );
+        assert!(
+            probe(OpKind::Add, ElemType::Bool, OPSET).is_none(),
+            "Add excludes bool"
+        );
+        assert!(probe(OpKind::Greater, ElemType::Bool, OPSET).is_none());
+        // ...and permit what the schema permits.
+        assert!(probe(OpKind::Add, ElemType::I64, OPSET).is_some());
+        assert!(probe(OpKind::Equal, ElemType::Bool, OPSET).is_some());
+        assert!(probe(OpKind::Identity, ElemType::Bool, OPSET).is_some());
+    }
+
+    /// `Round` does not exist below opset 22 — a retrieved fact that would otherwise
+    /// produce a model no runtime can load.
+    #[test]
+    fn an_operator_below_its_since_version_has_no_probe() {
+        assert!(probe(OpKind::Round, ElemType::F32, 21).is_none());
+        assert!(probe(OpKind::Round, ElemType::F32, 22).is_some());
+        assert!(
+            probe(OpKind::Equal, ElemType::F32, 18).is_none(),
+            "Equal is since 19"
+        );
+    }
+
+    /// The five operators whose output type is **not** the input type. Getting this wrong
+    /// would declare a graph output the checker rejects.
+    #[test]
+    fn output_types_that_differ_from_the_input() {
+        let bool_out = [OpKind::Equal, OpKind::Greater, OpKind::Less];
+        for op in bool_out {
+            let case = probe(op, ElemType::F32, OPSET).unwrap();
+            assert_eq!(output_spec(&case).0, ElemType::Bool, "{op:?} returns bool");
+        }
+        for op in [OpKind::Shape, OpKind::Size] {
+            let case = probe(op, ElemType::F32, OPSET).unwrap();
+            assert_eq!(output_spec(&case).0, ElemType::I64, "{op:?} returns int64");
+        }
+        // Cast returns whatever `to` names.
+        let case = probe(OpKind::Cast, ElemType::F32, OPSET).unwrap();
+        assert_eq!(output_spec(&case).0, ElemType::I64);
+    }
+
+    /// Shape inference, checked against hand-computed answers for each structural family.
+    #[test]
+    fn output_shapes_are_inferred_correctly() {
+        let expect = |op: OpKind, dims: Vec<i64>| {
+            let case = probe(op, ElemType::F32, OPSET).unwrap();
+            assert_eq!(output_spec(&case).1, dims, "{op:?}");
+        };
+
+        expect(OpKind::Identity, vec![2, 3]);
+        expect(OpKind::Add, vec![2, 3]);
+        expect(OpKind::Transpose, vec![3, 2]); // perm [1,0]
+        expect(OpKind::Reshape, vec![3, 2]); // shape input [3,2]
+        expect(OpKind::Concat, vec![4, 3]); // two [2,3] along axis 0
+        expect(OpKind::Gather, vec![2, 2]); // [3,2] indexed by [2] on axis 0
+        expect(OpKind::Squeeze, vec![3]); // [1,3] minus axis 0
+        expect(OpKind::Unsqueeze, vec![1, 3]); // [3] plus a 1 at axis 0
+        expect(OpKind::Shape, vec![2]); // rank of [2,3]
+        expect(OpKind::Size, vec![]); // a scalar, rank 0
+        expect(OpKind::Slice, vec![2]); // [4] sliced 1..3
+        expect(OpKind::Pad, vec![4]); // [2] padded 1 each side
+        expect(OpKind::Where, vec![2, 3]);
+    }
+
+    /// The N2 go/no-go requires ≥8 **value-dependent** operators. If the catalog cannot
+    /// supply that many, the bar is unmeetable by construction and the failure should be
+    /// visible here rather than at the gate.
+    #[test]
+    fn enough_operators_are_value_dependent_for_the_go_no_go_bar() {
+        let count = OpKind::ALL
+            .into_iter()
+            .filter(|op| spec(*op).value_dependent)
+            .count();
+        assert!(
+            count >= 8,
+            "only {count} value-dependent operators; the agreed N2 minimum needs 8"
+        );
+    }
+
+    /// Structural operators must **not** be counted as value-dependent. `Transpose` moves
+    /// numbers around without reading them, so it cannot exercise the adversarial-value
+    /// thesis and must not help clear a bar that exists to measure exactly that.
+    #[test]
+    fn structural_operators_are_not_value_dependent() {
+        for op in [
+            OpKind::Identity,
+            OpKind::Transpose,
+            OpKind::Reshape,
+            OpKind::Shape,
+            OpKind::Size,
+            OpKind::Squeeze,
+            OpKind::Unsqueeze,
+            OpKind::Concat,
+        ] {
+            assert!(!spec(op).value_dependent, "{op:?} does not read its values");
+        }
+        // But these do read values to decide the answer.
+        for op in [OpKind::Gather, OpKind::Where, OpKind::Add, OpKind::Equal] {
+            assert!(spec(op).value_dependent, "{op:?} reads its values");
+        }
+    }
+
+    /// **The gate on this module's correctness.**
+    ///
+    /// Our own `validate` only checks what we thought to check. `onnx.checker`, reached
+    /// through the reference implementation, checks the model against the *specification* —
+    /// including that the declared output type and shape match what the operator actually
+    /// produces. Every wrong entry in `output_spec` shows up here as a rejection.
+    ///
+    /// This is the second of the two validity gates from `06-ORACLES` §2, and it is the one
+    /// that matters: a probe the reference rejects is **our** invalid model, and a runtime
+    /// failing on it would be recorded as a capability gap that does not exist.
+    #[test]
+    fn every_probe_is_accepted_by_the_reference_implementation() {
+        use crate::outcome::OnnxOutcome;
+        use crate::reference::Reference;
+
+        let mut reference = Reference::start().expect("the reference worker must start");
+        let mut rejected = Vec::new();
+
+        for (op, elem) in candidates(OPSET) {
+            let case = probe(op, elem, OPSET).unwrap();
+            let bytes = crate::model::build_bytes(&case);
+            match reference
+                .run(&bytes, &case.inputs)
+                .expect("the worker must reply")
+            {
+                OnnxOutcome::Ok(_) => {}
+                other => rejected.push(format!("{op:?}/{elem:?}: {other}")),
+            }
+        }
+
+        assert!(
+            rejected.is_empty(),
+            "{} of {} probes were rejected by the specification's own checker — these are \
+             OUR invalid models, not capability gaps:\n{}",
+            rejected.len(),
+            candidates(OPSET).len(),
+            rejected.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_candidate_surface_is_substantial() {
+        let pairs = candidates(OPSET);
+        assert!(
+            pairs.len() > 80,
+            "only {} operator/type pairs — the census would be measuring very little",
+            pairs.len()
+        );
+        // Every element type must appear, or a type is in the enum untested.
+        for elem in ElemType::ALL {
+            assert!(
+                pairs.iter().any(|(_, e)| *e == elem),
+                "{elem:?} appears in no candidate pair"
+            );
+        }
+    }
+
+    #[test]
+    fn every_operator_is_assigned_a_tier() {
+        let (a, b): (Vec<_>, Vec<_>) = OpKind::ALL
+            .into_iter()
+            .partition(|op| spec(*op).tier == Tier::A);
+        assert!(
+            !a.is_empty() && !b.is_empty(),
+            "both tiers must be populated"
+        );
+        assert_eq!(a.len() + b.len(), OpKind::ALL.len());
+    }
+}

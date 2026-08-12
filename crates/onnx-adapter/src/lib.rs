@@ -29,6 +29,7 @@
 //! |---|---|
 //! | [`case`] | what a test case *is* |
 //! | [`attrs`] | an operator's static parameters |
+//! | [`ops`] | per-operator arity, types, output shape, and probe models |
 //! | [`outcome`] | what a runtime gives back, **including its failures, as values** |
 //! | [`validation`] | is this case well-formed? |
 //! | [`model`] | case → protobuf bytes |
@@ -46,6 +47,7 @@ pub mod environment;
 pub mod generator;
 pub mod model;
 pub mod normalize;
+pub mod ops;
 pub mod oracle;
 pub mod outcome;
 pub mod reference;
