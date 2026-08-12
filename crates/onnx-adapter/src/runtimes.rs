@@ -37,7 +37,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use diff_fuzzer_core::traits::{Implementation, RunError};
 
-use crate::case::{OnnxCase, TensorValue};
+use crate::case::{OnnxCase, TensorData, TensorValue};
 use crate::model::build_bytes;
 use crate::outcome::OnnxOutcome;
 
@@ -121,13 +121,32 @@ impl OrtRuntime {
             ort::session::SessionInputValue<'_>,
         )> = Vec::with_capacity(case.inputs.len());
         for input in &case.inputs {
-            match TensorRef::from_array_view((input.dims.clone(), input.values.as_slice())) {
-                Ok(tensor) => feeds.push((input.name.clone().into(), tensor.into())),
-                Err(e) => {
-                    return OnnxOutcome::Rejected {
-                        detail: format!("building input {}: {e}", input.name),
-                    };
-                }
+            // One arm per element type, each pushing directly. An exhaustive `match`
+            // rather than a helper taking a dtype tag: adding an `ElemType` then fails to
+            // compile here, which is the compiler enforcing `08-RISKS.md` §4's "adding a
+            // type must touch every check" instead of a reviewer having to remember it.
+            //
+            // The arms cannot be collapsed by building a common value first, because each
+            // `TensorRef<T>` is a distinct type — the conversion to a session input is what
+            // erases it, so it has to happen inside each arm.
+            macro_rules! feed {
+                ($values:expr) => {
+                    match TensorRef::from_array_view((input.dims.clone(), $values.as_slice())) {
+                        Ok(tensor) => feeds.push((input.name.clone().into(), tensor.into())),
+                        Err(e) => {
+                            return OnnxOutcome::Rejected {
+                                detail: format!("building input {}: {e}", input.name),
+                            };
+                        }
+                    }
+                };
+            }
+            match &input.data {
+                TensorData::F32(v) => feed!(v),
+                TensorData::F64(v) => feed!(v),
+                TensorData::I32(v) => feed!(v),
+                TensorData::I64(v) => feed!(v),
+                TensorData::Bool(v) => feed!(v),
             }
         }
 
@@ -142,18 +161,55 @@ impl OrtRuntime {
 
         let mut tensors = Vec::new();
         for (name, value) in outputs.iter() {
-            match value.try_extract_tensor::<f32>() {
-                Ok((shape, data)) => tensors.push(TensorValue::f32(
-                    name,
-                    shape.iter().copied().collect(),
-                    data.to_vec(),
-                )),
-                Err(e) => {
+            // The output type is whatever the operator produced, which is not always an
+            // input type — `Equal` takes floats and returns bools. So the type is read from
+            // the value and then decoded, rather than assumed.
+            let dtype = match value.dtype().tensor_type() {
+                Some(t) => t,
+                None => {
                     return OnnxOutcome::Rejected {
-                        detail: format!("extracting output {name}: {e}"),
+                        detail: format!("output {name} is not a tensor"),
                     };
                 }
+            };
+
+            macro_rules! extract {
+                ($rust:ty, $variant:ident) => {
+                    match value.try_extract_tensor::<$rust>() {
+                        Ok((shape, data)) => TensorValue::new(
+                            name,
+                            shape.iter().copied().collect(),
+                            TensorData::$variant(data.to_vec()),
+                        ),
+                        Err(e) => {
+                            return OnnxOutcome::Rejected {
+                                detail: format!("extracting output {name}: {e}"),
+                            };
+                        }
+                    }
+                };
             }
+
+            use ort::value::TensorElementType as Ty;
+            let tensor = match dtype {
+                Ty::Float32 => extract!(f32, F32),
+                Ty::Float64 => extract!(f64, F64),
+                Ty::Int32 => extract!(i32, I32),
+                Ty::Int64 => extract!(i64, I64),
+                Ty::Bool => extract!(bool, Bool),
+                // A type ORT produced that this adapter cannot represent. Reported rather
+                // than decoded as something else — a wrong decode would look like a real
+                // divergence.
+                other => {
+                    return OnnxOutcome::Rejected {
+                        detail: format!(
+                            "output {name} has element type {other:?}, which this \
+                                         adapter does not decode"
+                        ),
+                    };
+                }
+            };
+            tensors.push(tensor);
         }
         OnnxOutcome::Ok(tensors)
     }
@@ -212,14 +268,28 @@ impl TractRuntime {
         let mut feeds: TVec<TValue> = tvec!();
         for input in &case.inputs {
             let shape: Vec<usize> = input.dims.iter().map(|d| *d as usize).collect();
-            match tract_ndarray::ArrayD::from_shape_vec(shape, input.values.clone()) {
-                Ok(array) => feeds.push(Tensor::from(array).into()),
-                Err(e) => {
-                    return OnnxOutcome::Rejected {
-                        detail: format!("building input {}: {e}", input.name),
-                    };
-                }
+
+            macro_rules! feed {
+                ($values:expr) => {
+                    match tract_ndarray::ArrayD::from_shape_vec(shape.clone(), $values.clone()) {
+                        Ok(array) => Tensor::from(array),
+                        Err(e) => {
+                            return OnnxOutcome::Rejected {
+                                detail: format!("building input {}: {e}", input.name),
+                            };
+                        }
+                    }
+                };
             }
+
+            let tensor = match &input.data {
+                TensorData::F32(v) => feed!(v),
+                TensorData::F64(v) => feed!(v),
+                TensorData::I32(v) => feed!(v),
+                TensorData::I64(v) => feed!(v),
+                TensorData::Bool(v) => feed!(v),
+            };
+            feeds.push(tensor.into());
         }
 
         let outputs = match plan.run(feeds) {
@@ -233,21 +303,42 @@ impl TractRuntime {
 
         let mut tensors = Vec::new();
         for (index, output) in outputs.iter().enumerate() {
-            match output.to_plain_array_view::<f32>() {
-                Ok(array) => tensors.push(TensorValue::f32(
-                    // tract does not carry graph output names through the plan. The oracle
-                    // compares positionally, and the canonical form drops names, so this is
-                    // a label for humans rather than part of the comparison.
-                    OnnxCase::OUTPUT_NAME,
-                    array.shape().iter().map(|d| *d as i64).collect(),
-                    array.iter().copied().collect(),
-                )),
-                Err(e) => {
+            macro_rules! collect {
+                ($rust:ty, $variant:ident) => {
+                    match output.to_plain_array_view::<$rust>() {
+                        Ok(array) => TensorValue::new(
+                            // tract does not carry graph output names through the plan. The
+                            // oracle compares positionally and the canonical form drops
+                            // names, so this is a label for humans, not part of comparison.
+                            OnnxCase::OUTPUT_NAME,
+                            array.shape().iter().map(|d| *d as i64).collect(),
+                            TensorData::$variant(array.iter().copied().collect()),
+                        ),
+                        Err(e) => {
+                            return OnnxOutcome::Rejected {
+                                detail: format!("extracting output {index}: {e}"),
+                            };
+                        }
+                    }
+                };
+            }
+
+            let tensor = match output.datum_type() {
+                DatumType::F32 => collect!(f32, F32),
+                DatumType::F64 => collect!(f64, F64),
+                DatumType::I32 => collect!(i32, I32),
+                DatumType::I64 => collect!(i64, I64),
+                DatumType::Bool => collect!(bool, Bool),
+                other => {
                     return OnnxOutcome::Rejected {
-                        detail: format!("extracting output {index}: {e}"),
+                        detail: format!(
+                            "output {index} has datum type {other:?}, which this \
+                                         adapter does not decode"
+                        ),
                     };
                 }
-            }
+            };
+            tensors.push(tensor);
         }
         OnnxOutcome::Ok(tensors)
     }
@@ -302,16 +393,36 @@ impl CandleRuntime {
         let mut feeds: HashMap<String, Tensor> = HashMap::new();
         for input in &case.inputs {
             let shape: Vec<usize> = input.dims.iter().map(|d| *d as usize).collect();
-            match Tensor::from_vec(input.values.clone(), shape, &Device::Cpu) {
-                Ok(tensor) => {
-                    feeds.insert(input.name.clone(), tensor);
-                }
-                Err(e) => {
-                    return OnnxOutcome::Rejected {
-                        detail: format!("building input {}: {e}", input.name),
+
+            macro_rules! feed {
+                ($values:expr) => {
+                    match Tensor::from_vec($values.clone(), shape, &Device::Cpu) {
+                        Ok(tensor) => tensor,
+                        Err(e) => {
+                            return OnnxOutcome::Rejected {
+                                detail: format!("building input {}: {e}", input.name),
+                            };
+                        }
+                    }
+                };
+            }
+
+            let tensor = match &input.data {
+                TensorData::F32(v) => feed!(v),
+                TensorData::F64(v) => feed!(v),
+                TensorData::I64(v) => feed!(v),
+                // `candle_core::DType` has no boolean or 32-bit-integer variant, so candle
+                // cannot represent these tensors at all. That is a genuine capability limit
+                // of the runtime rather than a gap in this adapter, which is why it is
+                // `Unsupported` (a legitimate skip) and not `Rejected` — and it is exactly
+                // the kind of fact the N2 census exists to record.
+                TensorData::I32(_) | TensorData::Bool(_) => {
+                    return OnnxOutcome::Unsupported {
+                        reason: format!("candle has no DType for {:?}", input.elem_type()),
                     };
                 }
-            }
+            };
+            feeds.insert(input.name.clone(), tensor);
         }
 
         let outputs = match candle_onnx::simple_eval(&model, feeds) {
@@ -323,21 +434,53 @@ impl CandleRuntime {
             }
         };
 
-        match outputs.get(OnnxCase::OUTPUT_NAME) {
-            Some(tensor) => match tensor.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-                Ok(values) => OnnxOutcome::Ok(vec![TensorValue::f32(
-                    OnnxCase::OUTPUT_NAME,
-                    tensor.dims().iter().map(|d| *d as i64).collect(),
-                    values,
-                )]),
-                Err(e) => OnnxOutcome::Rejected {
-                    detail: format!("extracting output: {e}"),
-                },
-            },
-            None => OnnxOutcome::Rejected {
+        let Some(tensor) = outputs.get(OnnxCase::OUTPUT_NAME) else {
+            return OnnxOutcome::Rejected {
                 detail: format!("no output named {}", OnnxCase::OUTPUT_NAME),
-            },
+            };
+        };
+
+        let flat = match tensor.flatten_all() {
+            Ok(flat) => flat,
+            Err(e) => {
+                return OnnxOutcome::Rejected {
+                    detail: format!("flattening output: {e}"),
+                };
+            }
+        };
+
+        macro_rules! collect {
+            ($rust:ty, $variant:ident) => {
+                match flat.to_vec1::<$rust>() {
+                    Ok(values) => TensorData::$variant(values),
+                    Err(e) => {
+                        return OnnxOutcome::Rejected {
+                            detail: format!("extracting output: {e}"),
+                        };
+                    }
+                }
+            };
         }
+
+        let data = match tensor.dtype() {
+            candle_core::DType::F32 => collect!(f32, F32),
+            candle_core::DType::F64 => collect!(f64, F64),
+            candle_core::DType::I64 => collect!(i64, I64),
+            other => {
+                return OnnxOutcome::Unsupported {
+                    reason: format!(
+                        "candle produced dtype {other:?}, which this adapter \
+                                     does not decode"
+                    ),
+                };
+            }
+        };
+
+        OnnxOutcome::Ok(vec![TensorValue::new(
+            OnnxCase::OUTPUT_NAME,
+            tensor.dims().iter().map(|d| *d as i64).collect(),
+            data,
+        )])
     }
 }
 
@@ -409,7 +552,8 @@ mod tests {
                     panic!("{name} could not run {op:?}: {outcome}");
                 };
                 assert_eq!(
-                    actual[0].values, expected[0].values,
+                    actual[0].as_f32().expect("f32 tensor"),
+                    expected[0].as_f32().expect("f32 tensor"),
                     "{name} disagreed with {} on {op:?}",
                     first.0
                 );
@@ -467,7 +611,7 @@ mod tests {
                 panic!("{} could not run Sub", runtime.name());
             };
             assert_eq!(
-                out[0].values,
+                out[0].as_f32().expect("f32 tensor"),
                 vec![7.0],
                 "{} computed b - a instead of a - b",
                 runtime.name()
@@ -490,6 +634,68 @@ mod tests {
         }
     }
 
+    /// **The test that makes the multi-dtype work mean anything.**
+    ///
+    /// Every element type, through every compiled runtime, round-tripping intact. Without
+    /// this the refactor is untested for exactly the types it exists to add — the enum
+    /// would compile, `validate` would pass, and nothing would ever have run an `i64`.
+    ///
+    /// `Identity` is used because it performs no arithmetic: anything lost here is lost in
+    /// the plumbing, not in a kernel.
+    #[test]
+    fn every_element_type_survives_every_runtime() {
+        use crate::case::ElemType;
+        use crate::validation::well_formed_typed;
+
+        for elem in ElemType::ALL {
+            let case = well_formed_typed(OpKind::Identity, &[2, 3], OPSET, elem);
+            let expected = &case.inputs[0].data;
+
+            for runtime in in_process() {
+                match runtime.run(&case).expect("never Err") {
+                    OnnxOutcome::Ok(out) => {
+                        assert_eq!(
+                            out[0].data.to_bit_keys(),
+                            expected.to_bit_keys(),
+                            "{} altered {elem:?} data",
+                            runtime.name()
+                        );
+                        assert_eq!(
+                            out[0].elem_type(),
+                            elem,
+                            "{} changed the element type of {elem:?}",
+                            runtime.name()
+                        );
+                        assert_eq!(out[0].dims, vec![2, 3], "{} shape", runtime.name());
+                    }
+                    // A runtime declining a type is legitimate and is exactly the kind of
+                    // gap the N2 census exists to measure. Recorded, not failed.
+                    other => {
+                        eprintln!("note: {} does not handle {elem:?}: {other}", runtime.name());
+                    }
+                }
+            }
+        }
+    }
+
+    /// At least ONNX Runtime must handle every type this adapter can build. If the maturity
+    /// anchor cannot, the type does not belong in `ElemType` yet — an element type nothing
+    /// can execute is a variant that inflates the apparent surface without testing anything.
+    #[test]
+    fn onnx_runtime_handles_every_element_type() {
+        use crate::case::ElemType;
+        use crate::validation::well_formed_typed;
+
+        for elem in ElemType::ALL {
+            let case = well_formed_typed(OpKind::Identity, &[2], OPSET, elem);
+            let outcome = OrtRuntime.run(&case).expect("never Err");
+            assert!(
+                matches!(outcome, OnnxOutcome::Ok(_)),
+                "ONNX Runtime could not handle {elem:?}: {outcome}"
+            );
+        }
+    }
+
     /// Special values must reach a runtime and come back intact. `Identity` performs no
     /// arithmetic, so anything lost here is lost in the plumbing.
     #[test]
@@ -505,7 +711,10 @@ mod tests {
             let OnnxOutcome::Ok(out) = runtime.run(&case).unwrap() else {
                 panic!("{} could not run Identity", runtime.name());
             };
-            for (sent, received) in hostile.iter().zip(out[0].values.iter()) {
+            for (sent, received) in hostile
+                .iter()
+                .zip(out[0].as_f32().expect("f32 tensor").iter())
+            {
                 assert_eq!(
                     sent.to_bits(),
                     received.to_bits(),

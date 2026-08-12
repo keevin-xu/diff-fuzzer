@@ -41,15 +41,28 @@ use crate::outcome::OnnxOutcome;
 pub struct CanonTensor {
     pub dims: Vec<i64>,
     pub elem_type: ElemType,
-    pub bits: Vec<u32>,
+    /// One entry per element, holding its exact bits.
+    ///
+    /// `u64` for every type, not just the 64-bit ones, so the canonical form is a single
+    /// shape regardless of what the tensor held. The element type is carried alongside, so
+    /// widening loses nothing: an `I32` and an `F32` with the same bit pattern are still
+    /// distinguishable because their `elem_type` differs.
+    pub bits: Vec<u64>,
+    /// Whether every element was `NaN` or infinite, computed **before** widening.
+    ///
+    /// Stored rather than recomputed because `u64` bits alone cannot answer it — the same
+    /// pattern means different things for `F32` and `I64`, and reinterpreting after the
+    /// fact is how a reasonable-looking check quietly starts measuring the wrong thing.
+    pub entirely_undefined: bool,
 }
 
 impl CanonTensor {
     fn from(tensor: &TensorValue) -> Self {
         Self {
             dims: tensor.dims.clone(),
-            elem_type: tensor.elem_type,
-            bits: tensor.values.iter().map(|v| v.to_bits()).collect(),
+            elem_type: tensor.elem_type(),
+            bits: tensor.data.to_bit_keys(),
+            entirely_undefined: tensor.data.is_entirely_undefined(),
         }
     }
 
@@ -61,7 +74,7 @@ impl CanonTensor {
     /// campaign appears to provide, which is why the engine has a `NothingComparable` skip
     /// reason at all.
     pub fn is_entirely_undefined(&self) -> bool {
-        !self.bits.is_empty() && self.bits.iter().all(|b| !f32::from_bits(*b).is_finite())
+        self.entirely_undefined
     }
 }
 

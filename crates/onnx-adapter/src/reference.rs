@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use crate::case::{OnnxCase, TensorValue};
+use crate::case::{ElemType, OnnxCase, TensorData, TensorValue};
 use crate::outcome::OnnxOutcome;
 
 /// A running `onnx.reference` worker.
@@ -106,16 +106,18 @@ impl Reference {
         for input in inputs {
             write_u32(out, input.name.len() as u32)?;
             out.write_all(input.name.as_bytes())?;
+            // The element type, as ONNX's own `TensorProto.DataType` integer. A shared
+            // vocabulary rather than a private one: both sides already have to agree with
+            // ONNX about what `7` means, so inventing a second numbering would add a
+            // translation nobody needs and a place for it to be wrong.
+            write_u32(out, input.elem_type().wire() as u32)?;
             write_u32(out, input.dims.len() as u32)?;
             for dim in &input.dims {
                 out.write_all(&dim.to_le_bytes())?;
             }
-            // Raw little-endian bit patterns. `to_le_bytes` on each `f32` preserves NaN
-            // payloads and the sign of zero, which a text encoding would destroy.
-            let mut payload = Vec::with_capacity(input.values.len() * 4);
-            for value in &input.values {
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
+            // Raw little-endian bit patterns, preserving NaN payloads and the sign of
+            // zero — which a text encoding would destroy.
+            let payload = input.data.to_le_bytes();
             write_u32(out, payload.len() as u32)?;
             out.write_all(&payload)?;
         }
@@ -140,6 +142,19 @@ impl Reference {
             let mut name = vec![0u8; name_length];
             self.stdout.read_exact(&mut name)?;
 
+            let wire_type = read_u32(&mut self.stdout)? as i32;
+            let Some(elem_type) = ElemType::from_wire(wire_type) else {
+                // A type the reference produced and this adapter cannot represent. Reported
+                // as a value rather than silently decoded as something else — guessing here
+                // would turn a capability gap into a fabricated divergence.
+                return Ok(OnnxOutcome::Rejected {
+                    detail: format!(
+                        "the reference returned element type {wire_type}, which \
+                                     this adapter does not decode"
+                    ),
+                });
+            };
+
             let rank = read_u32(&mut self.stdout)? as usize;
             let mut dims = Vec::with_capacity(rank);
             for _ in 0..rank {
@@ -151,15 +166,11 @@ impl Reference {
             let payload_length = read_u32(&mut self.stdout)? as usize;
             let mut payload = vec![0u8; payload_length];
             self.stdout.read_exact(&mut payload)?;
-            let values = payload
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
 
-            tensors.push(TensorValue::f32(
+            tensors.push(TensorValue::new(
                 &String::from_utf8_lossy(&name),
                 dims,
-                values,
+                TensorData::from_le_bytes(elem_type, &payload),
             ));
         }
         Ok(OnnxOutcome::Ok(tensors))
@@ -291,7 +302,10 @@ mod tests {
             OnnxOutcome::Ok(outputs) => {
                 assert_eq!(outputs.len(), 1);
                 assert_eq!(outputs[0].dims, vec![2, 3]);
-                assert_eq!(outputs[0].values, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+                assert_eq!(
+                    outputs[0].as_f32().expect("f32 tensor"),
+                    vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]
+                );
             }
             OnnxOutcome::Rejected { detail: why } => {
                 panic!("the reference rejected a valid model:\n{why}")
@@ -316,7 +330,10 @@ mod tests {
             let OnnxOutcome::Ok(out) = reference.run(&bytes, &inputs).expect("reply") else {
                 panic!("round {round} was rejected");
             };
-            assert_eq!(out[0].values, vec![left + 1.0, left + 2.0]);
+            assert_eq!(
+                out[0].as_f32().expect("f32 tensor"),
+                vec![left + 1.0, left + 2.0]
+            );
         }
     }
 
@@ -347,17 +364,23 @@ mod tests {
             panic!("the reference rejected an Identity model with special values");
         };
 
-        assert!(out[0].values[0].is_infinite() && out[0].values[0].is_sign_positive());
-        assert!(out[0].values[1].is_infinite() && out[0].values[1].is_sign_negative());
+        assert!(
+            out[0].as_f32().expect("f32 tensor")[0].is_infinite()
+                && out[0].as_f32().expect("f32 tensor")[0].is_sign_positive()
+        );
+        assert!(
+            out[0].as_f32().expect("f32 tensor")[1].is_infinite()
+                && out[0].as_f32().expect("f32 tensor")[1].is_sign_negative()
+        );
         // `-0.0 == 0.0` is true in IEEE-754, so comparing values would pass even if the
         // sign were lost. Comparing the *bits* is what actually checks this.
         assert_eq!(
-            out[0].values[2].to_bits(),
+            out[0].as_f32().expect("f32 tensor")[2].to_bits(),
             (-0.0f32).to_bits(),
             "the sign of zero was lost crossing the process boundary"
         );
         assert_eq!(
-            out[0].values[3],
+            out[0].as_f32().expect("f32 tensor")[3],
             f32::MIN_POSITIVE,
             "subnormal boundary lost"
         );
@@ -388,12 +411,12 @@ mod tests {
         };
 
         assert_eq!(
-            out[0].values[0].to_bits(),
+            out[0].as_f32().expect("f32 tensor")[0].to_bits(),
             (0.0f32).to_bits(),
             "(-0.0) + (+0.0) should give +0.0"
         );
         assert_eq!(
-            out[0].values[1].to_bits(),
+            out[0].as_f32().expect("f32 tensor")[1].to_bits(),
             (-0.0f32).to_bits(),
             "(-0.0) + (-0.0) should give -0.0"
         );
@@ -414,7 +437,7 @@ mod tests {
             panic!("the reference rejected a NaN model");
         };
         assert!(
-            out[0].values[0].is_nan(),
+            out[0].as_f32().expect("f32 tensor")[0].is_nan(),
             "NaN did not survive the boundary"
         );
     }
@@ -422,6 +445,41 @@ mod tests {
     #[test]
     fn nan_survives_the_boundary() {
         nan_survives_the_boundary_impl();
+    }
+
+    /// Every element type must cross the process boundary intact, in both directions.
+    ///
+    /// The wire format carries the element type explicitly, and this is what proves the
+    /// two sides agree about what each code means. A mismatch would decode one type's bits
+    /// as another's and produce a divergence that looks entirely real.
+    #[test]
+    fn every_element_type_survives_the_process_boundary() {
+        use crate::case::ElemType;
+        use crate::validation::well_formed_typed;
+
+        let mut reference = Reference::start().expect("the reference worker must start");
+
+        for elem in ElemType::ALL {
+            let case =
+                well_formed_typed(crate::case::OpKind::Identity, &[2, 3], DEFAULT_OPSET, elem);
+            let bytes = crate::model::build_bytes(&case);
+
+            let outcome = reference.run(&bytes, &case.inputs).expect("reply");
+            let OnnxOutcome::Ok(out) = outcome else {
+                panic!("the reference rejected an Identity model at {elem:?}: {outcome}");
+            };
+            assert_eq!(
+                out[0].elem_type(),
+                elem,
+                "the element type changed crossing the boundary"
+            );
+            assert_eq!(
+                out[0].data.to_bit_keys(),
+                case.inputs[0].data.to_bit_keys(),
+                "{elem:?} data changed crossing the boundary"
+            );
+            assert_eq!(out[0].dims, vec![2, 3]);
+        }
     }
 
     /// An invalid model must come back as `Rejected`, not as a panic or a hang. This is
@@ -464,6 +522,6 @@ mod tests {
         let OnnxOutcome::Ok(out) = reference.run(&good, &inputs).expect("reply") else {
             panic!("the worker stopped working after a rejection");
         };
-        assert_eq!(out[0].values, vec![4.0, 6.0]);
+        assert_eq!(out[0].as_f32().expect("f32 tensor"), vec![4.0, 6.0]);
     }
 }

@@ -54,7 +54,12 @@ fn main() {
 
     println!("inputs");
     for input in &case.inputs {
-        println!("  {:<12} {:?}  {:?}", input.name, input.dims, input.values);
+        println!(
+            "  {:<12} {:?}  {:?}",
+            input.name,
+            input.dims,
+            input.as_f32().expect("f32 tensor")
+        );
     }
     println!();
 

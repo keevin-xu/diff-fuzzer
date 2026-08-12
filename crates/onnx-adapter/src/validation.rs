@@ -29,7 +29,7 @@
 //! responsibility, not a validation one — refusing to *emit* such a case is sound, while
 //! detecting it after the fact generally is not.
 
-use crate::case::{OnnxCase, OpKind, TensorValue};
+use crate::case::{ElemType, OnnxCase, OpKind, TensorData, TensorValue};
 
 /// Why a case is not well-formed.
 ///
@@ -140,12 +140,12 @@ pub fn validate(case: &OnnxCase) -> Vec<Invalid> {
         // Only meaningful once the shape itself is sane, or the expected count is nonsense.
         if input.dims.iter().all(|d| *d >= 0) {
             let expected = input.element_count();
-            if input.values.len() != expected {
+            if input.data.len() != expected {
                 problems.push(Invalid::ShapeDataMismatch {
                     name: input.name.clone(),
                     dims: input.dims.clone(),
                     expected,
-                    actual: input.values.len(),
+                    actual: input.data.len(),
                 });
             }
         }
@@ -167,7 +167,7 @@ pub fn validate(case: &OnnxCase) -> Vec<Invalid> {
                     second: other.dims.clone(),
                 });
             }
-            if other.elem_type != first.elem_type {
+            if other.elem_type() != first.elem_type() {
                 problems.push(Invalid::ElemTypeMismatch { op: op_name });
             }
         }
@@ -187,14 +187,36 @@ pub fn is_valid(case: &OnnxCase) -> bool {
 /// function that judges validity should be read together, so a rule added to one is
 /// obviously missing from the other.
 pub fn well_formed(op: OpKind, dims: &[i64], opset: i64) -> OnnxCase {
+    well_formed_typed(op, dims, opset, ElemType::F32)
+}
+
+/// Build a well-formed case for one operator at a given element type.
+///
+/// Values are distinct per input so a case cannot pass by symmetry — if a runtime swapped
+/// its operands, `Sub` would notice and `Add` would not.
+pub fn well_formed_typed(op: OpKind, dims: &[i64], opset: i64, elem: ElemType) -> OnnxCase {
     let count = dims.iter().product::<i64>().max(0) as usize;
     let inputs = (0..op.arity())
         .map(|index| {
-            // Distinct values per input so a case cannot pass by symmetry — if a runtime
-            // swapped its operands, `Sub` would notice and `Add` would not.
-            let base = (index as f32 + 1.0) * 10.0;
-            let values: Vec<f32> = (0..count).map(|i| base + i as f32).collect();
-            TensorValue::f32(&input_name(index), dims.to_vec(), values)
+            let base = (index as i64 + 1) * 10;
+            let data = match elem {
+                ElemType::F32 => {
+                    TensorData::F32((0..count).map(|i| (base + i as i64) as f32).collect())
+                }
+                ElemType::F64 => {
+                    TensorData::F64((0..count).map(|i| (base + i as i64) as f64).collect())
+                }
+                ElemType::I32 => {
+                    TensorData::I32((0..count).map(|i| (base + i as i64) as i32).collect())
+                }
+                ElemType::I64 => TensorData::I64((0..count).map(|i| base + i as i64).collect()),
+                // Alternating rather than constant, so a runtime that returned a fixed
+                // value would be caught.
+                ElemType::Bool => {
+                    TensorData::Bool((0..count).map(|i| (i + index) % 2 == 0).collect())
+                }
+            };
+            TensorValue::new(&input_name(index), dims.to_vec(), data)
         })
         .collect();
     OnnxCase::new(op, opset, inputs)
@@ -264,7 +286,12 @@ mod tests {
     #[test]
     fn data_not_matching_the_declared_shape_is_caught() {
         let mut case = well_formed(OpKind::Identity, &[4], OPSET);
-        case.inputs[0].values.pop();
+        // Drop a value without touching `dims`, so the declared shape and the stored data
+        // disagree — the situation this rule exists to catch.
+        let TensorData::F32(values) = &mut case.inputs[0].data else {
+            unreachable!("well_formed builds f32 tensors");
+        };
+        values.pop();
         assert!(validate(&case).iter().any(|p| matches!(
             p,
             Invalid::ShapeDataMismatch {
@@ -362,17 +389,34 @@ mod tests {
         assert_eq!(names.len(), unique.len(), "input_name produced a collision");
     }
 
+    /// Every element type must be constructible in a well-formed way, or the type exists
+    /// in the enum while nothing can generate it — a variant nothing tests.
+    #[test]
+    fn well_formed_cases_validate_for_every_element_type() {
+        for elem in ElemType::ALL {
+            for op in OpKind::ALL {
+                let case = well_formed_typed(op, &[2, 3], OPSET, elem);
+                assert_eq!(
+                    validate(&case),
+                    vec![],
+                    "{op:?} at {elem:?} should be valid"
+                );
+                assert_eq!(case.inputs[0].elem_type(), elem);
+            }
+        }
+    }
+
+    /// Now reachable with a real case: this rule previously had no way to fire, because
+    /// only one element type existed.
     #[test]
     fn mismatched_element_types_are_caught() {
-        // Only one element type exists today, so this rule cannot currently be tripped.
-        // The assertion below is what keeps that fact honest: when a second type is added,
-        // this test fails and forces a real case to be written rather than leaving a rule
-        // that has never once been exercised.
-        let variants = [ElemType::F32];
-        assert_eq!(
-            variants.len(),
-            1,
-            "a second ElemType exists — write a real mismatch case for ElemTypeMismatch"
+        let mut case = well_formed(OpKind::Add, &[2], OPSET);
+        case.inputs[1] = TensorValue::new("b", vec![2], TensorData::I64(vec![1, 2]));
+        assert!(
+            validate(&case)
+                .iter()
+                .any(|p| matches!(p, Invalid::ElemTypeMismatch { .. })),
+            "an f32 and an i64 input to the same elementwise operator must be rejected"
         );
     }
 }

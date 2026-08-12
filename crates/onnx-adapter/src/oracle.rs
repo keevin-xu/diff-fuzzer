@@ -230,7 +230,7 @@ fn render(canonical: &Canonical) -> String {
                 .bits
                 .iter()
                 .take(16)
-                .map(|b| format!("{}#{b:08x}", f32::from_bits(*b)))
+                .map(|b| format!("{b:#018x}"))
                 .collect();
             let elided = if t.bits.len() > 16 {
                 format!(" ...[{} more]", t.bits.len() - 16)

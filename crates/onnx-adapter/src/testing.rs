@@ -51,7 +51,7 @@
 
 use diff_fuzzer_core::traits::{Implementation, RunError};
 
-use crate::case::OnnxCase;
+use crate::case::{OnnxCase, TensorData};
 use crate::outcome::OnnxOutcome;
 
 /// Wraps a real implementation and perturbs one output value.
@@ -110,12 +110,48 @@ where
         let OnnxOutcome::Ok(mut tensors) = outcome else {
             return Ok(outcome);
         };
-        if let Some(tensor) = tensors.first_mut()
-            && let Some(value) = tensor.values.get_mut(self.index)
-        {
-            *value += self.delta;
+        if let Some(tensor) = tensors.first_mut() {
+            corrupt_element(&mut tensor.data, self.index, self.delta);
         }
         Ok(OnnxOutcome::Ok(tensors))
+    }
+}
+
+/// Perturb one element, whatever type it is.
+///
+/// Each type needs its own notion of "different": adding a float delta to a boolean is not
+/// a thing, and adding it to an integer would truncate to no change for any delta below 1.
+/// Out-of-range indices are a no-op, which the caller sees as an **inert** fault rather
+/// than a miss.
+fn corrupt_element(data: &mut TensorData, index: usize, delta: f32) {
+    match data {
+        TensorData::F32(v) => {
+            if let Some(x) = v.get_mut(index) {
+                *x += delta;
+            }
+        }
+        TensorData::F64(v) => {
+            if let Some(x) = v.get_mut(index) {
+                *x += f64::from(delta);
+            }
+        }
+        // `wrapping_add` rather than `+`: a corruptor must never panic on overflow, or a
+        // deliberate fault would look like a crash in the code under test.
+        TensorData::I32(v) => {
+            if let Some(x) = v.get_mut(index) {
+                *x = x.wrapping_add(1);
+            }
+        }
+        TensorData::I64(v) => {
+            if let Some(x) = v.get_mut(index) {
+                *x = x.wrapping_add(1);
+            }
+        }
+        TensorData::Bool(v) => {
+            if let Some(x) = v.get_mut(index) {
+                *x = !*x;
+            }
+        }
     }
 }
 
@@ -393,7 +429,8 @@ mod tests {
             panic!("the wrapper should still produce a result");
         };
         assert_eq!(
-            clean[0].values, faulty[0].values,
+            clean[0].as_f32().expect("f32 tensor"),
+            faulty[0].as_f32().expect("f32 tensor"),
             "values must be identical"
         );
         assert_ne!(clean[0].dims, faulty[0].dims, "shape must differ");

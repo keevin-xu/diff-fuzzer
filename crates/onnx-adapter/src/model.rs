@@ -35,7 +35,7 @@
 
 use prost::Message;
 
-use crate::case::{ElemType, OnnxCase, OpKind};
+use crate::case::{ElemType, OnnxCase, OpKind, TensorValue};
 use crate::pb::{
     GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorShapeProto, TypeProto,
     ValueInfoProto, tensor_shape_proto, type_proto,
@@ -115,7 +115,7 @@ pub fn build(case: &OnnxCase) -> ModelProto {
     let elem_type = case
         .inputs
         .first()
-        .map_or(ElemType::F32, |input| input.elem_type);
+        .map_or(ElemType::F32, TensorValue::elem_type);
 
     let graph = GraphProto {
         node: vec![node],
@@ -123,7 +123,7 @@ pub fn build(case: &OnnxCase) -> ModelProto {
         input: case
             .inputs
             .iter()
-            .map(|t| value_info(&t.name, t.elem_type, &t.dims))
+            .map(|t| value_info(&t.name, t.elem_type(), &t.dims))
             .collect(),
         output: vec![value_info(
             OnnxCase::OUTPUT_NAME,

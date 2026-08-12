@@ -30,10 +30,11 @@ until stdin closes, so one process can serve many cases — which is what makes 
         per input:
             u32      name length
             bytes    name, UTF-8
+            u32      elem_type, as ONNX TensorProto.DataType
             u32      rank
             i64*rank dimensions (signed)
             u32      payload length in bytes
-            bytes    values, little-endian, dtype implied by the graph's declaration
+            bytes    values, little-endian
 
     response:
         u8           0 = produced outputs, 1 = failed
@@ -94,6 +95,10 @@ def _write_tensor(stream, name, array):
     encoded = name.encode("utf-8")
     _write_u32(stream, len(encoded))
     stream.write(encoded)
+    # The element type travels with the data. An output's type is not always an input's --
+    # `Equal` takes floats and returns bools -- so the receiver cannot infer it from the
+    # request, and guessing would decode one type's bits as another's.
+    _write_u32(stream, _ONNX_TYPE_OF.get(array.dtype.type, 0))
     _write_u32(stream, array.ndim)
     for dim in array.shape:
         stream.write(struct.pack("<q", dim))
@@ -116,19 +121,9 @@ _DTYPES = {
     11: np.float64,  # DOUBLE
 }
 
-
-def _input_dtypes(model):
-    """The numpy dtype each graph input declares, keyed by name."""
-    dtypes = {}
-    for value_info in model.graph.input:
-        elem_type = value_info.type.tensor_type.elem_type
-        if elem_type not in _DTYPES:
-            raise ValueError(
-                f"input {value_info.name!r} has element type {elem_type}, which this "
-                f"runner does not decode. Add it to _DTYPES deliberately."
-            )
-        dtypes[value_info.name] = _DTYPES[elem_type]
-    return dtypes
+# The inverse, for encoding a result. Built from _DTYPES so the two can never disagree --
+# two hand-maintained tables that must agree is exactly how a mapping quietly rots.
+_ONNX_TYPE_OF = {dtype: code for code, dtype in _DTYPES.items()}
 
 
 def _handle(model_bytes, raw_inputs):
@@ -141,12 +136,25 @@ def _handle(model_bytes, raw_inputs):
     # as our error rather than becoming a divergence against some runtime.
     onnx.checker.check_model(model)
 
-    dtypes = _input_dtypes(model)
+    declared = {v.name: v.type.tensor_type.elem_type for v in model.graph.input}
     feeds = {}
-    for name, dims, payload in raw_inputs:
-        if name not in dtypes:
+    for name, elem_type, dims, payload in raw_inputs:
+        if name not in declared:
             raise ValueError(f"input {name!r} is not declared by the graph")
-        array = np.frombuffer(payload, dtype=dtypes[name]).reshape(dims)
+        # The sender's type must match what the graph declares. A mismatch means the model
+        # and the values disagree, which is our bug -- and decoding by one of them while
+        # the runtime uses the other would produce a fabricated divergence.
+        if declared[name] != elem_type:
+            raise ValueError(
+                f"input {name!r} was sent as element type {elem_type} but the graph "
+                f"declares {declared[name]}"
+            )
+        if elem_type not in _DTYPES:
+            raise ValueError(
+                f"input {name!r} has element type {elem_type}, which this runner does "
+                f"not decode. Add it to _DTYPES deliberately."
+            )
+        array = np.frombuffer(payload, dtype=_DTYPES[elem_type]).reshape(dims)
         feeds[name] = array
 
     evaluator = ReferenceEvaluator(model)
@@ -168,10 +176,11 @@ def main():
         raw_inputs = []
         for _ in range(_read_u32(stdin)):
             name = _read_exactly(stdin, _read_u32(stdin)).decode("utf-8")
+            elem_type = _read_u32(stdin)
             rank = _read_u32(stdin)
             dims = [struct.unpack("<q", _read_exactly(stdin, 8))[0] for _ in range(rank)]
             payload = _read_exactly(stdin, _read_u32(stdin))
-            raw_inputs.append((name, dims, payload))
+            raw_inputs.append((name, elem_type, dims, payload))
 
         try:
             results = _handle(model_bytes, raw_inputs)

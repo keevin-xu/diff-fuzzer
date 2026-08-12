@@ -141,12 +141,14 @@ impl std::fmt::Display for OnnxOutcome {
                     // Printed as bits alongside the value, because a report that shows
                     // `0` for both `+0.0` and `-0.0` hides the disagreement it exists to
                     // document.
-                    write!(f, "[")?;
-                    for (i, v) in tensor.values.iter().enumerate() {
+                    // Rendered as bit patterns, not values. A report that prints `0` for
+                    // both `+0.0` and `-0.0` hides the disagreement it exists to document.
+                    write!(f, "{:?}[", tensor.elem_type())?;
+                    for (i, bits) in tensor.data.to_bit_keys().iter().enumerate() {
                         if i > 0 {
                             write!(f, " ")?;
                         }
-                        write!(f, "{v}#{:08x}", v.to_bits())?;
+                        write!(f, "{bits:#x}")?;
                     }
                     write!(f, "]")?;
                 }
@@ -237,7 +239,7 @@ mod tests {
         let restored: OnnxOutcome =
             serde_json::from_str(&serde_json::to_string(&outcome).unwrap()).unwrap();
 
-        let values = &restored.tensors().unwrap()[0].values;
+        let values = restored.tensors().unwrap()[0].as_f32().expect("f32 tensor");
         assert!(values[0].is_nan());
         assert_eq!(values[1].to_bits(), (-0.0f32).to_bits());
     }

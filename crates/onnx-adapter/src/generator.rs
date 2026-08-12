@@ -219,7 +219,7 @@ mod tests {
         for seed in 0..2_000 {
             let case = generator.generate(&mut SeededRng::from_seed(seed));
             for input in &case.inputs {
-                for value in &input.values {
+                for value in input.as_f32().expect("f32 tensor") {
                     seen_nan |= value.is_nan();
                     seen_inf |= value.is_infinite();
                     seen_negative_zero |= value.to_bits() == (-0.0f32).to_bits();
@@ -238,7 +238,7 @@ mod tests {
         for seed in 0..2_000 {
             let case = generator.generate(&mut SeededRng::from_seed(seed));
             for input in &case.inputs {
-                for value in &input.values {
+                for value in input.as_f32().expect("f32 tensor") {
                     assert!(
                         value.is_finite(),
                         "seed {seed} produced {value} with the special-value rate at zero"
