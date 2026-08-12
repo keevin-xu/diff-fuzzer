@@ -323,6 +323,45 @@ impl TractRuntime {
                 };
             }
 
+            // `TDim` is tract's **symbolic dimension** type, and it is what `Shape` returns:
+            // tract models shapes as expressions rather than as concrete integers. That is
+            // not a limitation of tract, it is how tract works — and until this arm existed
+            // the census recorded 14 cells as tract rejections when tract had in fact
+            // answered correctly. A capability matrix that blames a runtime for our own
+            // decoding gap is worse than one with a hole in it, because it reads as evidence.
+            //
+            // Every shape this domain builds is fully static, so each dimension is a concrete
+            // integer and the cast succeeds. A genuinely symbolic dimension would fail the
+            // cast, and that is reported rather than guessed at.
+            if output.datum_type() == DatumType::TDim {
+                let concrete = match output.cast_to::<i64>() {
+                    Ok(concrete) => concrete,
+                    Err(e) => {
+                        return OnnxOutcome::Rejected {
+                            detail: format!(
+                                "output {index} is a symbolic shape that does not resolve to \
+                                 concrete integers: {e}"
+                            ),
+                        };
+                    }
+                };
+                match concrete.as_ref().to_plain_array_view::<i64>() {
+                    Ok(array) => {
+                        tensors.push(TensorValue::new(
+                            OnnxCase::OUTPUT_NAME,
+                            array.shape().iter().map(|d| *d as i64).collect(),
+                            TensorData::I64(array.iter().copied().collect()),
+                        ));
+                        continue;
+                    }
+                    Err(e) => {
+                        return OnnxOutcome::Rejected {
+                            detail: format!("extracting output {index} after cast: {e}"),
+                        };
+                    }
+                }
+            }
+
             let tensor = match output.datum_type() {
                 DatumType::F32 => collect!(f32, F32),
                 DatumType::F64 => collect!(f64, F64),
