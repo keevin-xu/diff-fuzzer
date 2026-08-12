@@ -105,12 +105,15 @@ pub struct Bounds {
     /// `Reshape`, `Squeeze`, `Unsqueeze`, `Slice`, `Pad` — the operators whose second input is
     /// an `I64` shape, axes, or pad vector.
     ///
-    /// **A separate axis from [`Self::structural`] on purpose**, and off by default. The census
-    /// measured all five failing **0/5 on `tract`**, which types graphs statically at load and
-    /// cannot infer an output shape whose shape input only arrives at run time. Whether the fix
-    /// is to emit those inputs as *initializers* is `PENDING` 1.10, unresolved. Generating them
-    /// before that is settled would produce a corpus where a third of participants refuse every
-    /// case — which reads as a capability finding and is not one.
+    /// **A separate axis from [`Self::structural`]**, because their second input is
+    /// configuration rather than data and is emitted as an initializer — see
+    /// [`crate::case::InputRole`].
+    ///
+    /// It was held off by default while `PENDING` 1.10 was open: the census measured all five
+    /// failing **0/5 on `tract`**, which types graphs statically at load and could not infer an
+    /// output shape whose shape input only arrived at run time. Emitting those inputs as
+    /// initializers fixed it — `tract` went from **0/5 to 5/5** on four of them and 4/5 on
+    /// `Pad`, and its overall support rose from 97 to **121 of 126**. The axis is now on.
     pub shape_input_operators: bool,
 
     // ── which element types ───────────────────────────────────────────────────────
@@ -158,8 +161,7 @@ impl Default for Bounds {
             comparisons: true,
             logical: true,
             structural: true,
-            // Off pending `PENDING` 1.10.
-            shape_input_operators: false,
+            shape_input_operators: true,
 
             float64: true,
             integer_types: true,
@@ -364,9 +366,18 @@ mod tests {
                 "{name} missing from the description: {described}"
             );
         }
-        // A disabled axis must still be named, or it cannot be told from one that did not exist.
-        assert!(described.contains("shape-input-ops=off"), "{described}");
-        assert!(described.contains("special-values=off"), "{described}");
+        // A disabled axis must still be named, or it cannot be told from one that did not
+        // exist. `special-values` is the axis that is off in the default configuration; if it
+        // is ever turned on by default, this assertion must move to whichever axis is not,
+        // rather than being deleted — the property is what matters, not the example.
+        assert!(
+            described.contains("special-values=off"),
+            "a disabled axis must appear in the description: {described}"
+        );
+        assert!(
+            Bounds::default().axes().iter().any(|(_, on)| !on),
+            "this test is vacuous unless some axis is actually off"
+        );
     }
 
     #[test]
@@ -565,12 +576,18 @@ mod tests {
         }
     }
 
-    /// The shape-input operators must stay out until `PENDING` 1.10 is settled. A test rather
-    /// than a comment, because a default that drifts silently is how a blocked decision gets
-    /// made by accident.
+    /// The five shape-input operators are generated, and their configuration input is an
+    /// **initializer** rather than a fed input.
+    ///
+    /// The role is what makes them work: emitted as fed inputs they failed 0/5 on `tract`,
+    /// which types graphs statically at load. Asserting the role here — not just that the
+    /// operators are present — is the difference between testing the decision and testing that
+    /// somebody flipped a flag.
     #[test]
-    fn shape_input_operators_are_excluded_by_default() {
-        let ops = Bounds::default().operators();
+    fn shape_input_operators_pass_their_configuration_as_initializers() {
+        let bounds = Bounds::default();
+        let generated = bounds.operators();
+
         for op in [
             OpKind::Reshape,
             OpKind::Squeeze,
@@ -578,11 +595,33 @@ mod tests {
             OpKind::Slice,
             OpKind::Pad,
         ] {
+            assert!(generated.contains(&op), "{op:?} should be generated");
+
+            let case = ops::probe(op, ElemType::F32, bounds.opset).expect("probe");
             assert!(
-                !ops.contains(&op),
-                "{op:?} is generated while PENDING 1.10 is open — tract refuses all five"
+                case.initializers().count() >= 1,
+                "{op:?} must pass its shape/axes/pads input as an initializer"
+            );
+            // The data input stays fed, so nothing can be constant-folded to a literal — the
+            // property the graph-inputs rule was protecting in the first place.
+            assert!(
+                case.fed_inputs().count() >= 1,
+                "{op:?} must still feed its data input at execution"
             );
         }
+    }
+
+    /// `Gather`'s indices are **data**, not configuration: their values decide the answer. A
+    /// test because the distinction is the whole content of the role split, and getting it
+    /// backwards would silently stop testing index selection.
+    #[test]
+    fn gather_indices_stay_a_fed_input() {
+        let case = ops::probe(OpKind::Gather, ElemType::F32, 22).expect("probe");
+        assert_eq!(
+            case.initializers().count(),
+            0,
+            "Gather reads its indices as data; making them constant would fold the selection away"
+        );
     }
 
     /// An operator must not be admitted when nothing can build a case for it. Enabling the

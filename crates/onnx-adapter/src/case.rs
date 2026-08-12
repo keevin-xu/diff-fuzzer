@@ -221,12 +221,58 @@ impl TensorData {
     }
 }
 
-/// One tensor: its name in the graph, its shape, and its typed contents.
+/// What an operator input *is* — data flowing through the graph, or configuration.
+///
+/// # Why the distinction exists
+///
+/// ONNX makes no type-level difference between "the tensor to reshape" and "the shape to
+/// reshape it to": both are node inputs. But they are not the same kind of thing, and treating
+/// them alike broke two things at once.
+///
+/// N0.3 decided that values are **graph inputs** rather than baked-in `initializer` constants,
+/// because an all-initializer graph can be constant-folded at load time — which would test the
+/// optimizer while appearing to test the operator, and would do so silently. That reasoning is
+/// correct for **data**.
+///
+/// It is wrong for a **shape vector**. The N2 census measured `Reshape`, `Squeeze`, `Unsqueeze`,
+/// `Slice` and `Pad` failing **0/5 on `tract`** — 25 of its 29 rejections — because `tract`
+/// types the graph statically at load and cannot infer an output shape whose shape input only
+/// arrives at run time. A shape vector is not data; it is operator **configuration**, no
+/// different in kind from the `perm` attribute that `Transpose` takes.
+///
+/// So the rule splits by **role**, not by operator:
+///
+/// | role | emitted as | why |
+/// |---|---|---|
+/// | [`InputRole::Data`] | a graph input, fed at execution | keeps the kernel in the path |
+/// | [`InputRole::Initializer`] | a constant in the model | it is configuration, and static shape inference needs it |
+///
+/// The data input of every operator stays a graph input, so nothing can be folded away to a
+/// constant — which is the property N0.3 was protecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum InputRole {
+    /// Fed at execution time through each runtime's own API. The default.
+    #[default]
+    Data,
+    /// Baked into the model as a constant `TensorProto`.
+    ///
+    /// Not listed among the graph's inputs: since IR version 4 an initializer need not be, and
+    /// listing it would make every runtime expect it to be fed as well.
+    Initializer,
+}
+
+/// One tensor: its name in the graph, its shape, its typed contents, and its role.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TensorValue {
     pub name: String,
     pub dims: Vec<i64>,
     pub data: TensorData,
+    /// Whether this is data or configuration. See [`InputRole`].
+    ///
+    /// `#[serde(default)]` so a finding stored before roles existed still loads, as `Data` —
+    /// the backward-compatible-deserializer rule from `08-RISKS.md` §11.
+    #[serde(default)]
+    pub role: InputRole,
 }
 
 impl TensorValue {
@@ -235,7 +281,23 @@ impl TensorValue {
             name: name.to_owned(),
             dims,
             data,
+            role: InputRole::Data,
         }
+    }
+
+    /// The same tensor, emitted as a constant in the model rather than fed at execution.
+    ///
+    /// For shape vectors, axis lists and pad amounts — operator configuration that a runtime
+    /// doing static shape inference must be able to see at load time.
+    #[must_use]
+    pub fn as_initializer(mut self) -> Self {
+        self.role = InputRole::Initializer;
+        self
+    }
+
+    /// Whether this input is baked into the model rather than fed at execution.
+    pub fn is_initializer(&self) -> bool {
+        self.role == InputRole::Initializer
     }
 
     /// Shorthand for the common case. The other types get `new` with an explicit
@@ -517,6 +579,20 @@ impl OnnxCase {
 
     /// The name the single output is given in the graph.
     pub const OUTPUT_NAME: &'static str = "out";
+
+    /// The inputs a runtime must be **fed** — everything that is not an initializer.
+    ///
+    /// Every runtime and the reference boundary use this rather than `inputs`. Feeding an
+    /// initializer would be an error: it is already in the model, and a runtime that received
+    /// it twice would reject the case.
+    pub fn fed_inputs(&self) -> impl Iterator<Item = &TensorValue> {
+        self.inputs.iter().filter(|t| !t.is_initializer())
+    }
+
+    /// The inputs baked into the model as constants.
+    pub fn initializers(&self) -> impl Iterator<Item = &TensorValue> {
+        self.inputs.iter().filter(|t| t.is_initializer())
+    }
 
     /// Total elements across all inputs. Used as a cheap size measure by shrinking and by
     /// corpus-shape reporting.

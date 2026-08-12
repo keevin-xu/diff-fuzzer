@@ -35,10 +35,10 @@
 
 use prost::Message;
 
-use crate::case::{ElemType, OnnxCase, OpKind};
+use crate::case::{ElemType, OnnxCase, OpKind, TensorValue};
 use crate::pb::{
-    GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorShapeProto, TypeProto,
-    ValueInfoProto, tensor_shape_proto, type_proto,
+    GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorProto, TensorShapeProto,
+    TypeProto, ValueInfoProto, tensor_shape_proto, type_proto,
 };
 
 /// The IR version written into every model this crate builds.
@@ -124,11 +124,16 @@ pub fn build(case: &OnnxCase) -> ModelProto {
     let graph = GraphProto {
         node: vec![node],
         name: Some("g".to_owned()),
+        // **Only the fed inputs are declared as graph inputs.** An initializer is a constant
+        // in the model; since IR version 4 it need not appear here, and listing it would make
+        // every runtime expect it to be supplied at execution as well.
         input: case
-            .inputs
-            .iter()
+            .fed_inputs()
             .map(|t| value_info(&t.name, t.elem_type(), &t.dims))
             .collect(),
+        // Configuration inputs — shape vectors, axis lists, pad amounts — are baked in, so a
+        // runtime doing static shape inference can see them at load time. See `InputRole`.
+        initializer: case.initializers().map(tensor_proto).collect(),
         output: vec![value_info(OnnxCase::OUTPUT_NAME, elem_type, &output_dims)],
         ..Default::default()
     };
@@ -145,6 +150,23 @@ pub fn build(case: &OnnxCase) -> ModelProto {
         // directory says where it came from without needing the log beside it.
         producer_name: Some("diff-fuzzer".to_owned()),
         graph: Some(graph),
+        ..Default::default()
+    }
+}
+
+/// Convert a tensor to the constant form ONNX bakes into a model.
+///
+/// The payload goes in `raw_data` rather than the typed fields (`float_data`, `int64_data`, …)
+/// because raw bytes preserve the exact bit pattern — `NaN` payloads and the sign of zero
+/// included — and because one encoding for every element type means one place to be wrong
+/// rather than five. ONNX treats `raw_data` as little-endian, which is what
+/// [`TensorData::to_le_bytes`] produces.
+fn tensor_proto(tensor: &TensorValue) -> TensorProto {
+    TensorProto {
+        name: Some(tensor.name.clone()),
+        dims: tensor.dims.clone(),
+        data_type: Some(tensor.elem_type().wire()),
+        raw_data: Some(tensor.data.to_le_bytes()),
         ..Default::default()
     }
 }
@@ -185,12 +207,23 @@ mod tests {
 
             assert_eq!(graph.node.len(), 1, "this domain builds single-node graphs");
             assert_eq!(graph.node[0].op_type.as_deref(), Some(op.onnx_name()));
+            // The **node** references every input by name, initializers included.
             assert_eq!(
                 graph.node[0].input.len(),
                 case.inputs.len(),
                 "{op:?} node arity must match the case"
             );
-            assert_eq!(graph.input.len(), case.inputs.len());
+            // The **graph** declares only what is fed; initializers are constants in the model.
+            assert_eq!(
+                graph.input.len(),
+                case.fed_inputs().count(),
+                "{op:?} graph inputs must exclude initializers"
+            );
+            assert_eq!(
+                graph.initializer.len(),
+                case.initializers().count(),
+                "{op:?} initializers must reach the model"
+            );
             assert_eq!(graph.output.len(), 1);
         }
     }

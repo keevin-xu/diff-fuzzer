@@ -461,7 +461,7 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             opset,
             vec![
                 data("a", &[2, 3], elem, 0),
-                TensorValue::new("b", vec![2], TensorData::I64(vec![3, 2])),
+                TensorValue::new("b", vec![2], TensorData::I64(vec![3, 2])).as_initializer(),
             ],
         ),
         Family::Transpose => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)])
@@ -477,6 +477,8 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             opset,
             vec![
                 data("a", &[3, 2], elem, 0),
+                // `Gather`'s indices are genuinely data — they select, and their *values*
+                // decide the answer — so they stay a fed input.
                 TensorValue::new("b", vec![2], TensorData::I64(vec![0, 2])),
             ],
         )
@@ -487,7 +489,7 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             vec![
                 // A length-1 dimension, since that is the only kind `Squeeze` may remove.
                 data("a", &[1, 3], elem, 0),
-                TensorValue::new("b", vec![1], TensorData::I64(vec![0])),
+                TensorValue::new("b", vec![1], TensorData::I64(vec![0])).as_initializer(),
             ],
         ),
         Family::Unsqueeze => OnnxCase::new(
@@ -495,7 +497,7 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             opset,
             vec![
                 data("a", &[3], elem, 0),
-                TensorValue::new("b", vec![1], TensorData::I64(vec![0])),
+                TensorValue::new("b", vec![1], TensorData::I64(vec![0])).as_initializer(),
             ],
         ),
         Family::Shape | Family::Size => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)]),
@@ -504,8 +506,8 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             opset,
             vec![
                 data("a", &[4], elem, 0),
-                TensorValue::new("b", vec![1], TensorData::I64(vec![1])),
-                TensorValue::new("c", vec![1], TensorData::I64(vec![3])),
+                TensorValue::new("b", vec![1], TensorData::I64(vec![1])).as_initializer(),
+                TensorValue::new("c", vec![1], TensorData::I64(vec![3])).as_initializer(),
             ],
         ),
         Family::Pad => OnnxCase::new(
@@ -514,7 +516,7 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             vec![
                 data("a", &[2], elem, 0),
                 // `pads` is [begin.., end..], so 2 * rank entries.
-                TensorValue::new("b", vec![2], TensorData::I64(vec![1, 1])),
+                TensorValue::new("b", vec![2], TensorData::I64(vec![1, 1])).as_initializer(),
             ],
         )
         .with_attrs(Attrs::new().string("mode", "constant")),
@@ -729,11 +731,24 @@ mod tests {
         for (op, elem) in candidates(OPSET) {
             let case = probe(op, elem, OPSET).unwrap();
             let bytes = crate::model::build_bytes(&case);
-            match reference
-                .run(&bytes, &case.inputs)
-                .expect("the worker must reply")
-            {
+            // Only the **fed** inputs cross the wire; the initializers are already constants
+            // inside the model bytes. Sending them as well is refused by the runner, which
+            // checks every name against the graph's declared inputs — and that check caught
+            // this exact mistake the moment the initializer split was introduced.
+            let fed: Vec<TensorValue> = case.fed_inputs().cloned().collect();
+            match reference.run(&bytes, &fed).expect("the worker must reply") {
                 OnnxOutcome::Ok(_) => {}
+                OnnxOutcome::Rejected { detail } => {
+                    // The *last* line of a Python traceback is the exception; the first is
+                    // just the word "Traceback". Reporting the first made this failure
+                    // unreadable the first time it fired.
+                    let reason = detail
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("");
+                    rejected.push(format!("{op:?}/{elem:?}: {reason}"));
+                }
                 other => rejected.push(format!("{op:?}/{elem:?}: {other}")),
             }
         }

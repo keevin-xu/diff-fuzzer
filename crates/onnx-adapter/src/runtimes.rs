@@ -120,7 +120,9 @@ impl OrtRuntime {
             std::borrow::Cow<'_, str>,
             ort::session::SessionInputValue<'_>,
         )> = Vec::with_capacity(case.inputs.len());
-        for input in &case.inputs {
+        // `fed_inputs`, not `inputs`: an initializer is already a constant inside the model,
+        // and supplying it again would be rejected as an unknown input name.
+        for input in case.fed_inputs() {
             // One arm per element type, each pushing directly. An exhaustive `match`
             // rather than a helper taking a dtype tag: adding an `ElemType` then fails to
             // compile here, which is the compiler enforcing `08-RISKS.md` §4's "adding a
@@ -262,11 +264,14 @@ impl TractRuntime {
         };
 
         // `tract` feeds inputs **positionally**, not by name, so this order must match the
-        // order the graph declares them in. `model::build` writes them in case order, and
-        // a test in that module pins the correspondence — a mismatch would silently swap
-        // operands, which is invisible for `Add` and wrong for `Sub`.
+        // order the graph declares them in. `model::build` declares exactly the fed inputs, in
+        // case order, and a test in that module pins the correspondence — a mismatch would
+        // silently swap operands, which is invisible for `Add` and wrong for `Sub`.
+        //
+        // Initializers are excluded here for the same reason they are excluded there: they are
+        // constants in the model, not positional arguments.
         let mut feeds: TVec<TValue> = tvec!();
-        for input in &case.inputs {
+        for input in case.fed_inputs() {
             let shape: Vec<usize> = input.dims.iter().map(|d| *d as usize).collect();
 
             macro_rules! feed {
@@ -430,7 +435,7 @@ impl CandleRuntime {
         };
 
         let mut feeds: HashMap<String, Tensor> = HashMap::new();
-        for input in &case.inputs {
+        for input in case.fed_inputs() {
             let shape: Vec<usize> = input.dims.iter().map(|d| *d as usize).collect();
 
             macro_rules! feed {

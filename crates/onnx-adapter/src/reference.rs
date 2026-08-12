@@ -222,10 +222,14 @@ impl diff_fuzzer_core::traits::Implementation for ReferenceRuntime {
 
     fn run(&self, input: &OnnxCase) -> Result<OnnxOutcome, diff_fuzzer_core::traits::RunError> {
         let bytes = crate::model::build_bytes(input);
+        // Only the fed inputs cross the wire. The initializers are already inside the model
+        // bytes, and the Python side checks every sent name against the graph's declared
+        // inputs — an initializer would fail that check, correctly.
+        let fed: Vec<crate::case::TensorValue> = input.fed_inputs().cloned().collect();
         let outcome = self
             .worker
             .borrow_mut()
-            .run(&bytes, &input.inputs)
+            .run(&bytes, &fed)
             // A broken pipe means the worker died — which is a *harness* failure, not a
             // statement about the case, so it is reported as `Crashed` against the
             // reference itself rather than silently swallowed. If this ever fires in a
@@ -464,7 +468,8 @@ mod tests {
                 well_formed_typed(crate::case::OpKind::Identity, &[2, 3], DEFAULT_OPSET, elem);
             let bytes = crate::model::build_bytes(&case);
 
-            let outcome = reference.run(&bytes, &case.inputs).expect("reply");
+            let fed: Vec<TensorValue> = case.fed_inputs().cloned().collect();
+            let outcome = reference.run(&bytes, &fed).expect("reply");
             let OnnxOutcome::Ok(out) = outcome else {
                 panic!("the reference rejected an Identity model at {elem:?}: {outcome}");
             };
