@@ -31,6 +31,7 @@
 //! | [`attrs`] | an operator's static parameters |
 //! | [`ops`] | per-operator arity, types, output shape, and probe models |
 //! | [`census`] | which runtime supports which operator, **measured** |
+//! | [`capability`] | what each runtime *claims*, so a crash can be told from a gap |
 //! | [`outcome`] | what a runtime gives back, **including its failures, as values** |
 //! | [`validation`] | is this case well-formed? |
 //! | [`model`] | case → protobuf bytes |
@@ -43,6 +44,7 @@
 //! | [`pb`] | the ONNX protobuf types, generated at build time |
 
 pub mod attrs;
+pub mod capability;
 pub mod case;
 pub mod census;
 pub mod environment;
@@ -96,6 +98,29 @@ pub mod pb {
 /// one domain can never overwrite another's evidence.
 pub const FINDINGS_ROOT: &str = "findings/onnx";
 
+/// # Maintenance rule: adding an operator or element type
+///
+/// **Adding a variant to `OpKind` or `ElemType` must be the same commit that:**
+///
+/// 1. extends `ops::spec` with its tier, family, `since` version and accepted types —
+///    **retrieved from the schema registry, never recalled** — and records the retrieval in
+///    `SPECS.md`;
+/// 2. extends `ops::output_spec` and `ops::arity_range` if it joins no existing family;
+/// 3. extends `ops::probe` so the census can measure it;
+/// 4. **regenerates `findings/onnx/census.json`**, because a capability matrix that predates
+///    the operator silently reports it as unsupported everywhere;
+/// 5. extends the reference runner's dtype table, for a new element type.
+///
+/// This is a review rule, not a technical one, and it exists because `08-RISKS.md` §4 records
+/// **ten** checks in earlier domains that silently narrowed while what they measured grew.
+/// None announced itself. The mechanism was always the same: a check enumerated what existed
+/// when it was written.
+///
+/// Two things make the compiler carry part of the burden — the exhaustive `match` in
+/// `ops::spec` and the one over `TensorData` in every runtime both fail to compile until a new
+/// variant is handled everywhere. **Steps 4 and 5 are not compiler-enforced**, and step 4 is
+/// the one that fails silently.
+///
 /// Where sampled non-findings are written.
 ///
 /// Negatives are not spare output. A predicate that has survived zero negatives has

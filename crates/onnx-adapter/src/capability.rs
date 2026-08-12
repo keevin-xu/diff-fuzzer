@@ -1,0 +1,267 @@
+//! What each runtime **claims** to support — the model that makes the crash thesis possible.
+//!
+//! # Why this exists
+//!
+//! `06-ORACLES-AND-LEGAL-DIFFERENCES.md` §2 rests on one distinction:
+//!
+//! | situation | outcome | finding? |
+//! |---|---|---|
+//! | the runtime does not implement this operator | `Unsupported` | **no** |
+//! | the runtime implements it and blew up | `Crashed` | **yes** |
+//!
+//! Those look identical from outside — both are "no result". Telling them apart requires
+//! knowing what each runtime *claims*, which is what this module answers, from the measured
+//! census rather than from documentation.
+//!
+//! # The direction of the inference, which is easy to get backwards
+//!
+//! A capability model can only ever *promote* a failure to a finding. It cannot demote one:
+//! a runtime that answered a minimal probe and then panicked on hostile values has still
+//! crashed, whatever any table says.
+//!
+//! So the rule is deliberately one-way and conservative:
+//!
+//! - **claimed + failed** → this may be a crash; the harness is entitled to say so.
+//! - **not claimed + failed** → `Unsupported`, always. Never an accusation.
+//! - **unknown** → treated as *not claimed*. An absent measurement must not manufacture a
+//!   finding, and `08-RISKS.md` §2 is blunt that most early findings in any differential
+//!   project are the tool's own.
+//!
+//! # This is a snapshot, and snapshots rot
+//!
+//! The census records the date, the opset and every component version, because a capability
+//! matrix is a claim about *those* versions on *that* day. A stale one is worse than none,
+//! because it still looks current. [`Capabilities::is_stale_for`] exists so a campaign can
+//! refuse to run against a matrix taken under different versions rather than silently
+//! trusting it.
+
+use std::collections::BTreeSet;
+
+use crate::case::{ElemType, OpKind};
+use crate::census::{Census, Support};
+
+/// What the runtimes claim, derived from a census.
+#[derive(Debug, Clone)]
+pub struct Capabilities {
+    claimed: BTreeSet<(String, String, ElemType)>,
+    measured: BTreeSet<(String, String, ElemType)>,
+    environment: Vec<(String, String)>,
+    taken: String,
+    opset: i64,
+}
+
+impl Capabilities {
+    /// Build from a census.
+    ///
+    /// **Only [`Support::Supported`] counts as a claim.** A `Rejected` cell is explicitly not
+    /// a claim: it is the ambiguous outcome, and treating ambiguity as a claim would turn
+    /// every polite refusal into a potential crash report. That is the direction this module
+    /// must never lean.
+    pub fn from_census(census: &Census) -> Self {
+        let mut claimed = BTreeSet::new();
+        let mut measured = BTreeSet::new();
+        for cell in &census.cells {
+            let key = (cell.runtime.clone(), cell.op.clone(), cell.elem_type);
+            measured.insert(key.clone());
+            if cell.support == Support::Supported {
+                claimed.insert(key);
+            }
+        }
+        Self {
+            claimed,
+            measured,
+            environment: census.environment.clone(),
+            taken: census.taken.clone(),
+            opset: census.opset,
+        }
+    }
+
+    /// Load the census stored in the repository.
+    pub fn load(path: &str) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading the census at {path}: {e}"))?;
+        let census: Census =
+            serde_json::from_str(&text).map_err(|e| format!("parsing the census: {e}"))?;
+        Ok(Self::from_census(&census))
+    }
+
+    /// Does this runtime claim this operator at this element type?
+    pub fn claims(&self, runtime: &str, op: OpKind, elem: ElemType) -> bool {
+        self.claimed
+            .contains(&(runtime.to_string(), op.onnx_name().to_string(), elem))
+    }
+
+    /// Was this combination ever measured?
+    ///
+    /// Distinct from [`Self::claims`] on purpose. "Measured and refused" and "never measured"
+    /// are different states, and collapsing them would let a gap in the census read as a
+    /// statement about a runtime.
+    pub fn was_measured(&self, runtime: &str, op: OpKind, elem: ElemType) -> bool {
+        self.measured
+            .contains(&(runtime.to_string(), op.onnx_name().to_string(), elem))
+    }
+
+    /// **The question N5 asks.** A runtime failed on a case — may that be reported as a crash?
+    ///
+    /// Only when the runtime claimed the operator. Everything else, including an unmeasured
+    /// combination, is a legitimate skip. One-way by construction: this can promote a failure
+    /// to a finding but never excuse one.
+    pub fn failure_is_reportable(&self, runtime: &str, op: OpKind, elem: ElemType) -> bool {
+        self.claims(runtime, op, elem)
+    }
+
+    /// The runtimes the census covered.
+    pub fn runtimes(&self) -> BTreeSet<&str> {
+        self.measured.iter().map(|(r, _, _)| r.as_str()).collect()
+    }
+
+    /// How many combinations this runtime claims.
+    pub fn claim_count(&self, runtime: &str) -> usize {
+        self.claimed.iter().filter(|(r, _, _)| r == runtime).count()
+    }
+
+    /// Whether this matrix was taken under a different environment than the one now running.
+    ///
+    /// A capability claim is version-specific. Running a campaign against a census taken with
+    /// a different ONNX Runtime — or a different `onnx`, which *is* the specification revision
+    /// — means classifying crashes against a runtime that no longer exists.
+    ///
+    /// Returns the components that differ, so the caller can say which.
+    pub fn is_stale_for(&self, current: &[(String, String)]) -> Vec<String> {
+        let mut drifted = Vec::new();
+        for (name, version) in current {
+            match self.environment.iter().find(|(n, _)| n == name) {
+                Some((_, recorded)) if recorded != version => {
+                    drifted.push(format!("{name}: census {recorded}, now {version}"));
+                }
+                None => drifted.push(format!("{name}: not recorded in the census")),
+                _ => {}
+            }
+        }
+        drifted
+    }
+
+    pub fn taken(&self) -> &str {
+        &self.taken
+    }
+
+    pub fn opset(&self) -> i64 {
+        self.opset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::census;
+    use crate::runtimes::{OrtRuntime, TractRuntime};
+
+    const OPSET: i64 = 22;
+
+    fn sample() -> Capabilities {
+        Capabilities::from_census(&census::take(&[&OrtRuntime, &TractRuntime], OPSET))
+    }
+
+    /// The inference must run one way only. A claimed operator makes a failure reportable;
+    /// nothing makes a failure *un*-reportable, and an unmeasured combination must never
+    /// manufacture a finding.
+    #[test]
+    fn only_a_claimed_operator_makes_a_failure_reportable() {
+        let caps = sample();
+
+        // ONNX Runtime answered `Add` on f32 in the census, so it claims it.
+        assert!(caps.claims("onnxruntime", OpKind::Add, ElemType::F32));
+        assert!(caps.failure_is_reportable("onnxruntime", OpKind::Add, ElemType::F32));
+
+        // It declined `Where` on bool — measured, but not a claim.
+        assert!(caps.was_measured("onnxruntime", OpKind::Where, ElemType::Bool));
+        assert!(!caps.claims("onnxruntime", OpKind::Where, ElemType::Bool));
+        assert!(!caps.failure_is_reportable("onnxruntime", OpKind::Where, ElemType::Bool));
+    }
+
+    /// An unmeasured combination is treated as *not claimed*. The safe direction: an absent
+    /// measurement must not become an accusation.
+    #[test]
+    fn an_unmeasured_combination_is_never_reportable() {
+        let caps = sample();
+        assert!(!caps.was_measured(
+            "a-runtime-that-was-not-in-the-census",
+            OpKind::Add,
+            ElemType::F32
+        ));
+        assert!(!caps.failure_is_reportable(
+            "a-runtime-that-was-not-in-the-census",
+            OpKind::Add,
+            ElemType::F32
+        ));
+    }
+
+    /// "Measured and refused" and "never measured" must stay distinct, or a gap in the census
+    /// reads as a statement about a runtime.
+    #[test]
+    fn measured_and_claimed_are_different_questions() {
+        let caps = sample();
+        // Sqrt has no integer probe at all — the specification forbids it — so it was never
+        // measured, as opposed to having been measured and refused.
+        assert!(!caps.was_measured("tract", OpKind::Sqrt, ElemType::I64));
+        assert!(!caps.claims("tract", OpKind::Sqrt, ElemType::I64));
+    }
+
+    /// A stale matrix must be detectable. Classifying crashes against versions that are no
+    /// longer running is worse than not classifying them.
+    #[test]
+    fn version_drift_is_detected_and_named() {
+        let caps = sample();
+
+        // The current environment matches the one the census was taken in.
+        assert!(
+            caps.is_stale_for(&crate::environment::environment().components)
+                .is_empty()
+        );
+
+        // A changed component is reported, and reported by name.
+        let drifted = caps.is_stale_for(&[("onnx (python, reference)".into(), "9.9.9".into())]);
+        assert_eq!(drifted.len(), 1);
+        assert!(
+            drifted[0].contains("onnx"),
+            "the drifted component must be named"
+        );
+
+        // An unknown component is also drift — a census that never saw it cannot vouch for it.
+        let unknown = caps.is_stale_for(&[("some-new-runtime".into(), "1.0".into())]);
+        assert_eq!(unknown.len(), 1);
+    }
+
+    /// The model must actually carry claims, or every test above passes vacuously.
+    #[test]
+    fn the_model_is_not_empty() {
+        let caps = sample();
+        assert!(
+            caps.claim_count("onnxruntime") > 100,
+            "ORT claims almost everything"
+        );
+        assert!(caps.claim_count("tract") > 50);
+        assert_eq!(
+            caps.runtimes(),
+            ["onnxruntime", "tract"].into_iter().collect()
+        );
+        assert_eq!(caps.opset(), OPSET);
+        assert!(!caps.taken().is_empty());
+    }
+
+    /// The stored census must load and agree with a freshly taken one about a runtime both
+    /// cover. This is what proves the file on disk is usable rather than merely written.
+    #[test]
+    fn the_stored_census_loads_and_agrees() {
+        let path = format!("{}/census.json", crate::FINDINGS_ROOT);
+        let Ok(stored) = Capabilities::load(&path) else {
+            // The census is regenerable output and is gitignored, so a fresh checkout will
+            // not have it. Skipping is correct here — but the skip is *loud*, because a
+            // silent one would hide a genuinely broken loader.
+            eprintln!("note: no census at {path}; run the n2_census example to generate it");
+            return;
+        };
+        assert!(stored.claims("onnxruntime", OpKind::Add, ElemType::F32));
+        assert!(stored.opset() > 0);
+    }
+}

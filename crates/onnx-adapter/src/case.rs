@@ -42,7 +42,10 @@ use crate::attrs::Attrs;
 /// on `TensorData` is what makes the compiler enforce that rule rather than a reviewer.
 // `Hash` so the canonical form can derive it: grouping participants by the result they
 // produced is how the oracle identifies an outlier, and that needs a hashable key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `Ord` so the capability model can key an ordered set on it — an ordered set rather than a
+// hash set because a capability matrix is read by humans and iterated in reports, and a
+// stable order is worth more than a marginally faster lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ElemType {
     /// 32-bit IEEE-754 binary float. ONNX `FLOAT` = 1.
     F32,
