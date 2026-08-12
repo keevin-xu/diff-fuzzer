@@ -110,6 +110,45 @@ impl Capabilities {
         self.claims(runtime, op, elem)
     }
 
+    /// Which element types a runtime was ever measured to handle successfully.
+    ///
+    /// Derived from the census rather than declared: a runtime that produced a result for *any*
+    /// operator at a type can evidently represent it. A runtime that never did — `candle` at
+    /// `I32` and `Bool`, across all 46 of its cells — cannot.
+    ///
+    /// This is the question `claims` cannot answer. `claims` asks "does this runtime implement
+    /// this operator at this type"; a `Cast` to `int32` on a runtime with no `int32` fails for a
+    /// reason that has nothing to do with `Cast`.
+    pub fn representable_types(&self, runtime: &str) -> BTreeSet<ElemType> {
+        self.claimed
+            .iter()
+            .filter(|(r, _, _)| r == runtime)
+            .map(|(_, _, elem)| *elem)
+            .collect()
+    }
+
+    /// Whether this runtime is known **unable** to represent this element type.
+    ///
+    /// # The asymmetry, and the test that forced it
+    ///
+    /// Phrased as *known unable* rather than *can represent*, because the two differ exactly
+    /// where it matters. A runtime the census never covered has no measured types at all, so a
+    /// naive `can_represent` returns `false` for every type — and a caller that skips the run on
+    /// that basis **excuses everything the runtime does, including crashing**.
+    ///
+    /// That regression was written, and `a_gap_becomes_unsupported_but_a_crash_never_changes`
+    /// caught it on the first run: the deliberately-panicking test implementation is not in the
+    /// census, so its crash was being reclassified as a gap. The whole thesis of this domain is
+    /// that crashes are findings, and this module had just quietly excused one.
+    ///
+    /// So absence of evidence is **not** evidence of inability. An uncensused runtime is known
+    /// unable to represent nothing, and every one of its outcomes reaches the oracle.
+    pub fn known_unable_to_represent(&self, runtime: &str, elem: ElemType) -> bool {
+        let measured = self.representable_types(runtime);
+        // Never measured at all → we know nothing, and nothing is what we may conclude.
+        !measured.is_empty() && !measured.contains(&elem)
+    }
+
     /// The runtimes the census covered.
     pub fn runtimes(&self) -> BTreeSet<&str> {
         self.measured.iter().map(|(r, _, _)| r.as_str()).collect()
@@ -207,6 +246,34 @@ where
         input: &crate::case::OnnxCase,
     ) -> Result<crate::outcome::OnnxOutcome, diff_fuzzer_core::traits::RunError> {
         use crate::outcome::OnnxOutcome;
+
+        // ── Before running at all ─────────────────────────────────────────────────
+        //
+        // A type the runtime cannot represent makes the case unrunnable for a reason that has
+        // nothing to do with the operator. `candle` has no `int32`, so asking it to `Cast` to
+        // `int32` is not a question it can be wrong about — and it does not *fail*: it returns
+        // an `int64` tensor, which the oracle then reports as a divergence against two runtimes
+        // that agreed. Checking after the fact would miss exactly that case, because the run
+        // succeeded.
+        //
+        // So this is checked first, and the runtime is not asked.
+        let unrepresentable: Vec<crate::case::ElemType> = crate::ops::required_elem_types(input)
+            .into_iter()
+            .filter(|t| {
+                self.capabilities
+                    .known_unable_to_represent(self.inner.name(), *t)
+            })
+            .collect();
+        if !unrepresentable.is_empty() {
+            return Ok(OnnxOutcome::Unsupported {
+                reason: format!(
+                    "{} cannot represent {unrepresentable:?}, which {} requires (census {})",
+                    self.inner.name(),
+                    input.op.onnx_name(),
+                    self.capabilities.taken()
+                ),
+            });
+        }
 
         let outcome = self.inner.run(input)?;
         let OnnxOutcome::Rejected { detail } = outcome else {
@@ -392,6 +459,84 @@ mod tests {
             matches!(crasher.run(&case).unwrap(), OnnxOutcome::Crashed { .. }),
             "a crash must survive classification — nothing may excuse one"
         );
+    }
+
+    /// A runtime that cannot represent a type the case needs is skipped **without being run**.
+    ///
+    /// The measured case: asked to `Cast` an `f32` tensor to `int32`, `candle` returns an
+    /// `int64` tensor, because it has no `int32` type. It does not fail, so a check that only
+    /// inspected failures would miss it entirely and the wrong-typed result would be reported
+    /// as a divergence against two runtimes that agreed.
+    #[test]
+    fn a_type_the_runtime_cannot_represent_is_a_gap_not_a_divergence() {
+        use crate::attrs::Attrs;
+        use crate::case::{OnnxCase, TensorData, TensorValue};
+        use crate::outcome::OnnxOutcome;
+        use diff_fuzzer_core::traits::Implementation;
+
+        // A census in which one runtime has only ever handled f32.
+        let census = census::take(&[&OrtRuntime], OPSET);
+        let mut narrowed = census.clone();
+        narrowed.cells.retain(|c| c.elem_type == ElemType::F32);
+        let caps = Capabilities::from_census(&narrowed);
+
+        assert!(caps.known_unable_to_represent("onnxruntime", ElemType::I32));
+        assert!(!caps.known_unable_to_represent("onnxruntime", ElemType::F32));
+
+        // A `Cast` whose *output* is i32 — the input is f32, which the runtime does handle.
+        let case = OnnxCase::new(
+            OpKind::Cast,
+            OPSET,
+            vec![TensorValue::new(
+                "a",
+                vec![2],
+                TensorData::F32(vec![1.5, -2.5]),
+            )],
+        )
+        .with_attrs(Attrs::new().int("to", i64::from(ElemType::I32.wire())));
+
+        assert!(
+            crate::ops::required_elem_types(&case).contains(&ElemType::I32),
+            "the output type must be part of what the case requires"
+        );
+
+        let wrapped = WithCapabilities::new(OrtRuntime, &caps);
+        assert!(
+            matches!(wrapped.run(&case).unwrap(), OnnxOutcome::Unsupported { .. }),
+            "a case needing a type the runtime cannot represent is a gap, not a disagreement"
+        );
+
+        // The same operator at a type it *can* represent still runs normally.
+        let representable = OnnxCase::new(
+            OpKind::Cast,
+            OPSET,
+            vec![TensorValue::new(
+                "a",
+                vec![2],
+                TensorData::F32(vec![1.5, -2.5]),
+            )],
+        )
+        .with_attrs(Attrs::new().int("to", i64::from(ElemType::F32.wire())));
+        assert!(
+            matches!(wrapped.run(&representable).unwrap(), OnnxOutcome::Ok(_)),
+            "the skip must be specific to the unrepresentable type, not a blanket refusal"
+        );
+    }
+
+    /// **Absence of evidence is not evidence of inability.**
+    ///
+    /// A runtime the census never covered must have every outcome pass through untouched. The
+    /// naive phrasing — "can this runtime represent this type?" — returns `false` for an
+    /// uncensused runtime and would skip it before running, excusing even a crash.
+    #[test]
+    fn an_uncensused_runtime_is_never_skipped() {
+        let caps = sample();
+        for elem in ElemType::ALL {
+            assert!(
+                !caps.known_unable_to_represent("a-runtime-nobody-measured", elem),
+                "an uncensused runtime must not be declared unable to represent {elem:?}"
+            );
+        }
     }
 
     /// The reclassified reason must name the census it came from, so a stale matrix is

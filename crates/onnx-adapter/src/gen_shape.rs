@@ -499,15 +499,33 @@ pub fn generate_case(
             let total: i64 = dims.iter().product::<i64>().max(0);
             // A target whose element count matches exactly — the one rule `Reshape` has.
             let target = factorization(total, bounds, rng);
-            OnnxCase::new(
+            // **`0` in a `Reshape` target does not mean "zero-length".** ONNX reads it as
+            // "copy the corresponding dimension from the input" unless `allowzero=1`:
+            //
+            // > "A dimension could also be 0, in which case the actual dimension value is
+            // > unchanged (i.e. taken from the input tensor)."
+            //
+            // The generator emits a literal `0` when the tensor is empty, so it must say so.
+            // Without this, `[5,8,6,0] -> [0]` asks for an output of shape `[5]` — five
+            // elements from a zero-element input — which is **invalid**, and 13% of generated
+            // `Reshape` cases were exactly that. `SPECS.md` §2.4.
+            let mut case = OnnxCase::new(
                 op,
                 opset,
                 vec![
                     tensor("a", &dims, elem, op, bounds, rng),
-                    TensorValue::new("b", vec![target.len() as i64], TensorData::I64(target))
-                        .as_initializer(),
+                    TensorValue::new(
+                        "b",
+                        vec![target.len() as i64],
+                        TensorData::I64(target.clone()),
+                    )
+                    .as_initializer(),
                 ],
-            )
+            );
+            if target.contains(&0) {
+                case = case.with_attrs(Attrs::new().int("allowzero", 1));
+            }
+            case
         }
 
         Family::Squeeze => {

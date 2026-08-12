@@ -273,8 +273,15 @@ pub fn output_spec(case: &OnnxCase) -> (ElemType, Vec<i64>) {
             (target, dims)
         }
 
-        // The *values* of the second input are the output shape.
+        // The *values* of the second input are the output shape — but a `0` means "copy the
+        // input's dimension here" unless `allowzero=1` says to take it literally. Reading a `0`
+        // as literal when the attribute is absent computes an output shape ONNX would not, and
+        // the declared shape then disagrees with what the operator produces.
         Family::Reshape => {
+            let allow_zero = matches!(
+                case.attrs.get("allowzero"),
+                Some(crate::attrs::AttrValue::Int(1))
+            );
             let target = case
                 .inputs
                 .get(1)
@@ -283,7 +290,18 @@ pub fn output_spec(case: &OnnxCase) -> (ElemType, Vec<i64>) {
                     _ => None,
                 })
                 .unwrap_or_else(|| dims.clone());
-            (elem, target)
+            let resolved = target
+                .iter()
+                .enumerate()
+                .map(|(index, extent)| {
+                    if *extent == 0 && !allow_zero {
+                        dims.get(index).copied().unwrap_or(0)
+                    } else {
+                        *extent
+                    }
+                })
+                .collect();
+            (elem, resolved)
         }
 
         Family::Transpose => {
@@ -437,6 +455,35 @@ pub fn data_elem_type(case: &OnnxCase) -> ElemType {
         .get(index)
         .or_else(|| case.inputs.first())
         .map_or(ElemType::F32, TensorValue::elem_type)
+}
+
+/// Every element type a case **requires** — its inputs and its output.
+///
+/// # Why the output type matters, and how missing it produced fake divergences
+///
+/// The capability model keys on the type a case is *about* ([`data_elem_type`]). For most
+/// operators that is enough, because the output is the same type as the input. It is not enough
+/// for three families:
+///
+/// - **`Cast`** produces whatever its `to` attribute names, which may be a type the runtime
+///   cannot represent at all;
+/// - **the comparisons** produce `Bool` whatever they were given;
+/// - **`Shape`/`Size`** produce `I64`.
+///
+/// Measured consequence: asked to `Cast` an `f32` tensor to `int32`, `candle` returns **`int64`**
+/// — it has no `int32` type. The lookup asked "does candle support `Cast` at `f32`?", got yes,
+/// and the wrong-typed result was reported as a **divergence against two runtimes that agreed**.
+/// It is not a divergence; it is a capability limit the census had already measured, consulted
+/// through the wrong key.
+///
+/// Returning every required type lets the capability model ask the question that actually
+/// decides the case: *can this runtime represent all of it?*
+pub fn required_elem_types(case: &OnnxCase) -> Vec<ElemType> {
+    let mut types: Vec<ElemType> = case.inputs.iter().map(TensorValue::elem_type).collect();
+    types.push(output_spec(case).0);
+    types.sort_unstable();
+    types.dedup();
+    types
 }
 
 /// Build the minimal valid model that probes `op` at `elem`.

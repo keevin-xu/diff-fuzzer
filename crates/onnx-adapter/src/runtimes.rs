@@ -785,7 +785,7 @@ mod tests {
             observed[0].data,
             TensorData::I32(vec![-1, 1, 1]),
             "tract's Sign(0) on integers changed. If it now returns 0 the bug is FIXED — \
-             update docs/scratch-explanations/onnx-runtimes/FINDING-001 and delete this test. \
+             update issues/onnx-runtime/FINDING-001 and delete this test. \
              Expected the known-wrong [-1, 1, 1]; got {:?}",
             observed[0].data
         );

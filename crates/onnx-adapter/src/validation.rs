@@ -81,6 +81,17 @@ pub enum Invalid {
 
     #[error("attribute names must be unique and non-empty; {name:?} is not")]
     BadAttributeName { name: String },
+
+    #[error(
+        "{op} must preserve the element count: input has {input} elements, the requested shape \
+         {requested:?} resolves to {output}"
+    )]
+    ElementCountMismatch {
+        op: &'static str,
+        input: usize,
+        requested: Vec<i64>,
+        output: usize,
+    },
 }
 
 /// The opset range this adapter is willing to build models for.
@@ -192,6 +203,34 @@ pub fn validate(case: &OnnxCase) -> Vec<Invalid> {
             if agreement.elem_types && other.elem_type() != first.elem_type() {
                 problems.push(Invalid::ElemTypeMismatch { op: op_name });
             }
+        }
+    }
+
+    // `Reshape` must preserve the element count — the one rule the operator has, and one our
+    // validator was blind to until a spec retrieval exposed it.
+    //
+    // **The failure this closes.** The generator emitted `0` in a shape input meaning "a
+    // zero-length dimension", while ONNX reads `0` as "copy the input's dimension here" unless
+    // `allowzero=1`. So `[5,8,6,0] -> [0]` asked for an output of shape `[5]` — five elements
+    // from a zero-element input. **13% of generated `Reshape` cases were invalid**, and the
+    // validity stress test reported them all as fine, because it consulted only this function.
+    //
+    // A validator weaker than the specification cannot detect that it is weaker. That is why
+    // the stress test now also asks the reference implementation.
+    if case.op == OpKind::Reshape
+        && let (Some(data), Some(shape)) = (case.inputs.first(), case.inputs.get(1))
+        && let TensorData::I64(requested) = &shape.data
+    {
+        let (_, resolved) = crate::ops::output_spec(case);
+        let input_count = data.element_count();
+        let output_count = resolved.iter().product::<i64>().max(0) as usize;
+        if input_count != output_count {
+            problems.push(Invalid::ElementCountMismatch {
+                op: op_name,
+                input: input_count,
+                requested: requested.clone(),
+                output: output_count,
+            });
         }
     }
 
