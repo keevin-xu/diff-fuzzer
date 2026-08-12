@@ -32,8 +32,17 @@
 //! later phases. This crate is deliberately small right now: PHASE-N0 exists to prove the
 //! plumbing before anything is built on it.
 
+pub mod case;
 pub mod environment;
+pub mod generator;
 pub mod model;
+pub mod normalize;
+pub mod oracle;
+pub mod outcome;
+pub mod reference;
+pub mod runtimes;
+pub mod testing;
+pub mod validation;
 
 /// The ONNX protobuf types — `ModelProto`, `GraphProto`, `NodeProto`, `TensorProto`, and
 /// the rest of the schema.

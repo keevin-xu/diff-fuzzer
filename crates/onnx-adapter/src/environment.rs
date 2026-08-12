@@ -36,14 +36,51 @@ pub const MAX_OPSET: i64 = 27;
 /// and this workspace's own precedent otherwise forbids pre-releases.
 pub const ORT_VERSION: &str = "2.0.0-rc.13";
 
+/// The **native** ONNX Runtime library `ort` links against.
+///
+/// This is the version a maintainer will care about — `ort` is only the binding. Not
+/// verifiable from `Cargo.lock`, because it is not a Rust crate: `ort-sys`'s build script
+/// downloads it. Confirm it by reading that script's output, which names the artifact it
+/// fetched:
+///
+/// ```text
+/// grep 'downloading from' target/*/build/ort-sys-*/output
+/// ```
+///
+/// Observed 2026-08-12: `.../ms@1.28.0/aarch64-apple-darwin+coreml.tar.lzma2`.
+///
+/// The same hand-tied arrangement as `LIBTORCH_VERSION` in the tensor adapter, and the
+/// same hazard: nothing fails if `ort-sys` starts fetching a different build, so this
+/// constant must be re-checked whenever `ort` is bumped.
+pub const ONNXRUNTIME_NATIVE_VERSION: &str = "1.28.0";
+
+/// The primary target runtime.
+pub const TRACT_VERSION: &str = "0.23.4";
+
+/// The secondary target runtime. Present only under the `candle` cargo feature.
+pub const CANDLE_ONNX_VERSION: &str = "0.11.0";
+
 /// The protobuf runtime the generated ONNX types are built on.
 pub const PROST_VERSION: &str = "0.14.4";
 
 /// The environment an ONNX finding was produced in.
+///
+/// `candle` appears only when it was actually compiled in. Listing a participant that did
+/// not run would overstate what a finding was checked against — and a campaign quietly
+/// running three participants instead of four while reporting four is the kind of silent
+/// narrowing `08-RISKS.md` §4 is about.
 pub fn environment() -> Environment {
-    Environment::detect()
+    let recorded = Environment::detect()
         .with("onnx (python, reference)", ONNX_PYTHON_VERSION)
-        .with("prost", PROST_VERSION)
+        .with("onnxruntime (native)", ONNXRUNTIME_NATIVE_VERSION)
+        .with("ort", ORT_VERSION)
+        .with("tract-onnx", TRACT_VERSION)
+        .with("prost", PROST_VERSION);
+
+    #[cfg(feature = "candle")]
+    let recorded = recorded.with("candle-onnx", CANDLE_ONNX_VERSION);
+
+    recorded
 }
 
 #[cfg(test)]
@@ -53,6 +90,53 @@ mod tests {
 
     fn crate_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// The version `Cargo.lock` resolved for a crate.
+    fn locked_version(crate_name: &str) -> Option<String> {
+        let lockfile = crate_root().join("../../Cargo.lock");
+        let text = std::fs::read_to_string(lockfile).ok()?;
+
+        // Entries look like:
+        //   [[package]]
+        //   name = "ort"
+        //   version = "2.0.0-rc.13"
+        let needle = format!("name = \"{crate_name}\"\n");
+        let start = text.find(&needle)? + needle.len();
+        let line = text[start..].lines().next()?;
+        Some(
+            line.strip_prefix("version = \"")?
+                .strip_suffix('"')?
+                .to_owned(),
+        )
+    }
+
+    /// Every recorded crate version must match what cargo actually resolved.
+    ///
+    /// A dependency bump would otherwise leave these constants stale, and every finding
+    /// written afterwards would name the wrong version while looking perfectly correct.
+    #[test]
+    fn recorded_crate_versions_match_the_lockfile() {
+        for (crate_name, recorded) in [
+            ("ort", ORT_VERSION),
+            ("tract-onnx", TRACT_VERSION),
+            ("candle-onnx", CANDLE_ONNX_VERSION),
+            ("prost", PROST_VERSION),
+        ] {
+            let locked = locked_version(crate_name)
+                .unwrap_or_else(|| panic!("{crate_name} is not in Cargo.lock"));
+            assert_eq!(
+                locked, recorded,
+                "the recorded {crate_name} version is stale; Cargo.lock says {locked}"
+            );
+        }
+    }
+
+    /// Prove the lookup above could fail rather than passing on an empty search.
+    #[test]
+    fn the_lockfile_lookup_actually_reads_the_file() {
+        assert!(locked_version("ort").is_some());
+        assert!(locked_version("a-crate-that-does-not-exist").is_none());
     }
 
     /// The version `requirements.txt` pins for a package.

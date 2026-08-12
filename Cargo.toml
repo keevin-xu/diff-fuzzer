@@ -110,6 +110,32 @@ duckdb = { version = "1.10505.0", features = ["bundled"] }
 # same revision as the reference implementation that judges them. See DECISIONS N0.1.
 prost = "0.14.4"
 prost-build = "0.14.4"
+
+# The runtimes under test. Three participants plus the Python reference implementation;
+# with three the oracle can name the outlier rather than only reporting that two differ.
+#
+# `tract` is the primary target: production use at Sonos, and no conformance or fuzzing
+# claims found for it. `candle-onnx` is a secondary target whose operator coverage is
+# explicitly incomplete, so many outcomes there will be `Unsupported` rather than wrong
+# answers. Both are pure Rust, which matters for the crash oracle: a Rust panic can be
+# caught with `catch_unwind` and classified, where a C++ abort cannot.
+tract-onnx = "0.23.4"
+candle-onnx = "0.11.0"
+candle-core = "0.11.0"
+
+# ONNX Runtime, the maturity anchor the two Rust runtimes are measured against.
+#
+# Pinned to an exact pre-release. There is no stable `ort` 2.x, and this file's own burn
+# comment above rejects pre-releases for reproducibility — so this is a conscious override,
+# recorded in crates/onnx-adapter/DECISIONS.md, and narrowed to "no pre-releases unless no
+# stable release exists, and then only pinned exactly". `=` makes cargo refuse to resolve
+# anything else, since an API shift between builds is exactly the hazard here.
+#
+# `download-binaries` (a default feature) fetches the native ONNX Runtime library in the
+# build script, the same arrangement burn-tch uses for libtorch: no manual install and no
+# DYLD_LIBRARY_PATH. The consequence for reporting is that the native ORT version is
+# determined by `ort-sys`, not by us, so it must be read back rather than assumed.
+ort = "=2.0.0-rc.13"
 # Pure-Rust protobuf compiler, standing in for the `protoc` binary. `protoc` is not
 # installed on the development machine, and making the build depend on a system binary
 # whose version nobody records is exactly the reproducibility hazard this project avoids

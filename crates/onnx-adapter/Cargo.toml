@@ -20,12 +20,38 @@ rand.workspace = true
 # so for the exact generator that produced it, and generators change.
 serde.workspace = true
 serde_json.workspace = true
+# Derives Display and std::error::Error for the validation error enum from its
+# `#[error(...)]` format strings — about twenty lines of boilerplate per enum otherwise.
+thiserror.workspace = true
 
 # The protobuf runtime. `prost` is the decode/encode half; the *types* are generated at
 # build time from `proto/onnx.proto` by the build script. See DECISIONS N0.1 for why the
 # schema is compiled here rather than taken from `onnx-protobuf` or `onnx-pb`, both of
 # which lag the current schema.
 prost.workspace = true
+
+# The runtimes under test. Versions are pinned once in the root [workspace.dependencies];
+# `.workspace = true` just says "use that". A finding is only meaningful if it names the
+# exact version that produced it, so no version literal appears here.
+tract-onnx.workspace = true
+ort.workspace = true
+
+# `candle-onnx` is optional, and the reason is worth knowing: its build script shells out
+# to the `protoc` binary to generate its own ONNX types. That would make `protoc` a
+# prerequisite for building this crate at all — the machine-dependent build this crate
+# went out of its way to avoid by using `protox` for its own codegen (DECISIONS N0.1).
+#
+# Behind a feature, the cost is paid only by whoever wants the fourth participant, the
+# default build needs nothing installed, and `PENDING` 1.5 ("is candle a participant or
+# optional?") stays a decision for the N2 census to make on coverage data rather than one
+# settled by accident at N0 because a build broke.
+candle-onnx = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+
+[features]
+# Off by default. Enabling it requires `protoc` on the build machine — see the dependency
+# comment above. Turn it on with `cargo test -p onnx-adapter --features candle`.
+candle = ["dep:candle-onnx", "dep:candle-core"]
 
 [build-dependencies]
 prost-build.workspace = true
