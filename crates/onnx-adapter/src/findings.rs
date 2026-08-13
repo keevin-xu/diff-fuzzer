@@ -427,7 +427,20 @@ impl Run {
 ///
 /// Returns whether a new file was created — an existing draft is never overwritten, because it may
 /// already contain analysis that this function cannot reproduce.
-pub fn write_rough_draft(finding: &StoredFinding) -> std::io::Result<bool> {
+///
+/// # `run_name` is not decoration
+///
+/// It was omitted, and the provenance line read *"during run recorded in `findings/onnx/logs/`"* —
+/// which names no run. A **control** campaign injects a deliberate fault into every operator, so
+/// every one of its signatures is unexplained and every one got a draft: **533 files describing
+/// arithmetic we broke on purpose**, sitting beside eight hand-written reports and indistinguishable
+/// from them by reading. Callers must not draft from a control at all, and the name is recorded so
+/// that a file which slips through says where it came from.
+pub fn write_rough_draft(
+    finding: &StoredFinding,
+    run_name: &str,
+    oracle: crate::OracleKind,
+) -> std::io::Result<bool> {
     let slug: String = finding
         .signature
         .chars()
@@ -478,7 +491,8 @@ pub fn write_rough_draft(finding: &StoredFinding) -> std::io::Result<bool> {
          of these are the second.** Seven times so far, an apparent finding turned out to be a case\n\
          whose answer ONNX does not determine.\n\
          \n\
-         **Found:** seed `{seed}`, during run recorded in `findings/onnx/logs/`.\n\
+         **Found:** seed `{seed}`, by the **{oracle:?}** oracle during run `{run_name}`\n\
+         (log at `findings/onnx/logs/{run_name}.log`).\n\
          \n\
          ---\n\
          \n\

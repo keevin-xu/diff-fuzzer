@@ -417,10 +417,18 @@ fn main() {
         // start investigating it is in memory at this moment and nowhere else afterwards; the
         // alternative is a line in a log at the end of a half-hour run. The draft carries the
         // evidence and the triage ladder, never the analysis.
-        if !onnx_adapter::problems::PROBLEMS
-            .iter()
-            .any(|p| p.covers(signature))
-            && write_rough_draft(&finding).expect("writing a rough draft")
+        //
+        // **Never from a control.** A control injects a wrong answer into every operator, so every
+        // one of its signatures is unexplained — not because it might be novel, but because we
+        // broke it deliberately. Drafting them produced 533 files describing our own injected
+        // faults, filed beside eight real reports. An unexplained signature is evidence only when
+        // nothing was arranged to make it so.
+        if !args.control
+            && !onnx_adapter::problems::PROBLEMS
+                .iter()
+                .any(|p| p.covers(signature))
+            && write_rough_draft(&finding, &run_name, onnx_adapter::OracleKind::Differential)
+                .expect("writing a rough draft")
         {
             drafted.push(key.clone());
         }
