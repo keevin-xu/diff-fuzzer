@@ -110,6 +110,55 @@ pub mod pb {
 /// one domain can never overwrite another's evidence.
 pub const FINDINGS_ROOT: &str = "findings/onnx";
 
+/// Where campaign runs write their findings, one directory per run.
+///
+/// The layout is `runs/{oracle}/{run name}`, and the **oracle comes before the run name**
+/// deliberately. The SQL domain arrived at the same split the expensive way: both of its oracles
+/// wrote into one `runs/{label}` tree, so two campaigns sharing a label interleaved findings of
+/// two different kinds, and telling them apart meant reading each file.
+///
+/// They are not the same claim. A **differential** finding names two implementations that
+/// disagreed, and answering it means deciding which is wrong. A **metamorphic** violation names
+/// one implementation contradicting itself, where no second implementation is involved and no
+/// legal-difference argument is available at all.
+pub const RUNS_ROOT: &str = "findings/onnx/runs";
+
+/// Differential findings: implementations disagreed with each other.
+pub const DIFFERENTIAL_ROOT: &str = "findings/onnx/runs/differential";
+
+/// Metamorphic violations: one implementation contradicted itself.
+///
+/// Nothing writes here yet — the metamorphic oracle is PHASE-N10. The constant exists now so the
+/// layout is decided before there are findings to file under it, rather than after.
+pub const METAMORPHIC_ROOT: &str = "findings/onnx/runs/metamorphic";
+
+/// Where campaign logs are written, one file per run.
+///
+/// Separate from the findings themselves because they answer different questions. A finding says
+/// *what was wrong*; a log says *what the campaign did* — how many cases, how long, what was
+/// skipped and why. A campaign that found nothing produces no findings and a log that is the
+/// entire result.
+pub const LOGS_ROOT: &str = "findings/onnx/logs";
+
+/// Which oracle produced a finding, and therefore which tree it belongs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleKind {
+    /// Two implementations disagreed.
+    Differential,
+    /// One implementation contradicted itself.
+    Metamorphic,
+}
+
+impl OracleKind {
+    /// The directory this oracle's findings live under.
+    pub fn root(self) -> &'static str {
+        match self {
+            OracleKind::Differential => DIFFERENTIAL_ROOT,
+            OracleKind::Metamorphic => METAMORPHIC_ROOT,
+        }
+    }
+}
+
 /// # Maintenance rule: adding an operator or element type
 ///
 /// **Adding a variant to `OpKind` or `ElemType` must be the same commit that:**
@@ -140,3 +189,48 @@ pub const FINDINGS_ROOT: &str = "findings/onnx";
 /// everything — so the cases that *did not* diverge are kept as evidence in their own
 /// right.
 pub const NEGATIVES_ROOT: &str = "findings/onnx/negatives";
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Every path this crate writes to must sit under the findings root.
+    ///
+    /// Trivial to state and trivial to break: these are separate string literals, and nothing but
+    /// this test ties them together. The tensor domain learned the general lesson expensively —
+    /// a value matched by string equality needs one definition, or a mismatch shows up as
+    /// **missing data** rather than as a typo, which is how it survives review.
+    #[test]
+    fn every_root_lives_under_the_findings_root() {
+        for path in [RUNS_ROOT, DIFFERENTIAL_ROOT, METAMORPHIC_ROOT, LOGS_ROOT] {
+            assert!(
+                path.starts_with(FINDINGS_ROOT),
+                "{path} must live under {FINDINGS_ROOT}"
+            );
+        }
+    }
+
+    /// The two oracles must never share a tree. This is the mistake the SQL domain made.
+    #[test]
+    fn the_two_oracles_write_to_separate_trees() {
+        assert_ne!(DIFFERENTIAL_ROOT, METAMORPHIC_ROOT);
+        assert_eq!(OracleKind::Differential.root(), DIFFERENTIAL_ROOT);
+        assert_eq!(OracleKind::Metamorphic.root(), METAMORPHIC_ROOT);
+        assert!(DIFFERENTIAL_ROOT.starts_with(RUNS_ROOT));
+        assert!(METAMORPHIC_ROOT.starts_with(RUNS_ROOT));
+    }
+
+    /// Logs are not findings and must not land in a run directory.
+    #[test]
+    fn logs_are_separate_from_findings() {
+        assert!(!LOGS_ROOT.starts_with(RUNS_ROOT));
+    }
+
+    /// This domain must not write where the other two write.
+    #[test]
+    fn the_findings_root_is_domain_scoped() {
+        assert_eq!(FINDINGS_ROOT, "findings/onnx");
+        assert_ne!(FINDINGS_ROOT, "findings/sql");
+        assert_ne!(FINDINGS_ROOT, "findings/tensor");
+    }
+}

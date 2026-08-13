@@ -298,15 +298,14 @@ mod tests {
     /// the one that matters.
     #[test]
     fn a_finding_round_trips_through_disk_and_still_replays() {
-        use crate::findings::FindingsLog;
-        let path = std::env::temp_dir().join(format!("dfrepro-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        use crate::findings::Run;
+        let name = format!("test-repro-{}", std::process::id());
 
         let finding = stored("Add/22/F32/rank1/value");
-        let mut log = FindingsLog::open(&path).unwrap();
-        log.record(&finding).unwrap();
+        let mut run = Run::open(crate::OracleKind::Differential, &name).unwrap();
+        run.record(&finding).unwrap();
 
-        let loaded = FindingsLog::load(&path).unwrap();
+        let loaded = Run::load(crate::OracleKind::Differential, &name).unwrap();
         let a = answered(vec![1.0, 2.0]);
         let b = answered(vec![1.0, 9.0]);
         assert_eq!(
@@ -314,6 +313,6 @@ mod tests {
             replay(&finding, &[("ort", &a), ("tract", &b)]),
             "a finding must replay the same way after a round trip"
         );
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(run.directory());
     }
 }

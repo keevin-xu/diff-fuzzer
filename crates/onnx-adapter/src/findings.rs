@@ -23,14 +23,14 @@
 //! same move as making a budget an input to shape construction rather than repairing afterwards.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use diff_fuzzer_core::Environment;
 
-use crate::case::OnnxCase;
+use crate::case::{OnnxCase, TensorData};
 
 /// One recorded divergence, self-contained.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,6 +45,22 @@ pub struct StoredFinding {
     /// The human-readable statement of what disagreed.
     pub summary: String,
 
+    /// The kind of disagreement — `value`, `shape`, `crash`, and so on.
+    ///
+    /// Duplicated out of [`Self::signature_parts`] into a top-level field because it is how the
+    /// other two domains name a finding, and because it becomes the filename prefix. A reader
+    /// listing a run directory should be able to see what kinds of problem it holds without
+    /// opening anything.
+    #[serde(default)]
+    pub kind: String,
+
+    /// The implementations that disagreed, sorted.
+    ///
+    /// Sorted so the same disagreement records identically whatever order the runtimes ran in —
+    /// the same determinism requirement the oracle's summary and the signature both carry.
+    #[serde(default)]
+    pub disagreeing: Vec<String>,
+
     /// The seed, kept for **reproducing the surrounding run**, never as the case itself.
     pub seed: u64,
 
@@ -56,6 +72,15 @@ pub struct StoredFinding {
 
     /// The case itself — the artifact that survives a generator change.
     pub case: OnnxCase,
+
+    /// The model in words: what a maintainer reads instead of parsing the case.
+    ///
+    /// The counterpart of the SQL domain's `sql` field, which stores the statements themselves
+    /// rather than only the structured query. **A reproduction nobody can read is a reproduction
+    /// nobody will act on**, and expecting the recipient of an issue to decode a JSON tensor is
+    /// how a report gets closed unread.
+    #[serde(default)]
+    pub model: String,
 
     /// What each participant produced, rendered for a human.
     pub outputs: Vec<(String, String)>,
@@ -78,6 +103,14 @@ pub struct StoredFinding {
     #[serde(default)]
     pub legal_trail: Vec<String>,
 
+    /// What minimisation achieved, when the finding was minimised.
+    ///
+    /// **Recorded because "minimised to one element" and "stopped at one element with reductions
+    /// still untried" are different claims**, and a report that cannot tell them apart overstates
+    /// the second as the first.
+    #[serde(default)]
+    pub minimisation: Option<Minimisation>,
+
     /// The structured signature, when one could be derived.
     ///
     /// The `signature` field above is the flat de-duplication key; this is the decomposition
@@ -97,6 +130,7 @@ impl StoredFinding {
         case: OnnxCase,
         outputs: Vec<(String, String)>,
     ) -> Self {
+        let case_for_description = case.clone();
         Self {
             signature: signature.into(),
             summary: summary.into(),
@@ -105,17 +139,58 @@ impl StoredFinding {
             environment: crate::environment::environment(),
             case,
             outputs,
+            model: describe_model(&case_for_description),
+            kind: String::new(),
+            disagreeing: Vec::new(),
             policy: crate::policy::describe(),
             legal_trail: legal_trail_for(),
+            minimisation: None,
             signature_parts: None,
         }
     }
 
-    /// Attach the structured signature.
+    /// Attach the structured signature, deriving the flat key, kind and participant list from it.
+    ///
+    /// Derived rather than passed separately, so the four cannot disagree about the same finding.
     pub fn with_signature(mut self, signature: crate::signature::Signature) -> Self {
         self.signature = signature.key();
+        self.kind = signature.kind.token().to_string();
+        let mut disagreeing: Vec<String> = signature
+            .participants
+            .iter()
+            .filter(|(_, outcome)| outcome != "unsupported")
+            .map(|(name, _)| name.clone())
+            .collect();
+        disagreeing.sort();
+        self.disagreeing = disagreeing;
         self.signature_parts = Some(signature);
         self
+    }
+
+    /// Attach what minimisation achieved.
+    pub fn with_minimisation(mut self, minimisation: Minimisation) -> Self {
+        self.minimisation = Some(minimisation);
+        self
+    }
+
+    /// The file this finding is stored as, inside its run directory.
+    ///
+    /// `{kind}-{hash}.json`, matching the convention the other two domains use. The hash is of
+    /// the **signature**, not of the case, so re-running a campaign overwrites the same file
+    /// rather than accumulating one copy per occurrence — a directory holding a hundred files for
+    /// one problem is not a report.
+    pub fn file_name(&self) -> String {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.signature.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        let kind = if self.kind.is_empty() {
+            "finding"
+        } else {
+            &self.kind
+        };
+        format!("{kind}-{hash:016x}.json")
     }
 
     /// Was this finding judged under the rules currently compiled in?
@@ -147,80 +222,252 @@ fn legal_trail_for() -> Vec<String> {
         .collect()
 }
 
-/// An append-only log of findings, de-duplicated by signature.
+/// Render a single-node model as one readable line.
 ///
-/// Held in memory and flushed on each write, because a campaign that crashes should not lose the
-/// findings it had already made — the whole point of the log is to survive the run that produced
-/// it.
-#[derive(Debug)]
-pub struct FindingsLog {
-    path: PathBuf,
-    seen: Vec<String>,
+/// Deliberately compact: a finding's model is a single node with a handful of small tensors once
+/// it has been minimised, and a reader wants to see all of it at once rather than scroll.
+/// Floating-point values carry their **bit pattern** alongside, because `0` and `-0` print
+/// identically and two of this domain's five findings are about exactly that difference.
+fn describe_model(case: &OnnxCase) -> String {
+    let inputs: Vec<String> = case
+        .inputs
+        .iter()
+        .map(|input| {
+            format!(
+                "{}{}: {:?}{:?} = {}",
+                if input.is_initializer() {
+                    "initializer "
+                } else {
+                    ""
+                },
+                input.name,
+                input.elem_type(),
+                input.dims,
+                render_values(&input.data)
+            )
+        })
+        .collect();
+
+    let attrs = if case.attrs.is_empty() {
+        String::new()
+    } else {
+        format!(", attributes {{{}}}", case.attrs.describe())
+    };
+
+    format!(
+        "node {} (opset {}){} with {}",
+        case.op.onnx_name(),
+        case.opset,
+        attrs,
+        inputs.join("; ")
+    )
 }
 
-impl FindingsLog {
-    /// Open (or create) a log, loading the signatures already present so a resumed campaign
-    /// does not re-report what it found before.
-    pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+/// Values, with bit patterns for floats.
+fn render_values(data: &TensorData) -> String {
+    fn join<T: std::fmt::Debug>(values: &[T], limit: usize) -> String {
+        let shown: Vec<String> = values
+            .iter()
+            .take(limit)
+            .map(|v| format!("{v:?}"))
+            .collect();
+        if values.len() > limit {
+            format!("[{}, … {} more]", shown.join(", "), values.len() - limit)
+        } else {
+            format!("[{}]", shown.join(", "))
         }
-        let mut seen = Vec::new();
-        if path.exists() {
-            for line in BufReader::new(File::open(&path)?).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                // A corrupt trailing line — a run killed mid-write — must not stop the log from
-                // opening. Skipping it costs one duplicate at worst.
-                if let Ok(finding) = serde_json::from_str::<StoredFinding>(&line) {
-                    seen.push(finding.signature);
-                }
-            }
-        }
-        Ok(Self { path, seen })
     }
+    match data {
+        TensorData::F32(v) => {
+            let shown: Vec<String> = v
+                .iter()
+                .take(8)
+                .map(|x| format!("{x}({:#010x})", x.to_bits()))
+                .collect();
+            format!(
+                "[{}{}]",
+                shown.join(", "),
+                if v.len() > 8 {
+                    format!(", … {} more", v.len() - 8)
+                } else {
+                    String::new()
+                }
+            )
+        }
+        TensorData::F64(v) => {
+            let shown: Vec<String> = v
+                .iter()
+                .take(8)
+                .map(|x| format!("{x}({:#018x})", x.to_bits()))
+                .collect();
+            format!(
+                "[{}{}]",
+                shown.join(", "),
+                if v.len() > 8 {
+                    format!(", … {} more", v.len() - 8)
+                } else {
+                    String::new()
+                }
+            )
+        }
+        TensorData::I32(v) => join(v, 12),
+        TensorData::I64(v) => join(v, 12),
+        TensorData::Bool(v) => join(v, 12),
+    }
+}
 
-    /// Record a finding unless its signature has already been seen.
+/// What a minimisation achieved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Minimisation {
+    pub steps: usize,
+    pub candidates_tried: usize,
+    /// Whether the search reached a local minimum rather than running out of budget.
     ///
-    /// Returns whether it was new — the count a campaign should report is distinct findings, not
-    /// occurrences, since one defect hit ten thousand times is one defect.
+    /// **Only a complete search may be described as minimal.** A budget-exhausted result is a
+    /// smaller case, not the smallest one.
+    pub complete: bool,
+    /// Element count before and after, which is the figure a reader actually wants.
+    pub elements_before: usize,
+    pub elements_after: usize,
+}
+
+/// A campaign run: a directory of findings, one JSON file each.
+///
+/// # Why one file per finding rather than one file per run
+///
+/// The other two domains write a file per finding, and it is the better shape for the same reason
+/// a stored case beats a stored seed: the unit a human works with is **one problem**. A file can
+/// be opened, read, attached to an issue, diffed against a re-run, and deleted when it is fixed.
+/// A single appended log makes each of those a text-processing exercise.
+///
+/// De-duplication falls out of the filename: it is derived from the signature, so the same
+/// problem found a hundred times writes the same file a hundred times rather than accumulating a
+/// hundred copies.
+#[derive(Debug)]
+pub struct Run {
+    directory: PathBuf,
+    written: Vec<String>,
+}
+
+impl Run {
+    /// Open a run directory under the tree belonging to `oracle`.
+    ///
+    /// The oracle decides the tree rather than the caller passing a path, so a metamorphic
+    /// finding cannot be filed into the differential tree by writing the wrong string.
+    pub fn open(oracle: crate::OracleKind, name: &str) -> std::io::Result<Self> {
+        let directory = Path::new(oracle.root()).join(name);
+        std::fs::create_dir_all(&directory)?;
+        Ok(Self {
+            directory,
+            written: Vec::new(),
+        })
+    }
+
+    /// Write a finding. Returns whether it was new **to this run**.
     pub fn record(&mut self, finding: &StoredFinding) -> std::io::Result<bool> {
-        if self.seen.iter().any(|s| s == &finding.signature) {
-            return Ok(false);
+        let name = finding.file_name();
+        let fresh = !self.written.contains(&name);
+        let json = serde_json::to_string_pretty(finding).map_err(std::io::Error::other)?;
+        std::fs::write(self.directory.join(&name), json)?;
+        if fresh {
+            self.written.push(name);
         }
-        let line = serde_json::to_string(finding).map_err(std::io::Error::other)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        writeln!(file, "{line}")?;
-        file.flush()?;
-        self.seen.push(finding.signature.clone());
-        Ok(true)
+        Ok(fresh)
     }
 
-    /// How many distinct findings the log holds.
+    /// How many distinct findings this run has written.
     pub fn distinct(&self) -> usize {
-        self.seen.len()
+        self.written.len()
     }
 
-    /// Read every finding back.
-    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Vec<StoredFinding>> {
+    /// Where the findings went, for a log line or a report to point at.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Read every finding back out of a run directory.
+    pub fn load(oracle: crate::OracleKind, name: &str) -> std::io::Result<Vec<StoredFinding>> {
+        let directory = Path::new(oracle.root()).join(name);
         let mut found = Vec::new();
-        if !path.as_ref().exists() {
+        if !directory.exists() {
             return Ok(found);
         }
-        for line in BufReader::new(File::open(path)?).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            found.push(serde_json::from_str(&line).map_err(std::io::Error::other)?);
+        // Sorted, so a report over a run directory does not depend on filesystem order.
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&directory)?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let text = std::fs::read_to_string(&path)?;
+            found.push(serde_json::from_str(&text).map_err(std::io::Error::other)?);
         }
         Ok(found)
+    }
+}
+
+/// A campaign's log: what the run did, as opposed to what it found.
+///
+/// **A campaign that finds nothing produces no findings and a log that is the entire result.**
+/// `05-MEASUREMENT-AND-CAMPAIGNS.md` is clear that a zero is only worth anything alongside the
+/// surface it was measured over, and that surface lives here.
+///
+/// Written through as each line is added, so a campaign killed halfway still leaves the part of
+/// the log it had reached — losing the record of a four-hour run because it was interrupted at
+/// three would be its own small disaster.
+#[derive(Debug)]
+pub struct CampaignLog {
+    path: PathBuf,
+    file: File,
+}
+
+impl CampaignLog {
+    /// Open (or truncate) the log for a named run.
+    pub fn open(name: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all(crate::LOGS_ROOT)?;
+        let path = Path::new(crate::LOGS_ROOT).join(format!("{name}.log"));
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        Ok(Self { path, file })
+    }
+
+    /// Append a line, flushing immediately.
+    pub fn line(&mut self, text: impl AsRef<str>) -> std::io::Result<()> {
+        writeln!(self.file, "{}", text.as_ref())?;
+        self.file.flush()
+    }
+
+    /// Write a line to the log **and** to standard output.
+    ///
+    /// Campaigns are watched while they run and read afterwards, and a line that goes to only one
+    /// of those is a line somebody misses.
+    pub fn say(&mut self, text: impl AsRef<str>) -> std::io::Result<()> {
+        println!("{}", text.as_ref());
+        self.line(text)
+    }
+
+    /// Record the header every campaign log must carry.
+    ///
+    /// The environment and the generator description are what make a later reader able to say
+    /// what the run actually covered. A log without them is a number with no surface attached.
+    pub fn header(&mut self, name: &str, generator: &str) -> std::io::Result<()> {
+        let environment = crate::environment::environment();
+        self.say(format!("campaign: {name}"))?;
+        self.say(format!("started:  {}", crate::census::env_date()))?;
+        self.say(format!("platform: {}", environment.platform))?;
+        for (component, version) in &environment.components {
+            self.say(format!("  {component}: {version}"))?;
+        }
+        self.say(format!("generator: {generator}"))?;
+        self.say(format!("policy:    {}", crate::policy::describe()))?;
+        self.say(String::new())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -232,12 +479,6 @@ mod tests {
     use crate::validation::well_formed;
     use diff_fuzzer_core::axes::GenerationAxes;
 
-    fn temp(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("dffind-{name}-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        path
-    }
-
     fn finding(signature: &str, case: OnnxCase) -> StoredFinding {
         StoredFinding::new(
             signature,
@@ -247,83 +488,6 @@ mod tests {
             case,
             vec![("tract".into(), "1".into()), ("ort".into(), "0".into())],
         )
-    }
-
-    /// **The property the whole module exists for.** A finding must replay from its own record,
-    /// with no generator involved — and the values must survive the round trip *bit for bit*,
-    /// since a `NaN` that comes back as a different `NaN` is a different test case.
-    #[test]
-    fn a_finding_replays_from_its_own_record() {
-        let case = OnnxCase::new(
-            OpKind::Add,
-            22,
-            vec![
-                TensorValue::f32("a", vec![3], vec![f32::NAN, -0.0, f32::INFINITY]),
-                TensorValue::f32("b", vec![3], vec![1.0, 0.0, f32::NEG_INFINITY]),
-            ],
-        );
-        let path = temp("replay");
-        let mut log = FindingsLog::open(&path).unwrap();
-        assert!(log.record(&finding("sig-a", case.clone())).unwrap());
-
-        let loaded = FindingsLog::load(&path).unwrap();
-        assert_eq!(loaded.len(), 1);
-
-        // **Not `assert_eq!` on the case.** `PartialEq` is derived, so it compares the floats
-        // with `==` — and `NaN == NaN` is false, which would fail on a perfectly round-tripped
-        // case, while `-0.0 == 0.0` is true, which would pass on a corrupted one. It is wrong
-        // in *both* directions. The bit-pattern serialization is what makes the comparison
-        // expressible at all, so the round trip is checked on that.
-        assert_eq!(
-            serde_json::to_string(&loaded[0].case).unwrap(),
-            serde_json::to_string(&case).unwrap(),
-            "the case must survive verbatim"
-        );
-
-        // And spot-check the two values a naive comparison gets wrong.
-        let TensorValue { data, .. } = &loaded[0].case.inputs[0];
-        let bits: Vec<u32> = match data {
-            crate::case::TensorData::F32(values) => values.iter().map(|v| v.to_bits()).collect(),
-            other => panic!("expected f32 data, got {other:?}"),
-        };
-        assert_eq!(bits[0], f32::NAN.to_bits());
-        assert_eq!(
-            bits[1],
-            (-0.0f32).to_bits(),
-            "the sign of zero must survive"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// One defect hit repeatedly is one finding.
-    #[test]
-    fn repeated_signatures_are_recorded_once() {
-        let path = temp("dedup");
-        let case = well_formed(OpKind::Sign, &[2], 22);
-        let mut log = FindingsLog::open(&path).unwrap();
-        assert!(log.record(&finding("sig-x", case.clone())).unwrap());
-        assert!(!log.record(&finding("sig-x", case.clone())).unwrap());
-        assert!(log.record(&finding("sig-y", case)).unwrap());
-        assert_eq!(log.distinct(), 2);
-        assert_eq!(FindingsLog::load(&path).unwrap().len(), 2);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A resumed campaign must not re-report what a previous run already found.
-    #[test]
-    fn a_reopened_log_remembers_what_it_holds() {
-        let path = temp("resume");
-        let case = well_formed(OpKind::Sign, &[2], 22);
-        let mut log = FindingsLog::open(&path).unwrap();
-        log.record(&finding("sig-z", case.clone())).unwrap();
-
-        let mut reopened = FindingsLog::open(&path).unwrap();
-        assert_eq!(reopened.distinct(), 1);
-        assert!(
-            !reopened.record(&finding("sig-z", case)).unwrap(),
-            "a signature from a previous run must still de-duplicate"
-        );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// **N7.7: a record written by an older build must still load.**
@@ -378,16 +542,167 @@ mod tests {
         );
     }
 
+    /// **The property the module exists for.** A finding must replay from its own record, with
+    /// no generator involved — and the values must survive the round trip *bit for bit*, since a
+    /// `NaN` that comes back as a different `NaN` is a different test case.
+    #[test]
+    fn a_finding_replays_from_its_own_record() {
+        let case = OnnxCase::new(
+            OpKind::Add,
+            22,
+            vec![
+                TensorValue::f32("a", vec![3], vec![f32::NAN, -0.0, f32::INFINITY]),
+                TensorValue::f32("b", vec![3], vec![1.0, 0.0, f32::NEG_INFINITY]),
+            ],
+        );
+        let name = format!("test-replay-{}", std::process::id());
+        let mut run = Run::open(crate::OracleKind::Differential, &name).unwrap();
+        let mut record = finding("Add/22/F32/rank1/value", case.clone());
+        record.kind = "value".into();
+        run.record(&record).unwrap();
+
+        let loaded = Run::load(crate::OracleKind::Differential, &name).unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        // **Not `assert_eq!` on the case.** `PartialEq` is derived, so it compares floats with
+        // `==` — wrong in both directions here: it fails on a perfectly round-tripped `NaN` and
+        // passes on a corrupted `-0.0`. The bit-pattern serialization is what makes the
+        // comparison expressible at all.
+        assert_eq!(
+            serde_json::to_string(&loaded[0].case).unwrap(),
+            serde_json::to_string(&case).unwrap(),
+            "the case must survive verbatim"
+        );
+
+        let TensorValue { data, .. } = &loaded[0].case.inputs[0];
+        let bits: Vec<u32> = match data {
+            crate::case::TensorData::F32(values) => values.iter().map(|v| v.to_bits()).collect(),
+            other => panic!("expected f32 data, got {other:?}"),
+        };
+        assert_eq!(bits[0], f32::NAN.to_bits());
+        assert_eq!(
+            bits[1],
+            (-0.0f32).to_bits(),
+            "the sign of zero must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(run.directory());
+    }
+
+    /// A finding's filename must be derived from its **signature**, so re-running a campaign
+    /// overwrites one file per problem rather than accumulating one per occurrence. A directory
+    /// holding a hundred files for one problem is not a report.
+    #[test]
+    fn the_file_name_is_stable_per_problem_and_carries_the_kind() {
+        let case = well_formed(OpKind::Sign, &[2], 22);
+        let signature = crate::signature::Signature {
+            operator: "Sign".into(),
+            opset: 22,
+            elem_type: crate::case::ElemType::I32,
+            rank: 1,
+            kind: crate::signature::Kind::Value,
+            participants: vec![
+                ("tract".into(), "ok".into()),
+                ("onnxruntime".into(), "ok".into()),
+            ],
+        };
+        let a = finding("ignored", case.clone()).with_signature(signature.clone());
+        let b = finding("ignored", case).with_signature(signature);
+
+        assert_eq!(a.file_name(), b.file_name(), "the same problem, twice");
+        assert!(
+            a.file_name().starts_with("value-"),
+            "the kind must be visible without opening the file: {}",
+            a.file_name()
+        );
+        assert!(a.file_name().ends_with(".json"));
+        assert_eq!(a.kind, "value");
+        assert_eq!(a.disagreeing, vec!["onnxruntime", "tract"]);
+    }
+
+    /// Two different problems must not collide onto one file.
+    #[test]
+    fn different_problems_get_different_files() {
+        let case = well_formed(OpKind::Sign, &[2], 22);
+        let mut a = finding("Sign/22/I32/rank1/value", case.clone());
+        a.kind = "value".into();
+        let mut b = finding("Sign/22/F32/rank1/value", case);
+        b.kind = "value".into();
+        assert_ne!(a.file_name(), b.file_name());
+    }
+
+    /// **The round trip that matters for the new layout**: written into a run directory as one
+    /// pretty JSON per finding, and read back identically.
+    #[test]
+    fn a_run_directory_round_trips() {
+        let name = format!("test-run-{}", std::process::id());
+        let case = well_formed(OpKind::Sign, &[2], 22);
+        let mut run = Run::open(crate::OracleKind::Differential, &name).unwrap();
+
+        let mut first = finding("Sign/22/I32/rank1/value", case.clone());
+        first.kind = "value".into();
+        assert!(run.record(&first).unwrap(), "first write is new");
+        assert!(!run.record(&first).unwrap(), "the same problem is not new");
+        assert_eq!(run.distinct(), 1);
+
+        let loaded = Run::load(crate::OracleKind::Differential, &name).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].signature, "Sign/22/I32/rank1/value");
+        assert_eq!(loaded[0].case.op, OpKind::Sign);
+
+        let _ = std::fs::remove_dir_all(run.directory());
+    }
+
+    /// The two oracles must land in different directories even under the same run name — the
+    /// exact collision the SQL domain hit.
+    #[test]
+    fn the_same_run_name_under_two_oracles_does_not_collide() {
+        let name = format!("shared-label-{}", std::process::id());
+        let differential = Run::open(crate::OracleKind::Differential, &name).unwrap();
+        let metamorphic = Run::open(crate::OracleKind::Metamorphic, &name).unwrap();
+        assert_ne!(differential.directory(), metamorphic.directory());
+        let _ = std::fs::remove_dir_all(differential.directory());
+        let _ = std::fs::remove_dir_all(metamorphic.directory());
+    }
+
+    /// A campaign log must carry the surface the run covered, or a zero result means nothing.
+    #[test]
+    fn a_campaign_log_records_the_surface_it_covered() {
+        let name = format!("test-log-{}", std::process::id());
+        {
+            let mut log = CampaignLog::open(&name).unwrap();
+            log.header(&name, "float-elementwise=on logic=abcd1234")
+                .unwrap();
+            log.line("judged 10 cases").unwrap();
+        }
+        let path = std::path::Path::new(crate::LOGS_ROOT).join(format!("{name}.log"));
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        assert!(text.contains("campaign: "), "{text}");
+        assert!(text.contains("generator: "), "the surface must be recorded");
+        assert!(
+            text.contains("policy:"),
+            "the rules in force must be recorded"
+        );
+        assert!(text.contains("tract-onnx"), "versions must be recorded");
+        assert!(text.contains("judged 10 cases"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The generator description must actually reach the record — including the fingerprint of
     /// the generation logic, which is the half of drift the axis values cannot see.
     #[test]
     fn every_finding_carries_the_generator_that_produced_it() {
-        let path = temp("generator");
-        let mut log = FindingsLog::open(&path).unwrap();
-        log.record(&finding("sig-g", well_formed(OpKind::Sign, &[2], 22)))
-            .unwrap();
+        let name = format!("test-generator-{}", std::process::id());
+        let mut run = Run::open(crate::OracleKind::Differential, &name).unwrap();
+        let mut record = finding(
+            "Sign/22/I32/rank1/value",
+            well_formed(OpKind::Sign, &[2], 22),
+        );
+        record.kind = "value".into();
+        run.record(&record).unwrap();
 
-        let loaded = FindingsLog::load(&path).unwrap();
+        let loaded = Run::load(crate::OracleKind::Differential, &name).unwrap();
         assert!(
             loaded[0].generator.contains("logic="),
             "the logic fingerprint must be recorded: {}",
@@ -397,6 +712,11 @@ mod tests {
             !loaded[0].environment.components.is_empty(),
             "a finding with no version information cannot be re-checked later"
         );
-        let _ = std::fs::remove_file(&path);
+        assert!(
+            loaded[0].model.contains("node Sign"),
+            "the readable model must be recorded: {}",
+            loaded[0].model
+        );
+        let _ = std::fs::remove_dir_all(run.directory());
     }
 }

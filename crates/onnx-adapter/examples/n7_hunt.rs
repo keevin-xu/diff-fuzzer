@@ -29,7 +29,7 @@ use diff_fuzzer_core::traits::{Generator, Implementation, NamedOutput, Oracle, V
 use diff_fuzzer_core::{Budget, Normalizer, axes::GenerationAxes, minimize_within};
 use onnx_adapter::capability::{Capabilities, WithCapabilities};
 use onnx_adapter::case::OnnxCase;
-use onnx_adapter::findings::{FindingsLog, StoredFinding};
+use onnx_adapter::findings::{CampaignLog, Minimisation, Run, StoredFinding};
 use onnx_adapter::gen_shape::Bounds;
 use onnx_adapter::generator::OnnxGenerator;
 use onnx_adapter::normalize::{Canonical, OnnxNormalizer};
@@ -40,6 +40,9 @@ use onnx_adapter::runtimes::{OrtRuntime, TractRuntime};
 use onnx_adapter::shrink::complexity;
 
 const SEEDS: u64 = 4000;
+
+/// The run name. Findings land in `runs/differential/{RUN_NAME}`, the log in `logs/{RUN_NAME}.log`.
+const RUN_NAME: &str = "n7-first-findings";
 
 fn main() {
     let previous = std::panic::take_hook();
@@ -82,6 +85,9 @@ fn main() {
     // ── 1-3. Sweep and group ────────────────────────────────────────────────────────
     let bounds = Bounds::default().with_special_values();
     let generator = OnnxGenerator::new(bounds.clone());
+    let mut log = CampaignLog::open(RUN_NAME).expect("opening the campaign log");
+    log.header(RUN_NAME, &bounds.description())
+        .expect("writing the log header");
     let mut first_seen: BTreeMap<String, (u64, OnnxCase)> = BTreeMap::new();
     let mut hits: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -96,15 +102,17 @@ fn main() {
         }
     }
 
-    println!(
-        "\n{} distinct problems across {SEEDS} seeds ({} occurrences)\n",
+    log.say(format!(
+        "{} distinct signatures across {SEEDS} seeds ({} occurrences)",
         first_seen.len(),
         hits.values().sum::<usize>()
-    );
+    ))
+    .expect("writing the log");
+    log.say(String::new()).expect("writing the log");
 
     // ── 4-6. Minimise, store, replay ────────────────────────────────────────────────
-    let path = format!("{}/findings.jsonl", onnx_adapter::FINDINGS_ROOT);
-    let mut log = FindingsLog::open(&path).expect("opening the findings log");
+    let mut run = Run::open(onnx_adapter::OracleKind::Differential, RUN_NAME)
+        .expect("opening the run directory");
     let budget = Budget {
         max_steps: 200,
         max_candidates: 4000,
@@ -140,12 +148,19 @@ fn main() {
             minimized.input.clone(),
             rendered.clone(),
         )
-        .with_signature(signature.clone());
+        .with_signature(signature.clone())
+        .with_minimisation(Minimisation {
+            steps: minimized.steps,
+            candidates_tried: minimized.candidates_tried,
+            complete: minimized.is_minimal(),
+            elements_before: before.elements,
+            elements_after: after.elements,
+        });
 
-        let stored = log.record(&finding).expect("writing a finding");
+        let stored = run.record(&finding).expect("writing a finding");
 
-        println!("── {key}");
-        println!(
+        log.say(format!("── {key}")).expect("log");
+        log.say(format!(
             "   seen {}x · minimised {} -> {} elements, rank sum {} -> {} ({} steps, {} candidates, {})",
             hits[key],
             before.elements,
@@ -155,10 +170,13 @@ fn main() {
             minimized.steps,
             minimized.candidates_tried,
             minimized.stopped
-        );
-        println!("   {}", describe_case(&minimized.input));
+        ))
+        .expect("log");
+        log.say(format!("   {}", describe_case(&minimized.input)))
+            .expect("log");
         for (name, text) in &rendered {
-            println!("     {name:<12} {}", truncate(text, 96));
+            log.say(format!("     {name:<12} {}", truncate(text, 96)))
+                .expect("log");
         }
 
         // ── 6. Replay from the record ───────────────────────────────────────────────
@@ -169,25 +187,33 @@ fn main() {
             ("candle", &candle),
         ];
         let result = replay(&finding, &participants);
-        println!(
+        log.say(format!(
             "   replay: {}",
             match &result {
                 Replay::Reproduced { .. } => "REPRODUCED from its own record".to_string(),
                 other => format!("*** {other:?} ***"),
             }
-        );
-        println!(
-            "   {} in the log\n",
+        ))
+        .expect("log");
+        log.say(format!(
+            "   {} in {}\n",
             if stored {
                 "recorded"
             } else {
                 "already present"
-            }
-        );
+            },
+            run.directory().display()
+        ))
+        .expect("log");
     }
     std::panic::set_hook(previous);
 
-    println!("{} distinct findings in {path}", log.distinct());
+    log.say(format!(
+        "\n{} distinct findings written to {}",
+        run.distinct(),
+        run.directory().display()
+    ))
+    .expect("writing the log");
 }
 
 /// A one-line description of what the case actually is.

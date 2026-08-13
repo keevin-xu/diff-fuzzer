@@ -308,7 +308,7 @@ fn first_line(text: &str) -> String {
 ///
 /// Read from the environment rather than invented: a matrix that misreports when it was
 /// taken is worse than one with no date, because it looks current.
-fn env_date() -> String {
+pub(crate) fn env_date() -> String {
     std::process::Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%MZ"])
         .output()

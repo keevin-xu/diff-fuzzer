@@ -14,7 +14,7 @@
 //!   cargo run --release -p onnx-adapter --example n4_specials --features candle
 
 use diff_fuzzer_core::axes::GenerationAxes;
-use onnx_adapter::findings::{FindingsLog, StoredFinding};
+use onnx_adapter::findings::{Run, StoredFinding};
 use std::collections::BTreeMap;
 
 use diff_fuzzer_core::Normalizer;
@@ -51,16 +51,17 @@ fn main() {
         ("special values on", Bounds::default().with_special_values()),
     ] {
         let generator = OnnxGenerator::new(bounds.clone());
-        let mut log = FindingsLog::open(format!(
-            "{}/divergences-{}.jsonl",
-            onnx_adapter::FINDINGS_ROOT,
+        // Findings from a measurement run go where every other run's findings go — one run
+        // directory per configuration, under the oracle that produced them.
+        let mut log = Run::open(
+            onnx_adapter::OracleKind::Differential,
             if bounds.special_values {
-                "specials"
+                "n4-special-values"
             } else {
-                "baseline"
-            }
-        ))
-        .expect("opening the findings log");
+                "n4-baseline"
+            },
+        )
+        .expect("opening the run directory");
         let (mut judged, mut agreed, mut diverged, mut skipped, mut degenerate) = (0, 0, 0, 0, 0);
         let mut signatures: BTreeMap<String, usize> = BTreeMap::new();
         // How often the one loosening actually decides a case.
