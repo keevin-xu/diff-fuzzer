@@ -43,6 +43,8 @@
 //!   --announce   print what the run would do, and exit without running it
 //!   --control    inject a deliberately wrong participant; divergence is EXPECTED
 //!   --seeds A..B seed range, default 0..20000
+//!   --quantized  include the Tier Q surface (PHASE-N9); off by default, so the default IS
+//!                the baseline the quantized yield is measured against
 //! ```
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -75,12 +77,13 @@ struct Args {
     seeds: std::ops::Range<u64>,
     control: bool,
     announce: bool,
+    quantized: bool,
 }
 
 fn parse_args() -> Args {
     let mut name = "campaign".to_string();
     let mut seeds = 0..20_000u64;
-    let (mut control, mut announce) = (false, false);
+    let (mut control, mut announce, mut quantized) = (false, false, false);
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -97,6 +100,7 @@ fn parse_args() -> Args {
                 }
             }
             "--control" => control = true,
+            "--quantized" => quantized = true,
             "--announce" => announce = true,
             other => eprintln!("ignoring unrecognised argument {other}"),
         }
@@ -107,12 +111,20 @@ fn parse_args() -> Args {
         seeds,
         control,
         announce,
+        quantized,
     }
 }
 
 fn main() {
     let args = parse_args();
-    let bounds = Bounds::default().with_special_values();
+    // The quantized surface is a separate axis so its yield can be measured *against* the
+    // Tier A/B baseline. N9.7 asks for exactly that comparison, and a rate without a baseline
+    // is not a measurement.
+    let bounds = if args.quantized {
+        Bounds::default().with_special_values().with_quantized()
+    } else {
+        Bounds::default().with_special_values()
+    };
     let cases = args.seeds.end.saturating_sub(args.seeds.start);
 
     // ── N8.2: announce before running ───────────────────────────────────────────────

@@ -64,6 +64,7 @@ pub mod policy;
 pub mod problems;
 pub mod reference;
 pub mod repro;
+pub mod roundtrip;
 pub mod runtimes;
 pub mod sentinel;
 pub mod shrink;

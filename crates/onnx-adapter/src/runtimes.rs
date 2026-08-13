@@ -539,6 +539,11 @@ impl CandleRuntime {
             candle_core::DType::F32 => collect!(f32, F32),
             candle_core::DType::F64 => collect!(f64, F64),
             candle_core::DType::I64 => collect!(i64, I64),
+            // candle has a `U8` but no `I8`, so only half the quantization surface is
+            // decodable. Added at N9 — and the census is what found it missing: 36 cells were
+            // recorded as "this adapter does not decode" rather than as candle capability,
+            // which is an honest message and still 36 cells of lost coverage.
+            candle_core::DType::U8 => collect!(u8, U8),
             other => {
                 return OnnxOutcome::Unsupported {
                     reason: format!(

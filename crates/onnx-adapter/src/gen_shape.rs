@@ -277,6 +277,21 @@ impl Bounds {
         if self.bool_type {
             types.push(ElemType::Bool);
         }
+        // **Tied to the quantized axis, not to `integer_types`.** `int8` and `uint8` exist in
+        // this adapter only to be quantized into: no Tier A or Tier B operator accepts them, so
+        // adding them to the general integer pool would produce nothing but `None` from
+        // `build_case`.
+        //
+        // Missing this is why `DequantizeLinear` and `MatMulInteger` were generated **zero**
+        // times on the first N9 measurement while appearing to be enabled — their type
+        // constraints are `int8`/`uint8`, the pool never offered those types, and the operator
+        // silently never came up. The yield table showed 0 cases rather than 0 findings, which
+        // is the distinction `05-MEASUREMENT-AND-CAMPAIGNS.md` insists on and the reason that
+        // table exists at all.
+        if self.quantized {
+            types.push(ElemType::I8);
+            types.push(ElemType::U8);
+        }
         types
     }
 
@@ -429,9 +444,12 @@ pub fn generate_case(
                 op,
                 opset,
                 vec![
-                    tensor("a", &dims, elem, op, bounds, rng),
+                    // Finite for the same reason as `DynamicQuantize` above: `x / scale` with a
+                    // non-finite `x` is non-finite, and what saturating *that* to an 8-bit range
+                    // produces is not something ONNX states. `SPECS.md` §2q.6.
+                    finite_tensor("a", &dims, elem, rng),
                     scale_tensor(bounds, rng),
-                    zero_point_tensor(target, rng),
+                    zero_point_tensor("zero_point", target, rng),
                 ],
             )
         }
@@ -445,7 +463,7 @@ pub fn generate_case(
                     tensor("a", &dims, elem, op, bounds, rng),
                     scale_tensor(bounds, rng),
                     // "x_zero_point and x must have the same type" (§2q.2).
-                    zero_point_tensor(elem, rng),
+                    zero_point_tensor("zero_point", elem, rng),
                 ],
             )
         }
@@ -468,16 +486,35 @@ pub fn generate_case(
                 vec![
                     tensor("a", &[m, k], elem, op, bounds, rng),
                     tensor("b", &[k, n], elem, op, bounds, rng),
-                    zero_point_tensor(elem, rng),
-                    zero_point_tensor(elem, rng),
+                    // **Distinct names.** Both zero-points were called `zero_point`, which is a
+                    // duplicate input name and an invalid model — our validator rejected all 880
+                    // generated cases, so `MatMulInteger` silently contributed *nothing* while
+                    // appearing enabled. Caught by the yield table, not by a test.
+                    zero_point_tensor("a_zero_point", elem, rng),
+                    zero_point_tensor("b_zero_point", elem, rng),
                 ],
             )
         }
 
         // One input, no parameters: it derives its own (§2q.4).
+        //
+        // **Two constraints the formula needs and the specification never states.**
+        //
+        // `y_scale = (max(0, max(x)) - min(0, min(x))) / 255` is undefined in two ways here:
+        //
+        // - **A non-finite input** makes the numerator `inf` or `NaN`, and the answer with it.
+        //   Measured: reference and ONNX Runtime produce `scale = NaN, zero_point = 255`;
+        //   `tract` produces `scale = inf, zero_point = 0`. Neither is wrong, because ONNX does
+        //   not say.
+        // - **An empty input** has no `max` or `min` at all. `onnx.reference` *rejects* the
+        //   model outright, which is the clearest possible statement that the case is not
+        //   determined.
+        //
+        // Both are excluded by construction, the sixth and seventh time this domain has met
+        // "ONNX is silent, so two runtimes differ". `SPECS.md` §2q.6.
         Family::DynamicQuantize => {
-            let dims = shape(bounds, rng);
-            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
+            let dims = non_empty_shape(bounds, rng);
+            OnnxCase::new(op, opset, vec![finite_tensor("a", &dims, elem, rng)])
         }
 
         Family::BinaryElementwise | Family::Comparison => {
@@ -816,6 +853,36 @@ fn factorization(total: i64, bounds: &Bounds, rng: &mut SeededRng) -> Vec<i64> {
 /// `NaN` exclusions apply everywhere rather than at whichever call site remembered them. That
 /// is the same rule as `shape_bounded`: a property belongs in the construction path, not at the
 /// sites where it was first needed.
+/// A tensor of **finite** values only.
+///
+/// The quantization operators divide by a scale and saturate into an 8-bit range; an infinity or
+/// a `NaN` anywhere in the input makes the result undetermined, and ONNX states nothing about
+/// either. Rather than feed them and forgive the disagreement afterwards, they are not generated
+/// — the same choice made five times over in `known.rs`.
+fn finite_tensor(name: &str, dims: &[i64], elem: ElemType, rng: &mut SeededRng) -> TensorValue {
+    let count = element_count(dims) as usize;
+    TensorValue::new(name, dims.to_vec(), gen_value::ordinary(elem, count, rng))
+}
+
+/// A shape with at least one element.
+///
+/// `DynamicQuantizeLinear` derives its scale from the input's `max` and `min`, which do not exist
+/// for an empty tensor — and `onnx.reference` rejects such a model rather than defining it.
+fn non_empty_shape(bounds: &Bounds, rng: &mut SeededRng) -> Vec<i64> {
+    let mut dims = shape(bounds, rng);
+    if dims.contains(&0) {
+        for d in dims.iter_mut() {
+            if *d == 0 {
+                *d = 1;
+            }
+        }
+    }
+    if dims.is_empty() {
+        dims.push(1);
+    }
+    dims
+}
+
 /// Uniformly pick one of a slice's elements.
 fn pick<'a, T>(choices: &'a [T], rng: &mut SeededRng) -> &'a T {
     &choices[rng.random_range(0..choices.len())]
@@ -845,7 +912,7 @@ fn scale_tensor(bounds: &Bounds, rng: &mut SeededRng) -> TensorValue {
 /// The range comes from `ElemType::saturation_range`, itself quoted from `SPECS.md` §2q.1, so
 /// there is one definition of what `int8` and `uint8` can hold rather than a literal here and
 /// another in the census probe.
-fn zero_point_tensor(target: ElemType, rng: &mut SeededRng) -> TensorValue {
+fn zero_point_tensor(name: &str, target: ElemType, rng: &mut SeededRng) -> TensorValue {
     let (low, high) = target
         .saturation_range()
         .expect("a zero-point's type is always a quantization target");
@@ -854,7 +921,7 @@ fn zero_point_tensor(target: ElemType, rng: &mut SeededRng) -> TensorValue {
         ElemType::U8 => TensorData::U8(vec![value as u8]),
         _ => TensorData::I8(vec![value as i8]),
     };
-    TensorValue::new("zero_point", vec![], payload)
+    TensorValue::new(name, vec![], payload)
 }
 
 /// A single dimension within the configured bound.

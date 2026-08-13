@@ -195,6 +195,36 @@ pub const CATALOG: &[LegalDifference] = &[
                is true, so that answer is specified.",
     },
     LegalDifference {
+        id: "quantize-non-finite-input",
+        operators: &[OpKind::QuantizeLinear, OpKind::DynamicQuantizeLinear],
+        elem_types: &[ElemType::F32],
+        what: "the quantized result of an infinite or NaN input",
+        handling: Handling::DeclinedByGenerator,
+        citation: Citation {
+            specs_section: "2q.6",
+            url: "https://onnx.ai/onnx/operators/onnx__DynamicQuantizeLinear.html",
+            kind: SourceKind::Primary,
+        },
+        note: "The derived scale becomes inf or NaN. Measured: reference and ONNX Runtime give \
+               scale NaN with zero-point 255; tract gives scale inf with zero-point 0. Nothing in \
+               the specification chooses between them.",
+    },
+    LegalDifference {
+        id: "dynamic-quantize-empty-input",
+        operators: &[OpKind::DynamicQuantizeLinear],
+        elem_types: &[ElemType::F32],
+        what: "the scale derived from a tensor with no elements",
+        handling: Handling::DeclinedByGenerator,
+        citation: Citation {
+            specs_section: "2q.6",
+            url: "https://onnx.ai/onnx/operators/onnx__DynamicQuantizeLinear.html",
+            kind: SourceKind::Primary,
+        },
+        note: "max(x) and min(x) do not exist for an empty tensor. onnx.reference rejects the \
+               model outright, which is the strongest available signal that the case is not \
+               determined.",
+    },
+    LegalDifference {
         id: "cast-out-of-range",
         operators: &[OpKind::Cast],
         elem_types: &[ElemType::F32, ElemType::F64],
