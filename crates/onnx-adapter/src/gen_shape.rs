@@ -567,10 +567,15 @@ pub fn generate_case(
             // **A float value outside the target integer's range has no determined answer** —
             // the `Cast` reference says "fixed point: undefined if OOR", and `saturate` applies
             // only to float8. So when the target is an integer and the source is a float, the
-            // values are drawn from a pool that stays in range. `SPECS.md` §2.5.
+            // values are drawn from a pool that stays in range *for that target*. `SPECS.md`
+            // §2.5, and §2.5b for why "that target" is load-bearing: the pool was once a fixed
+            // `int32`-sized one, which is out of range for `uint8` on every negative value.
+            //
+            // An *integer* source is deliberately not routed here: narrowing an integer is
+            // specified to wrap (§2.5b), so those cases have a right answer and are compared.
             let count = element_count(&dims) as usize;
             let data = if !target.is_floating() && elem.is_floating() {
-                gen_value::cast_safe(elem, count, bounds.special_value_rate, rng)
+                gen_value::cast_safe(elem, target, count, bounds.special_value_rate, rng)
             } else if bounds.special_values {
                 gen_value::with_specials(
                     elem,

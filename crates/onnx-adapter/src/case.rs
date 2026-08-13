@@ -139,6 +139,34 @@ impl ElemType {
             _ => None,
         }
     }
+
+    /// The range a float must stay inside to have a **determined** `Cast` to this type.
+    ///
+    /// `None` for the float and boolean targets, which are not fixed-point conversions.
+    ///
+    /// # Why this is a method and not a constant
+    ///
+    /// It existed as the constant `2.0e9` — an `int32` bound — hard-coded in two places, and
+    /// that is exactly how a campaign came to report ten `Cast` signatures that were ours.
+    /// `uint8` holds `[0, 255]`, so `-44.99` is out of range for it and perfectly in range for
+    /// `int32`; `tract` clamped to `0` and ONNX Runtime wrapped to `212`, and both are legal
+    /// because the ONNX `Cast` reference says *"fixed point: undefined if OOR"* (`SPECS.md`
+    /// §2.5). **The range is a property of the target, so it has to be asked of the target.**
+    ///
+    /// The `match` is exhaustive on purpose: a new element type cannot be added without
+    /// someone deciding what its cast range is.
+    pub fn cast_target_range(self) -> Option<(f64, f64)> {
+        match self {
+            ElemType::I8 => Some((-128.0, 127.0)),
+            ElemType::U8 => Some((0.0, 255.0)),
+            ElemType::I32 => Some((f64::from(i32::MIN), f64::from(i32::MAX))),
+            // `i64::MAX` is not exactly representable in `f64`; the nearest double above it is
+            // out of range, so the bound is taken one power of two down. Nothing this
+            // generator draws comes near either.
+            ElemType::I64 => Some((-(2f64.powi(62)), 2f64.powi(62))),
+            ElemType::F32 | ElemType::F64 | ElemType::Bool => None,
+        }
+    }
 }
 
 /// A tensor's contents, typed.

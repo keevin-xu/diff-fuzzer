@@ -219,41 +219,85 @@ fn pick_f32(exclude: Excluded, rng: &mut SeededRng) -> f32 {
 /// Measured before the retrieval: this produced **17 divergences in 6,000 cases** that looked
 /// exactly like a wrong answer in `tract`. They were ours.
 ///
-/// So the special-value pool is filtered here to the values that remain *in range and finite*:
-/// zeros, ±1, and the subnormal boundary (which converts to 0). `±inf`, `NaN`, `f32::MAX` and
-/// `f32::MIN` are excluded — every one of them is out of range for an integer target.
+/// So the special-value pool is filtered here to the values that remain *finite*: zeros, ±1, and
+/// the subnormal boundary (which converts to 0). `±inf`, `NaN`, `f32::MAX` and `f32::MIN` are
+/// excluded — every one of them is out of range for every integer target.
 ///
 /// This keeps a real special-value surface for `Cast` rather than dropping to ordinary values
 /// entirely, which would have been the easy fix and would have cost the coverage.
+///
+/// **Finite is necessary and not sufficient**: `-1.0` is finite and out of range for `uint8`.
+/// The pool is filtered again per target in [`cast_safe`].
 const CAST_SAFE_F32: [f32; 5] = [0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE];
 
-/// Values for a `Cast` whose target is an integer type.
-pub fn cast_safe(elem: ElemType, count: usize, rate: f64, rng: &mut SeededRng) -> TensorData {
-    match elem {
-        ElemType::F32 => TensorData::F32(
-            (0..count)
-                .map(|_| {
-                    if rng.random_bool(rate) {
-                        CAST_SAFE_F32[rng.random_range(0..CAST_SAFE_F32.len())]
-                    } else {
-                        rng.random_range(-100.0..100.0)
-                    }
-                })
-                .collect(),
-        ),
-        ElemType::F64 => TensorData::F64(
-            (0..count)
-                .map(|_| {
-                    if rng.random_bool(rate) {
-                        f64::from(CAST_SAFE_F32[rng.random_range(0..CAST_SAFE_F32.len())])
-                    } else {
-                        f64::from(rng.random_range(-100.0f32..100.0))
-                    }
-                })
-                .collect(),
-        ),
-        // Integer and boolean sources are always in range for an integer target at these
-        // magnitudes, and carry no out-of-range special values.
+/// The magnitude ordinary `Cast` draws reach for, before the target's range narrows it.
+const CAST_DRAW_MAGNITUDE: f64 = 100.0;
+
+/// The draw range for a float `Cast` into `target`: the ordinary magnitude, clipped to whatever
+/// the target can actually hold.
+///
+/// Returns a **half-open** range whose upper bound is one step above the largest value the
+/// target represents, because that is what `random_range` wants; the clipping below keeps it
+/// well inside every real bound.
+fn cast_draw_range(target: ElemType) -> (f64, f64) {
+    match target.cast_target_range() {
+        Some((low, high)) => (low.max(-CAST_DRAW_MAGNITUDE), high.min(CAST_DRAW_MAGNITUDE)),
+        // A float or boolean target is not a fixed-point conversion; nothing is out of range.
+        None => (-CAST_DRAW_MAGNITUDE, CAST_DRAW_MAGNITUDE),
+    }
+}
+
+/// Whether `value` survives a `Cast` into `target` with a determined answer.
+fn in_cast_range(value: f32, target: ElemType) -> bool {
+    match target.cast_target_range() {
+        Some((low, high)) => {
+            let v = f64::from(value);
+            v.is_finite() && v >= low && v <= high
+        }
+        None => true,
+    }
+}
+
+/// Values for a `Cast` from a float `source` into `target`.
+///
+/// # Why the target is a parameter
+///
+/// It used to draw `-100.0..100.0` regardless, which honours §2.5 for `int32` and violates it
+/// for `uint8`, whose range is `[0, 255]`. A campaign duly reported ten `Cast` signatures where
+/// `tract` clamped a negative to `0` and ONNX Runtime wrapped it — both legal, all ten ours.
+/// See `SPECS.md` §2.5b. **The range belongs to the target, so it is asked of the target.**
+///
+/// Note what is *not* here: an integer source. Integer-to-integer narrowing **is** specified —
+/// it wraps, two's complement (§2.5b) — so those cases have a right answer and are generated
+/// ordinarily by the caller. Declining them would have hidden a real disagreement.
+pub fn cast_safe(
+    source: ElemType,
+    target: ElemType,
+    count: usize,
+    rate: f64,
+    rng: &mut SeededRng,
+) -> TensorData {
+    let (low, high) = cast_draw_range(target);
+    // The specials that this target can hold. Never empty: `0.0` is in range for every integer
+    // type, so the `rate` branch always has something to offer.
+    let specials: Vec<f32> = CAST_SAFE_F32
+        .iter()
+        .copied()
+        .filter(|v| in_cast_range(*v, target))
+        .collect();
+
+    let draw = |rng: &mut SeededRng| -> f64 {
+        if rng.random_bool(rate) && !specials.is_empty() {
+            f64::from(specials[rng.random_range(0..specials.len())])
+        } else {
+            rng.random_range(low..high)
+        }
+    };
+
+    match source {
+        ElemType::F32 => TensorData::F32((0..count).map(|_| draw(rng) as f32).collect()),
+        ElemType::F64 => TensorData::F64((0..count).map(|_| draw(rng)).collect()),
+        // Only float sources are undetermined out of range, so only they route through here.
         other => ordinary(other, count, rng),
     }
 }
@@ -344,6 +388,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The test that was missing.** Every float source, every integer target, in range.
+    ///
+    /// The old version of this function drew `-100.0..100.0` for all targets, which is in range
+    /// for `int32` and out of range for `uint8` on every negative draw. There was no test that
+    /// looked at the *target*, so a campaign found it instead — ten signatures, all ours
+    /// (`SPECS.md` §2.5b). Iterating `ElemType::ALL` rather than naming the targets is the
+    /// point: a new integer type joins this test by existing.
+    #[test]
+    fn cast_values_stay_inside_the_target_range() {
+        for source in [ElemType::F32, ElemType::F64] {
+            for target in ElemType::ALL {
+                let Some((low, high)) = target.cast_target_range() else {
+                    continue;
+                };
+                // A high special rate, so the special-value pool is exercised too — that pool
+                // is where `-1.0` and `-0.0` live, and `-1.0` is the out-of-range one.
+                let mut rng = SeededRng::from_seed(11);
+                let data = cast_safe(source, target, 512, 0.5, &mut rng);
+                // `as_f32` only unwraps the `F32` variant, so both are read as `f64` here.
+                let values: Vec<f64> = match &data {
+                    TensorData::F32(v) => v.iter().map(|x| f64::from(*x)).collect(),
+                    TensorData::F64(v) => v.clone(),
+                    other => panic!("{source:?} produced non-float data: {other:?}"),
+                };
+                for v in values {
+                    assert!(
+                        v.is_finite() && v >= low && v <= high,
+                        "{source:?} -> {target:?} produced {v}, outside [{low}, {high}]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Narrowing the range must not narrow it to nothing.
+    ///
+    /// `uint8` loses `-0.0`, `-1.0` and every negative draw. If the filtering had gone one step
+    /// further and left an empty pool, the generator would still pass the range test above
+    /// while producing a constant — coverage lost silently, which is the failure mode that
+    /// makes "safe" values worthless.
+    #[test]
+    fn a_narrow_cast_target_still_gets_varied_values() {
+        let mut rng = SeededRng::from_seed(3);
+        let data = cast_safe(ElemType::F32, ElemType::U8, 256, 0.25, &mut rng);
+        let values = data.as_f32().expect("float data");
+        let distinct = values
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            distinct > 32,
+            "uint8 target collapsed to {distinct} distinct values"
+        );
+        assert!(
+            values.contains(&0.0),
+            "the in-range specials should still appear"
+        );
     }
 
     /// The same seed must give the same numbers, or no finding replays.

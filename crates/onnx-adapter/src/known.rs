@@ -334,12 +334,24 @@ pub fn is_undetermined(case: &crate::case::OnnxCase) -> bool {
                 Some(crate::attrs::AttrValue::Int(wire)) => ElemType::from_wire(*wire as i32),
                 _ => None,
             };
+            // **The bound is the target's, not `int32`'s.** This tested `|x| > 2.0e9` for every
+            // target, which is right for `int32` and wrong for `uint8`, whose range is
+            // `[0, 255]` — so it answered "determined" for `-44.99 → uint8` and the shrinker
+            // was free to minimise *into* a case the generator is supposed to decline.
+            // `SPECS.md` §2.5b.
+            //
+            // Integer sources are absent by design: narrowing an integer wraps, and is
+            // specified to (§2.5b), so it is determined however far out of range it is.
+            let out_of_range = |x: f64| match target.and_then(ElemType::cast_target_range) {
+                Some((low, high)) => !x.is_finite() || x < low || x > high,
+                None => false,
+            };
             match (target, case.inputs.first().map(|i| &i.data)) {
                 (Some(t), Some(TensorData::F32(v))) if !t.is_floating() => {
-                    v.iter().any(|x| !x.is_finite() || x.abs() > 2.0e9)
+                    v.iter().any(|x| out_of_range(f64::from(*x)))
                 }
                 (Some(t), Some(TensorData::F64(v))) if !t.is_floating() => {
-                    v.iter().any(|x| !x.is_finite() || x.abs() > 2.0e9)
+                    v.iter().any(|x| out_of_range(*x))
                 }
                 _ => false,
             }
@@ -574,6 +586,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Why the two tests above passed while the bound was wrong.**
+    ///
+    /// They check the generator and the shrinker against *each other*. Both asked the same
+    /// question — `|x| > 2.0e9` — so they agreed, and agreed wrongly: `-44.99` into a `uint8`
+    /// is out of range and both called it determined. A consistency test cannot catch an error
+    /// its two sides share.
+    ///
+    /// So this one checks the predicate against the **specification** instead, on the exact
+    /// case a campaign produced ten signatures of (`SPECS.md` §2.5b), and on the `int32` case
+    /// that must stay determined so the fix is not just "decline more".
+    #[test]
+    fn cast_range_is_read_from_the_target_not_from_int32() {
+        use crate::attrs::Attrs;
+        use crate::case::OnnxCase;
+
+        let cast_to = |value: f32, target: ElemType| {
+            OnnxCase::new(
+                OpKind::Cast,
+                22,
+                vec![TensorValue::new("a", vec![], TensorData::F32(vec![value]))],
+            )
+            .with_attrs(Attrs::new().int("to", i64::from(target.wire())))
+        };
+
+        // The campaign's case: in range for `int32`, far outside `uint8`'s `[0, 255]`.
+        assert!(
+            is_undetermined(&cast_to(-44.99, ElemType::U8)),
+            "-44.99 -> uint8 is out of range and must be declined"
+        );
+        assert!(
+            !is_undetermined(&cast_to(-44.99, ElemType::I32)),
+            "-44.99 -> int32 is in range and must stay comparable"
+        );
+        // `int8` holds negatives but not 200, and `uint8` is the reverse. A single symmetric
+        // bound could not tell these apart.
+        assert!(!is_undetermined(&cast_to(-44.99, ElemType::I8)));
+        assert!(is_undetermined(&cast_to(200.0, ElemType::I8)));
+        assert!(!is_undetermined(&cast_to(200.0, ElemType::U8)));
+        // Zero is representable everywhere, signed or not.
+        assert!(!is_undetermined(&cast_to(-0.0, ElemType::U8)));
+    }
+
+    /// An **integer** source narrowing out of range is specified to wrap (`SPECS.md` §2.5b), so
+    /// it must *not* be declined — declining it would hide a genuine disagreement.
+    #[test]
+    fn an_out_of_range_integer_cast_stays_comparable() {
+        use crate::attrs::Attrs;
+        use crate::case::OnnxCase;
+
+        let case = OnnxCase::new(
+            OpKind::Cast,
+            22,
+            vec![TensorValue::new("a", vec![], TensorData::I32(vec![300]))],
+        )
+        .with_attrs(Attrs::new().int("to", i64::from(ElemType::U8.wire())));
+        assert!(
+            !is_undetermined(&case),
+            "int32 300 -> uint8 has a specified answer (44) and must be compared"
+        );
     }
 
     /// The generator must actually decline what the catalog says it declines. Three entries rest
