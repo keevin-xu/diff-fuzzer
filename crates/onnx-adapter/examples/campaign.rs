@@ -25,9 +25,15 @@
 //!   skipped: a finding's filename is derived from its signature, so the same problem rewrites the
 //!   same file. Deliberately not "skip anything already found" — re-confirming a known problem on
 //!   a later run is exactly how a fixed one gets noticed;
-//! - **survivable** — nothing is held only in memory. The log and the findings are written
-//!   through, so a campaign detached with `nohup` and later reclaimed loses nothing but the
-//!   remaining seeds.
+//! - **survivable** — every distinct problem is written to disk **the moment it is first seen**,
+//!   unminimised, then rewritten in place once minimisation has run. A campaign killed at 2.9
+//!   million of 3 million cases still leaves behind every problem it found.
+//!
+//! That last property was *claimed before it was true*. The first version accumulated findings in
+//! a map and wrote them only after the sweep finished, so an interrupted campaign lost **all** of
+//! them and left only a progress log — while the comment above it read exactly as it does now.
+//! Caught because a monitor reported `findings-on-disk=0` six minutes into a run that had already
+//! found forty signatures.
 //!
 //! # Usage
 //!
@@ -260,12 +266,36 @@ fn main() {
                             *by_implementation.entry(name.clone()).or_default() += 1;
                         }
                     }
-                    let entry = signatures.entry(signature.key()).or_insert((
-                        signature,
-                        0,
-                        seed,
-                        case.clone(),
-                    ));
+                    let key = signature.key();
+                    let first_time = !signatures.contains_key(&key);
+
+                    // **Written on first sight, not at the end.** Provisional: unminimised, and
+                    // with an occurrence count the final pass corrects — but *on disk*, where an
+                    // interrupted campaign leaves it behind. The filename derives from the
+                    // signature, so the minimised version overwrites this one rather than
+                    // accumulating beside it.
+                    if first_time {
+                        let provisional = StoredFinding::new(
+                            &key,
+                            "provisional — written when first seen; not yet minimised",
+                            seed,
+                            bounds.description(),
+                            case.clone(),
+                            outputs
+                                .iter()
+                                .map(|o| {
+                                    (o.implementation.clone(), format!("{:?}", o.output.tensors))
+                                })
+                                .collect(),
+                        )
+                        .with_signature(signature.clone());
+                        run.record(&provisional)
+                            .expect("writing a provisional finding");
+                    }
+
+                    let entry = signatures
+                        .entry(key)
+                        .or_insert((signature, 0, seed, case.clone()));
                     entry.1 += 1;
                 }
             }
