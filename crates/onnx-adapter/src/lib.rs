@@ -61,7 +61,9 @@ pub mod oracle;
 pub mod outcome;
 pub mod reference;
 pub mod runtimes;
+pub mod sentinel;
 pub mod testing;
+pub mod timeout;
 pub mod validation;
 
 /// The ONNX protobuf types — `ModelProto`, `GraphProto`, `NodeProto`, `TensorProto`, and
