@@ -72,8 +72,24 @@ use onnx_adapter::shrink::complexity;
 use onnx_adapter::signature::Signature;
 use onnx_adapter::testing::WrongValues;
 
-/// How often to print progress. Frequent enough to watch, rare enough not to flood a log.
+/// How often to record progress **in the log file**. Frequent, because the log is read after the
+/// fact and detail there is free.
 const PROGRESS_EVERY: u64 = 2000;
+
+/// How often to also print progress **to stdout**.
+///
+/// # Why these are different numbers
+///
+/// A background process in this environment is reclaimed after a bounded number of stdout lines.
+/// Measured, not guessed: **four separate campaign runs across two independent pairs all stopped
+/// at exactly 1,029 progress lines**, which at one line per 2,000 cases is 2,058,000 cases every
+/// time — the same count at different throughputs, so it is a volume limit rather than a time
+/// limit. Two campaigns were lost to it before the cause was identified, both mistaken for
+/// external interruption.
+///
+/// Printing every 50,000 cases instead puts the ceiling above 50 million, while the log keeps full
+/// resolution. A campaign is watched through the log anyway.
+const PRINT_EVERY: u64 = 50_000;
 
 struct Args {
     name: String,
@@ -342,11 +358,16 @@ fn main() {
 
         if generated % PROGRESS_EVERY == 0 {
             let rate = generated as f64 / started.elapsed().as_secs_f64();
-            log.say(format!(
+            let line = format!(
                 "  … {generated}/{cases} cases · {} distinct signatures · {diverged} divergences · {rate:.0}/s",
                 signatures.len()
-            ))
-            .expect("log");
+            );
+            // The log gets every line; stdout gets one in twenty-five. See `PRINT_EVERY`.
+            if generated % PRINT_EVERY == 0 {
+                log.say(line).expect("log");
+            } else {
+                log.line(line).expect("log");
+            }
         }
     }
     let elapsed = started.elapsed();
