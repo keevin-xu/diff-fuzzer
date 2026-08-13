@@ -429,7 +429,19 @@ pub fn generate_case(
             let permitted = bounds.element_types();
             let targets: Vec<ElemType> = permitted.iter().copied().filter(|t| *t != elem).collect();
             let target = *targets.get(rng.random_range(0..targets.len().max(1)))?;
-            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
+            // **A float value outside the target integer's range has no determined answer** —
+            // the `Cast` reference says "fixed point: undefined if OOR", and `saturate` applies
+            // only to float8. So when the target is an integer and the source is a float, the
+            // values are drawn from a pool that stays in range. `SPECS.md` §2.5.
+            let count = element_count(&dims) as usize;
+            let data = if !target.is_floating() && elem.is_floating() {
+                gen_value::cast_safe(elem, count, bounds.special_value_rate, rng)
+            } else if bounds.special_values {
+                gen_value::with_specials(elem, count, bounds.special_value_rate, false, rng)
+            } else {
+                gen_value::ordinary(elem, count, rng)
+            };
+            OnnxCase::new(op, opset, vec![TensorValue::new("a", dims.clone(), data)])
                 .with_attrs(Attrs::new().int("to", i64::from(target.wire())))
         }
 

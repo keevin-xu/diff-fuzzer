@@ -6,19 +6,17 @@
 //! every unit of tolerance is sensitivity given away. So this module canonicalizes what it
 //! can — shape, element type, and the exact bits of every value — and tolerates nothing.
 //!
-//! **At N1 that means bit-exact equality, including `NaN` versus `NaN`.** That is
-//! *stricter* than the policy the domain intends: `06-ORACLES-AND-LEGAL-DIFFERENCES.md` §4
-//! says two `NaN`s should **agree**, because the payload and sign bit are unspecified. That
-//! rule is a **loosening**, and the project's inherited asymmetry is explicit about the
-//! direction of travel:
+//! **The special-value table is the one place any looseness lives**, and it is decided before
+//! any numeric comparison — see [`values_agree`]. Four of its five rows tighten or preserve;
+//! exactly one loosens, and the project's inherited asymmetry says only that one needed a
+//! citation:
 //!
 //! > Holding a bound needs only evidence it is achievable; loosening one needs a
 //! > specification.
 //!
-//! The specification has not been retrieved (it sits in `SPECS.md` §5), so the loosening
-//! waits for N4 and N6. Being too strict now costs false positives, which are noisy,
-//! visible and self-correcting. Being too loose would hide defects, silently and
-//! permanently. Starting strict is the choice that can be safely revised.
+//! The loosening is `NaN` vs `NaN` agreeing. `+0.0` vs `−0.0` **disagrees**, which is the tight
+//! direction and therefore free. Tolerance — the expensive option, where every unit is
+//! sensitivity given away — is still zero: Tier A and Tier B admit no rounding argument.
 //!
 //! # Why bits rather than values
 //!
@@ -184,11 +182,78 @@ impl diff_fuzzer_core::Normalizer for OnnxNormalizer {
     }
 }
 
+/// How two values of the same element type compare, before any tolerance is considered.
+///
+/// # The table, and the one row that is a *loosening*
+///
+/// From `06-ORACLES-AND-LEGAL-DIFFERENCES.md` §4. Every row is decided here, before any numeric
+/// comparison, and the inherited rule is absolute: **no tolerance, however large, may absorb a
+/// disagreement in this table, and none, however strict, may break an agreement in it.**
+///
+/// | comparison | verdict | why |
+/// |---|---|---|
+/// | `NaN` vs `NaN` | **agree** | both produced "not a number"; *which* `NaN` is not specified |
+/// | `NaN` vs a number | **disagree** | a disagreement about whether an answer exists |
+/// | same infinity | **agree** | |
+/// | opposite infinities, or infinity vs finite | **disagree** | not a difference of degree |
+/// | `+0.0` vs `−0.0` | **disagree** | the sign of a zero result is determined for these operators |
+///
+/// **Four of these five rows tighten or preserve; one loosens, and only that one needed a
+/// citation.** `NaN` vs `NaN` agreeing is the loosening: it accepts as equal two bit patterns
+/// that differ. `SPECS.md` §5.3 records what supports it — multiple consistent secondary
+/// sources stating that which `NaN` payload propagates is implementation-defined — and records
+/// equally plainly that **the primary text was not retrieved**.
+///
+/// `+0.0` vs `−0.0` disagreeing is the *tight* direction, so it needs only evidence that it is
+/// achievable, which every measurement so far provides: all four participants agree on the sign
+/// of zero everywhere it has been observed. Loosening it later would need a citation; adopting
+/// it now does not. `PENDING` 1.6.
+fn values_agree(elem: ElemType, left: u64, right: u64) -> bool {
+    if left == right {
+        return true;
+    }
+    // Only the floating types have values that differ in bits while agreeing in meaning.
+    if !elem.is_floating() {
+        return false;
+    }
+    let (a, b) = match elem {
+        ElemType::F32 => (
+            f64::from(f32::from_bits(left as u32)),
+            f64::from(f32::from_bits(right as u32)),
+        ),
+        _ => (f64::from_bits(left), f64::from_bits(right)),
+    };
+    // The single loosening: two `NaN`s agree whatever their payload or sign bit.
+    //
+    // Everything else falls through to the bit comparison already made above — which is what
+    // keeps `+0.0` vs `−0.0` a disagreement. Comparing with `==` here instead would silently
+    // make them agree, since `-0.0 == 0.0` is true, and that is precisely the blind spot the
+    // tensor domain documented.
+    a.is_nan() && b.is_nan()
+}
+
+/// Whether two canonical tensors agree under the special-value table.
+fn tensors_agree(left: &[CanonTensor], right: &[CanonTensor]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter().zip(right.iter()).all(|(a, b)| {
+        // Shape and element type are structural: no rule in the table can absorb a difference
+        // in either, and neither can any tolerance.
+        a.dims == b.dims
+            && a.elem_type == b.elem_type
+            && a.bits.len() == b.bits.len()
+            && a.bits
+                .iter()
+                .zip(b.bits.iter())
+                .all(|(x, y)| values_agree(a.elem_type, *x, *y))
+    })
+}
+
 /// Compare two canonical results for the purposes of the oracle.
 ///
 /// A free function rather than relying on `==` alone, because **what counts as equal is a
-/// policy decision that will change at N4**, and it should change in one place. Today it is
-/// exact, except that two rejections are equal regardless of wording.
+/// policy decision** and it should live in one place.
 pub fn equivalent(left: &Canonical, right: &Canonical) -> bool {
     if left.kind != right.kind {
         return false;
@@ -196,8 +261,7 @@ pub fn equivalent(left: &Canonical, right: &Canonical) -> bool {
     match left.kind {
         // Message text is not comparable across implementations; the *kind* is.
         "rejected" | "unsupported" | "crashed" | "timed-out" => true,
-        // Bit-exact. See the module note on why this is strict on purpose at N1.
-        _ => left.tensors == right.tensors,
+        _ => tensors_agree(&left.tensors, &right.tensors),
     }
 }
 
@@ -234,6 +298,96 @@ mod tests {
             !equivalent(&ok(vec![0.0]), &ok(vec![-0.0])),
             "signed zero must be visible to the oracle"
         );
+    }
+
+    /// **The special-value table, every row, in both directions.**
+    ///
+    /// N4.2 asks for both directions specifically, and the reason is that a table tested only
+    /// where it says "agree" would pass with a comparison that agrees with everything.
+    #[test]
+    fn the_special_value_table_holds_in_both_directions() {
+        let nan_alt = f32::from_bits(f32::NAN.to_bits() ^ 0x0000_0001); // a different payload
+        let nan_neg = -f32::NAN; // a different sign bit
+
+        // ── rows that AGREE ───────────────────────────────────────────────────────
+        assert!(
+            equivalent(&ok(vec![f32::NAN]), &ok(vec![nan_alt])),
+            "two NaNs agree whatever their payload — which one propagates is not specified"
+        );
+        assert!(
+            equivalent(&ok(vec![f32::NAN]), &ok(vec![nan_neg])),
+            "two NaNs agree whatever their sign bit"
+        );
+        assert!(
+            equivalent(&ok(vec![f32::INFINITY]), &ok(vec![f32::INFINITY])),
+            "the same infinity agrees"
+        );
+        assert!(
+            equivalent(&ok(vec![1.5]), &ok(vec![1.5])),
+            "equal numbers agree"
+        );
+
+        // ── rows that DISAGREE ────────────────────────────────────────────────────
+        assert!(
+            !equivalent(&ok(vec![f32::NAN]), &ok(vec![1.0])),
+            "NaN vs a number is a disagreement about whether an answer exists"
+        );
+        assert!(
+            !equivalent(&ok(vec![f32::INFINITY]), &ok(vec![f32::NEG_INFINITY])),
+            "opposite infinities are not a difference of degree"
+        );
+        assert!(
+            !equivalent(&ok(vec![f32::INFINITY]), &ok(vec![f32::MAX])),
+            "infinity vs finite is not a difference of degree"
+        );
+        assert!(
+            !equivalent(&ok(vec![0.0]), &ok(vec![-0.0])),
+            "signed zero is a disagreement: the sign of a zero result is determined here"
+        );
+        assert!(
+            !equivalent(&ok(vec![1.5]), &ok(vec![1.5000001])),
+            "no tolerance exists at Tier A or Tier B — the nearest distinct float disagrees"
+        );
+    }
+
+    /// The `NaN` loosening must apply **only** to floats. An integer bit pattern that happens
+    /// to look like a `NaN` when reinterpreted must not be quietly accepted as equal to a
+    /// different one — that would be the widening escaping its type.
+    #[test]
+    fn the_nan_rule_does_not_leak_into_integer_types() {
+        use crate::case::TensorData;
+        let int_tensor = |bits: i64| {
+            canon(OnnxOutcome::Ok(vec![TensorValue::new(
+                "out",
+                vec![1],
+                TensorData::I64(vec![bits]),
+            )]))
+        };
+        // Two i64 values whose bits are NaN patterns as f64, and which differ.
+        let a = f64::NAN.to_bits() as i64;
+        let b = (f64::NAN.to_bits() ^ 1) as i64;
+        assert!(
+            !equivalent(&int_tensor(a), &int_tensor(b)),
+            "integers compare by value; the NaN rule must not reach them"
+        );
+    }
+
+    /// The table is decided before any tolerance, and **no tolerance may absorb a
+    /// disagreement in it**. There is no tolerance here to test against, so the check is that
+    /// the largest possible numeric gap and the smallest both behave per the table.
+    #[test]
+    fn the_table_is_decided_before_magnitude_matters() {
+        // A vast finite difference and a one-ulp difference are both simply disagreements.
+        assert!(!equivalent(&ok(vec![0.0]), &ok(vec![f32::MAX])));
+        assert!(!equivalent(
+            &ok(vec![1.0]),
+            &ok(vec![f32::from_bits(1.0f32.to_bits() + 1)])
+        ));
+        // ...and NaN-ness beats magnitude entirely: NaN agrees with NaN, disagrees with the
+        // largest and smallest finite values alike.
+        assert!(equivalent(&ok(vec![f32::NAN]), &ok(vec![f32::NAN])));
+        assert!(!equivalent(&ok(vec![f32::NAN]), &ok(vec![f32::MAX])));
+        assert!(!equivalent(&ok(vec![f32::NAN]), &ok(vec![0.0])));
     }
 
     #[test]

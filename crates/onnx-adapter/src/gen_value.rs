@@ -150,6 +150,60 @@ fn pick_f32(exclude_nan: bool, rng: &mut SeededRng) -> f32 {
     }
 }
 
+/// Values safe to feed a **float-to-integer `Cast`**.
+///
+/// # Why this exists: "undefined if OOR"
+///
+/// The ONNX `Cast` reference states, for a float-to-fixed-point conversion:
+///
+/// > "fixed point: **undefined if OOR**."
+///
+/// and its `saturate` attribute *"only applies for float 8 conversion"*, not to integers. So
+/// casting a float outside the target integer's range has **no determined answer**: `tract`
+/// saturates at `int32` bounds, ONNX Runtime at `int64` bounds, and both are legal.
+///
+/// Measured before the retrieval: this produced **17 divergences in 6,000 cases** that looked
+/// exactly like a wrong answer in `tract`. They were ours.
+///
+/// So the special-value pool is filtered here to the values that remain *in range and finite*:
+/// zeros, ±1, and the subnormal boundary (which converts to 0). `±inf`, `NaN`, `f32::MAX` and
+/// `f32::MIN` are excluded — every one of them is out of range for an integer target.
+///
+/// This keeps a real special-value surface for `Cast` rather than dropping to ordinary values
+/// entirely, which would have been the easy fix and would have cost the coverage.
+const CAST_SAFE_F32: [f32; 5] = [0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE];
+
+/// Values for a `Cast` whose target is an integer type.
+pub fn cast_safe(elem: ElemType, count: usize, rate: f64, rng: &mut SeededRng) -> TensorData {
+    match elem {
+        ElemType::F32 => TensorData::F32(
+            (0..count)
+                .map(|_| {
+                    if rng.random_bool(rate) {
+                        CAST_SAFE_F32[rng.random_range(0..CAST_SAFE_F32.len())]
+                    } else {
+                        rng.random_range(-100.0..100.0)
+                    }
+                })
+                .collect(),
+        ),
+        ElemType::F64 => TensorData::F64(
+            (0..count)
+                .map(|_| {
+                    if rng.random_bool(rate) {
+                        f64::from(CAST_SAFE_F32[rng.random_range(0..CAST_SAFE_F32.len())])
+                    } else {
+                        f64::from(rng.random_range(-100.0f32..100.0))
+                    }
+                })
+                .collect(),
+        ),
+        // Integer and boolean sources are always in range for an integer target at these
+        // magnitudes, and carry no out-of-range special values.
+        other => ordinary(other, count, rng),
+    }
+}
+
 /// Ordinary values with **no zeros**, for a divisor.
 ///
 /// # Why this exists: an undetermined answer must not be generated
