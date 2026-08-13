@@ -55,6 +55,7 @@ pub mod gen_shape;
 pub mod gen_value;
 pub mod generator;
 pub mod known;
+pub mod metamorphic;
 pub mod model;
 pub mod normalize;
 pub mod ops;
