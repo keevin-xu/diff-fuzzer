@@ -59,6 +59,31 @@ pub struct StoredFinding {
 
     /// What each participant produced, rendered for a human.
     pub outputs: Vec<(String, String)>,
+
+    /// The comparison rules in force when this was judged, including their fingerprint.
+    ///
+    /// **A finding is a claim relative to a policy.** Loosen a rule and a recorded finding stops
+    /// diverging, with nothing to say the tool changed rather than the runtimes. Replay refuses
+    /// to claim a verdict when this no longer matches — see [`crate::repro`].
+    ///
+    /// Defaulted so records written before the field existed still load; an empty policy is
+    /// treated as unverifiable, which is the safe reading rather than the convenient one.
+    #[serde(default)]
+    pub policy: String,
+
+    /// The legal-difference entries consulted, and what each concluded.
+    ///
+    /// The audit trail behind "this was not excused". Without it a reader cannot tell a
+    /// difference nobody considered from one considered and rejected.
+    #[serde(default)]
+    pub legal_trail: Vec<String>,
+
+    /// The structured signature, when one could be derived.
+    ///
+    /// The `signature` field above is the flat de-duplication key; this is the decomposition
+    /// behind it, so a report can group by operator or by kind without re-parsing a string.
+    #[serde(default)]
+    pub signature_parts: Option<crate::signature::Signature>,
 }
 
 impl StoredFinding {
@@ -80,8 +105,46 @@ impl StoredFinding {
             environment: crate::environment::environment(),
             case,
             outputs,
+            policy: crate::policy::describe(),
+            legal_trail: legal_trail_for(),
+            signature_parts: None,
         }
     }
+
+    /// Attach the structured signature.
+    pub fn with_signature(mut self, signature: crate::signature::Signature) -> Self {
+        self.signature = signature.key();
+        self.signature_parts = Some(signature);
+        self
+    }
+
+    /// Was this finding judged under the rules currently compiled in?
+    pub fn policy_is_current(&self) -> bool {
+        !crate::policy::has_drifted(&self.policy)
+    }
+}
+
+/// The legal-difference entries in force, each with the handling that kept it from becoming noise.
+///
+/// Recorded per finding rather than assumed from the catalog at read time, because the catalog is
+/// code: a finding read next year must say what was consulted *then*.
+fn legal_trail_for() -> Vec<String> {
+    crate::known::CATALOG
+        .iter()
+        .map(|entry| {
+            let handling = match entry.handling {
+                crate::known::Handling::ForgivenByComparison => "forgiven-by-comparison",
+                crate::known::Handling::DeclinedByGenerator => "declined-by-generator",
+                crate::known::Handling::ExcludedByConfiguration { .. } => {
+                    "excluded-by-configuration"
+                }
+            };
+            format!(
+                "{}: {handling} (SPECS §{})",
+                entry.id, entry.citation.specs_section
+            )
+        })
+        .collect()
 }
 
 /// An append-only log of findings, de-duplicated by signature.
@@ -261,6 +324,58 @@ mod tests {
             "a signature from a previous run must still de-duplicate"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **N7.7: a record written by an older build must still load.**
+    ///
+    /// This is a *verbatim* finding from before `policy`, `legal_trail` and `signature_parts`
+    /// existed — pasted, not regenerated, because a test that regenerates its own fixture proves
+    /// only that today's writer agrees with today's reader. Stored findings are the artifact this
+    /// project exists to produce, and a schema change that quietly orphans them destroys work
+    /// that cannot be recovered.
+    #[test]
+    fn a_finding_written_by_an_older_build_still_loads() {
+        const OLDER: &str = r#"{"signature":"Sign | Sign: 2 distinct results","summary":"tract disagrees with 2 others","seed":17418742259747381416,"generator":"float-elementwise=on special-values=off max-rank=4 max-dim=8 element-budget=256 opset=22 logic=7a41e479","environment":{"tool":"diff-fuzzer 0.1.0","platform":"aarch64-macos","components":[["onnx (python, reference)","1.22.0"],["ort","2.0.0-rc.13"],["tract-onnx","0.23.4"]]},"case":{"opset":22,"op":"Sign","inputs":[{"name":"a","dims":[5],"data":{"I32":[-5,-1,0,1,5]},"role":"Data"}],"attrs":[]},"outputs":[["tract","[-1,-1,1,1,1]"],["onnxruntime","[-1,-1,0,1,1]"]]}"#;
+
+        let finding: StoredFinding =
+            serde_json::from_str(OLDER).expect("an older finding must still deserialize");
+
+        assert_eq!(finding.seed, 17_418_742_259_747_381_416);
+        assert_eq!(finding.case.op, OpKind::Sign);
+        assert_eq!(finding.case.inputs[0].dims, vec![5]);
+
+        // The new fields default rather than failing.
+        assert!(finding.policy.is_empty());
+        assert!(finding.legal_trail.is_empty());
+        assert!(finding.signature_parts.is_none());
+
+        // And an empty policy must read as *unverifiable*, not as current. The convenient
+        // default would be to treat a missing policy as "probably fine"; that is exactly how a
+        // stale record starts being trusted.
+        assert!(
+            !finding.policy_is_current(),
+            "a finding with no recorded policy must not claim to match the current one"
+        );
+    }
+
+    /// Every finding must carry the rules it was judged under, or a reader cannot tell whether a
+    /// replay that now agrees means the runtimes changed or the tool did.
+    #[test]
+    fn a_finding_records_the_policy_and_the_legal_trail() {
+        let finding = finding("sig-p", well_formed(OpKind::Sign, &[2], 22));
+        assert!(finding.policy_is_current());
+        assert!(finding.policy.contains("bit-exact"));
+        assert!(
+            finding.legal_trail.len() >= crate::known::CATALOG.len(),
+            "the trail must name every catalog entry consulted"
+        );
+        assert!(
+            finding
+                .legal_trail
+                .iter()
+                .any(|e| e.contains("nan-payload")),
+            "the one forgiven rule must appear in the trail"
+        );
     }
 
     /// The generator description must actually reach the record — including the fingerprint of
