@@ -948,7 +948,19 @@ fn dynamic_quantize_input(
 ) -> TensorValue {
     let count = element_count(dims) as usize;
     if !bounds.special_values || elem != ElemType::F32 || count < 2 {
-        return finite_tensor(name, dims, elem, rng);
+        // **A degenerate range divides by zero**, and a single element or an all-zero tensor is
+        // the easiest way to reach one: `y_scale = (max(0,max) - min(0,min))/255` is zero exactly
+        // when every value is zero. Measured: `tract` returns `scale = 0.0`, ONNX Runtime returns
+        // `1.0`, and ONNX says nothing about dividing by the formula's zero result. `SPECS.md`
+        // §2q.6. A non-zero value is forced so the range cannot collapse.
+        let mut fallback = finite_tensor(name, dims, elem, rng);
+        if let TensorData::F32(values) = &mut fallback.data
+            && values.iter().all(|x| *x == 0.0)
+            && let Some(first) = values.first_mut()
+        {
+            *first = 1.0;
+        }
+        return fallback;
     }
 
     const POWERS_OF_TWO: [f32; 6] = [0.015_625, 0.062_5, 0.25, 0.5, 1.0, 2.0];

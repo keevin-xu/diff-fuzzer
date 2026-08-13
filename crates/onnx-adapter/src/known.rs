@@ -278,6 +278,100 @@ pub const CATALOG: &[LegalDifference] = &[
     },
 ];
 
+/// Does this case have an answer the specification does not determine?
+///
+/// # One predicate, two users — and the second one was missing
+///
+/// The catalog's `DeclinedByGenerator` entries are enforced where cases are *built*, which kept
+/// them out of the corpus. Nothing enforced them where cases are *reduced*.
+///
+/// **So the shrinker could minimise a real finding into an undetermined case.** Observed: a
+/// `DynamicQuantizeLinear` divergence reduced to `F32[0]` — an empty tensor, which the generator
+/// declines because `max(x)` and `min(x)` do not exist and `onnx.reference` rejects the model. The
+/// reduction kept the signature, so the search accepted it, and the reproduction that came out
+/// demonstrated a case the project had already decided says nothing.
+///
+/// A minimised case is what gets read, filed, and argued from. Reducing into territory the
+/// generator refuses to enter turns a defensible finding into an indefensible one at the last step.
+///
+/// Checks values rather than consulting [`CATALOG`] directly: an entry records *what* is
+/// undetermined and *why*, and this decides whether a specific case is one.
+pub fn is_undetermined(case: &crate::case::OnnxCase) -> bool {
+    use crate::case::{ElemType, TensorData};
+
+    let data_elem = crate::ops::data_elem_type(case);
+    match case.op {
+        // `integer-division-by-zero` and `integer-division-overflow` (SPECS 2.2b, 2.11).
+        OpKind::Div if !data_elem.is_floating() => {
+            case.inputs.get(1).is_some_and(|d| match &d.data {
+                TensorData::I32(v) => v.iter().any(|x| *x == 0 || *x == -1),
+                TensorData::I64(v) => v.iter().any(|x| *x == 0 || *x == -1),
+                _ => false,
+            })
+        }
+
+        // `max-min-nan` and `max-min-signed-zero` (SPECS 2.2c, 2.9).
+        OpKind::Max | OpKind::Min => case.inputs.iter().any(|i| match &i.data {
+            TensorData::F32(v) => v
+                .iter()
+                .any(|x| x.is_nan() || x.to_bits() == (-0.0f32).to_bits()),
+            TensorData::F64(v) => v
+                .iter()
+                .any(|x| x.is_nan() || x.to_bits() == (-0.0f64).to_bits()),
+            _ => false,
+        }),
+
+        // `sign-of-nan` (SPECS 2.10). `Sign(-0.0)` IS determined and is not excluded.
+        OpKind::Sign => case.inputs.iter().any(|i| match &i.data {
+            TensorData::F32(v) => v.iter().any(|x| x.is_nan()),
+            TensorData::F64(v) => v.iter().any(|x| x.is_nan()),
+            _ => false,
+        }),
+
+        // `cast-out-of-range` (SPECS 2.5).
+        OpKind::Cast => {
+            let target = match case.attrs.get("to") {
+                Some(crate::attrs::AttrValue::Int(wire)) => ElemType::from_wire(*wire as i32),
+                _ => None,
+            };
+            match (target, case.inputs.first().map(|i| &i.data)) {
+                (Some(t), Some(TensorData::F32(v))) if !t.is_floating() => {
+                    v.iter().any(|x| !x.is_finite() || x.abs() > 2.0e9)
+                }
+                (Some(t), Some(TensorData::F64(v))) if !t.is_floating() => {
+                    v.iter().any(|x| !x.is_finite() || x.abs() > 2.0e9)
+                }
+                _ => false,
+            }
+        }
+
+        // `quantize-non-finite-input` (SPECS 2q.6).
+        OpKind::QuantizeLinear => case.inputs.first().is_some_and(|i| match &i.data {
+            TensorData::F32(v) => v.iter().any(|x| !x.is_finite()),
+            _ => false,
+        }),
+
+        // `dynamic-quantize-empty-input` (SPECS 2q.6), plus the degenerate range below.
+        OpKind::DynamicQuantizeLinear => case.inputs.first().is_some_and(|i| match &i.data {
+            TensorData::F32(v) => {
+                if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
+                    return true;
+                }
+                // **A degenerate range divides by zero.** `y_scale = (max(0,max) - min(0,min))/255`
+                // is zero exactly when every value is zero, and the formula then divides by it.
+                // Measured: `tract` returns `scale = 0.0`, ONNX Runtime returns `1.0`. ONNX gives
+                // the formula and says nothing about dividing by its zero result. SPECS 2q.6.
+                let high = v.iter().cloned().fold(0.0_f32, f32::max);
+                let low = v.iter().cloned().fold(0.0_f32, f32::min);
+                high - low == 0.0
+            }
+            _ => false,
+        }),
+
+        _ => false,
+    }
+}
+
 /// Look an entry up by its identifier.
 pub fn entry(id: &str) -> Option<&'static LegalDifference> {
     CATALOG.iter().find(|e| e.id == id)
@@ -427,6 +521,59 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate catalog identifiers");
+    }
+
+    /// **The generator and the shrinker must agree about what is undetermined.**
+    ///
+    /// The generator enforces the declined classes at construction; the shrinker enforces them at
+    /// reduction. If they disagree, a real finding can be *minimised into* a case the corpus
+    /// refuses to contain — which is exactly what happened before `is_undetermined` existed: a
+    /// `DynamicQuantizeLinear` divergence reduced to an empty tensor.
+    #[test]
+    fn nothing_the_generator_produces_is_undetermined() {
+        use crate::gen_shape::Bounds;
+        use crate::generator::OnnxGenerator;
+        use diff_fuzzer_core::rng::SeededRng;
+        use diff_fuzzer_core::traits::Generator;
+
+        for bounds in [
+            Bounds::default().with_special_values(),
+            Bounds::default().with_special_values().with_quantized(),
+        ] {
+            let generator = OnnxGenerator::new(bounds);
+            for seed in 0..4000u64 {
+                let case = generator.generate(&mut SeededRng::from_seed(seed));
+                assert!(
+                    !is_undetermined(&case),
+                    "seed {seed} generated an undetermined case: {:?} {:?}",
+                    case.op,
+                    case.inputs.first().map(|i| &i.data)
+                );
+            }
+        }
+    }
+
+    /// And no *reduction* of a generated case may be undetermined either.
+    #[test]
+    fn nothing_the_shrinker_proposes_is_undetermined() {
+        use crate::gen_shape::Bounds;
+        use crate::generator::OnnxGenerator;
+        use diff_fuzzer_core::Shrink;
+        use diff_fuzzer_core::rng::SeededRng;
+        use diff_fuzzer_core::traits::Generator;
+
+        let generator =
+            OnnxGenerator::new(Bounds::default().with_special_values().with_quantized());
+        for seed in 0..600u64 {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            for candidate in case.candidates() {
+                assert!(
+                    !is_undetermined(&candidate),
+                    "seed {seed}: shrinking {:?} produced an undetermined candidate",
+                    case.op
+                );
+            }
+        }
     }
 
     /// The generator must actually decline what the catalog says it declines. Three entries rest

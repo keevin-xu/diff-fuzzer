@@ -59,7 +59,7 @@ use diff_fuzzer_core::traits::{
 use diff_fuzzer_core::{Budget, Normalizer, axes::GenerationAxes, minimize_within};
 use onnx_adapter::capability::{Capabilities, WithCapabilities};
 use onnx_adapter::case::OnnxCase;
-use onnx_adapter::findings::{CampaignLog, Minimisation, Run, StoredFinding};
+use onnx_adapter::findings::{CampaignLog, Minimisation, Run, StoredFinding, write_rough_draft};
 use onnx_adapter::gen_shape::Bounds;
 use onnx_adapter::generator::OnnxGenerator;
 use onnx_adapter::normalize::{Canonical, OnnxNormalizer};
@@ -358,6 +358,7 @@ fn main() {
         max_candidates: 4000,
         max_duration: None,
     };
+    let mut drafted: Vec<String> = Vec::new();
     for (key, (signature, hits, seed, case)) in &signatures {
         let before = complexity(case);
         let minimized = minimize_within(case.clone(), budget, |candidate: &OnnxCase| {
@@ -390,6 +391,18 @@ fn main() {
             elements_after: complexity(&minimized.input).elements,
         });
         run.record(&finding).expect("writing a finding");
+
+        // **A signature nobody has explained gets a draft, written now.** Everything needed to
+        // start investigating it is in memory at this moment and nowhere else afterwards; the
+        // alternative is a line in a log at the end of a half-hour run. The draft carries the
+        // evidence and the triage ladder, never the analysis.
+        if !onnx_adapter::problems::PROBLEMS
+            .iter()
+            .any(|p| p.covers(signature))
+            && write_rough_draft(&finding).expect("writing a rough draft")
+        {
+            drafted.push(key.clone());
+        }
     }
 
     // ── The report ──────────────────────────────────────────────────────────────────
@@ -485,6 +498,16 @@ fn main() {
     }
     for (key, count) in &grouping.unexplained {
         say(format!("      *** UNEXPLAINED *** {count}x {key}"));
+    }
+    if !drafted.is_empty() {
+        say(String::new());
+        say(format!(
+            "  {} rough draft(s) written to issues/onnx-runtime/ for the unexplained signatures:",
+            drafted.len()
+        ));
+        for key in &drafted {
+            say(format!("      DRAFT-… for {key}"));
+        }
     }
 
     if !by_operator.is_empty() {

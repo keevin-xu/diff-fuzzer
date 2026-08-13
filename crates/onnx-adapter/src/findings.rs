@@ -408,6 +408,135 @@ impl Run {
     }
 }
 
+/// Write a **rough draft** for a finding nobody has explained yet.
+///
+/// # Why a campaign writes these itself
+///
+/// An unexplained signature is the one output a campaign exists to produce, and it arrives as a
+/// line in a log at the end of a run that may have taken half an hour. Everything needed to start
+/// investigating it — the case, what each runtime said, how far it minimised, the exact generator
+/// and policy in force — is in memory at that moment and nowhere else afterwards.
+///
+/// So the campaign writes the draft. **Not the analysis** — that needs a specification retrieved
+/// and a judgement made, and this project has five separate records of what happens when that step
+/// is skipped. What it writes is the evidence, pre-filled, plus the checklist that has to be
+/// cleared before anything is filed.
+///
+/// The file is deliberately named `DRAFT-…` rather than `FINDING-…`: a numbered finding is a claim
+/// somebody has stood behind, and these have not been read by anyone yet.
+///
+/// Returns whether a new file was created — an existing draft is never overwritten, because it may
+/// already contain analysis that this function cannot reproduce.
+pub fn write_rough_draft(finding: &StoredFinding) -> std::io::Result<bool> {
+    let slug: String = finding
+        .signature
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    let directory = Path::new("issues/onnx-runtime");
+    std::fs::create_dir_all(directory)?;
+    let path = directory.join(format!("DRAFT-{slug}.md"));
+    if path.exists() {
+        return Ok(false);
+    }
+
+    let participants = finding
+        .outputs
+        .iter()
+        .map(|(name, rendered)| format!("| `{name}` | `{}` |", truncate(rendered, 90)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let minimisation = match &finding.minimisation {
+        Some(m) => format!(
+            "Minimised from **{} elements to {}** in {} steps ({} candidates){}.",
+            m.elements_before,
+            m.elements_after,
+            m.steps,
+            m.candidates_tried,
+            if m.complete {
+                ""
+            } else {
+                " — **budget exhausted, so this is not minimal**"
+            }
+        ),
+        None => "Not minimised.".to_string(),
+    };
+
+    let body = format!(
+        "# DRAFT — {signature}\n\
+         \n\
+         **Status: UNEXPLAINED. Written automatically by a campaign; nobody has read this yet.**\n\
+         \n\
+         This signature matched no entry in `problems.rs`, which means either a new defect or a new\n\
+         class of case the generator should not be producing. **This project's record is that most\n\
+         of these are the second.** Seven times so far, an apparent finding turned out to be a case\n\
+         whose answer ONNX does not determine.\n\
+         \n\
+         **Found:** seed `{seed}`, during run recorded in `findings/onnx/logs/`.\n\
+         \n\
+         ---\n\
+         \n\
+         ## The case\n\
+         \n\
+         ```\n{model}\n```\n\
+         \n\
+         {minimisation}\n\
+         \n\
+         ## What each implementation produced\n\
+         \n\
+         | implementation | result |\n\
+         |---|---|\n\
+         {participants}\n\
+         \n\
+         Oracle summary: {summary}\n\
+         \n\
+         ## Reproducibility\n\
+         \n\
+         The full case is stored in the run directory, so this replays without the generator.\n\
+         \n\
+         - **generator:** `{generator}`\n\
+         - **policy:** `{policy}`\n\
+         \n\
+         ## Before this becomes a finding\n\
+         \n\
+         Work the triage ladder in order; do not skip to drafting a report.\n\
+         \n\
+         - [ ] **Does it reproduce** from the stored case, on a clean run?\n\
+         - [ ] **Is it ours?** Comparison, normalisation, an invalid model, a stray source of\n\
+               randomness. Check that `onnx.reference` accepts the model.\n\
+         - [ ] **Does the specification determine the answer?** *Retrieve the operator page — do not\n\
+               recall it.* If ONNX is silent, this is a generator rule, not a finding, and belongs in\n\
+               `known.rs` with its citation.\n\
+         - [ ] **Has it been reported already?** Search the tracker. One confirmed finding here was\n\
+               fixed upstream three weeks after our pinned release.\n\
+         - [ ] If it survives all four: rename to `FINDING-NNN-…`, write the analysis, and add a\n\
+               `problems.rs` entry so future campaigns account for it.\n",
+        signature = finding.signature,
+        seed = finding.seed,
+        model = finding.model,
+        minimisation = minimisation,
+        participants = participants,
+        summary = finding.summary,
+        generator = truncate(&finding.generator, 160),
+        policy = truncate(&finding.policy, 160),
+    );
+    std::fs::write(&path, body)?;
+    Ok(true)
+}
+
+fn truncate(text: &str, at: usize) -> String {
+    if text.chars().count() <= at {
+        return text.to_string();
+    }
+    text.chars().take(at).collect::<String>() + "…"
+}
+
 /// A campaign's log: what the run did, as opposed to what it found.
 ///
 /// **A campaign that finds nothing produces no findings and a log that is the entire result.**

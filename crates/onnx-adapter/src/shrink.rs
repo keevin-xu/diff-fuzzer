@@ -201,8 +201,17 @@ impl Shrink for OnnxCase {
         // ── The two gates ──────────────────────────────────────────────────────────
         // Strictly simpler, and valid. Everything above proposes liberally; this is where
         // anything that broke a coupling between parts of the case is discarded.
+        // **Three gates, not two.** Strictly simpler, structurally valid, and *determined* — a
+        // reduction into a case whose answer the specification does not fix produces a
+        // reproduction the project has already decided says nothing. See
+        // `known::is_undetermined`, which the generator enforces at construction and this
+        // enforces at reduction.
         let parent = complexity(self);
-        out.retain(|candidate| complexity(candidate) < parent && is_valid(candidate));
+        out.retain(|candidate| {
+            complexity(candidate) < parent
+                && is_valid(candidate)
+                && !crate::known::is_undetermined(candidate)
+        });
 
         // Distinct, so the search does not spend its budget re-testing the same case.
         out.dedup_by(|a, b| a == b);
