@@ -15,7 +15,14 @@ use onnx_adapter::roundtrip::{self, Outcome};
 use onnx_adapter::runtimes::{OrtRuntime, TractRuntime};
 use rand::RngExt;
 
-const CASES: u64 = 4000;
+/// Cases per runtime, overridable on the command line. Each case carries eight values, so the
+/// number of *judged values* is roughly eight times this minus the non-representable ones.
+fn cases() -> u64 {
+    std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(4000)
+}
 
 fn quantize(x: &[f32], scale: f32, zp: i64, target: ElemType) -> OnnxCase {
     let zp_data = match target {
@@ -68,7 +75,7 @@ fn run_all(
     let mut violations = Vec::new();
     let mut rng = SeededRng::from_seed(0);
 
-    for seed in 0..CASES {
+    for seed in 0..cases() {
         let mut rng = SeededRng::from_seed(seed);
         let target = if rng.random_bool(0.5) {
             ElemType::I8
@@ -114,6 +121,7 @@ fn main() {
     let reference = ReferenceRuntime::start().expect("reference");
 
     println!("\nquantization round trip — DequantizeLinear(QuantizeLinear(x))");
+    println!("{} cases per runtime, 8 values each", cases());
     println!("bound: scale/2, derived from the round-half-to-even rule (SPECS 2q.1/2q.2)\n");
     println!(
         "{:<14} {:>9} {:>10} {:>18} {:>10}",

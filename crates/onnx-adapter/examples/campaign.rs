@@ -45,6 +45,9 @@
 //!   --seeds A..B seed range, default 0..20000
 //!   --quantized  include the Tier Q surface (PHASE-N9); off by default, so the default IS
 //!                the baseline the quantized yield is measured against
+//!   --quantized-only  ONLY the Tier Q surface. Quantized operators are ~4.7% of a mixed
+//!                corpus, so a mixed campaign spends most of its budget on a surface already
+//!                known to be saturated.
 //! ```
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -78,12 +81,14 @@ struct Args {
     control: bool,
     announce: bool,
     quantized: bool,
+    quantized_only: bool,
 }
 
 fn parse_args() -> Args {
     let mut name = "campaign".to_string();
     let mut seeds = 0..20_000u64;
     let (mut control, mut announce, mut quantized) = (false, false, false);
+    let mut quantized_only = false;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -101,6 +106,10 @@ fn parse_args() -> Args {
             }
             "--control" => control = true,
             "--quantized" => quantized = true,
+            "--quantized-only" => {
+                quantized = true;
+                quantized_only = true;
+            }
             "--announce" => announce = true,
             other => eprintln!("ignoring unrecognised argument {other}"),
         }
@@ -112,6 +121,7 @@ fn parse_args() -> Args {
         control,
         announce,
         quantized,
+        quantized_only,
     }
 }
 
@@ -120,7 +130,24 @@ fn main() {
     // The quantized surface is a separate axis so its yield can be measured *against* the
     // Tier A/B baseline. N9.7 asks for exactly that comparison, and a rate without a baseline
     // is not a measurement.
-    let bounds = if args.quantized {
+    // **`--quantized-only` exists because of a composition problem, not a preference.**
+    //
+    // Quantized operators are 4 of 37, so they are only ~4.7% of a mixed corpus. A three-million
+    // case campaign with `--quantized` would spend roughly 95% of its compute re-testing the
+    // Tier A/B surface that N8 already measured to saturate at ~50,000 seeds — buying a bound
+    // that already exists — to collect ~69,000 judged quantized cases.
+    //
+    // Turning the other axes off spends the whole budget on the surface being measured.
+    let bounds = if args.quantized_only {
+        Bounds {
+            float_elementwise: false,
+            comparisons: false,
+            logical: false,
+            structural: false,
+            shape_input_operators: false,
+            ..Bounds::default().with_special_values().with_quantized()
+        }
+    } else if args.quantized {
         Bounds::default().with_special_values().with_quantized()
     } else {
         Bounds::default().with_special_values()

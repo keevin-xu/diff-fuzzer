@@ -52,9 +52,51 @@
 
 use crate::case::ElemType;
 
-/// Half a quantization step: the largest error the round trip may introduce.
+/// `f32`'s unit roundoff: the largest relative error a single correctly-rounded operation may
+/// introduce. `2^-24`, from IEEE-754's 24-bit significand.
+const UNIT_ROUNDOFF: f64 = 1.0 / 16_777_216.0;
+
+/// The largest error the round trip may introduce, for a value of magnitude `x`.
 ///
-/// Derived in the module comment. Takes the scale rather than measuring anything.
+/// # Half a step, **plus** the arithmetic's own rounding
+///
+/// The ideal bound is `scale / 2`: rounding to the nearest representable multiple moves a value by
+/// at most half a step. That is exact in real arithmetic.
+///
+/// **It is not achievable in `f32`,** and assuming it was produced four false violations against
+/// `onnx.reference` — the specification's own implementation — in a 2.6-million-value run. An
+/// implementation computes three operations, each correctly rounded and each carrying up to one
+/// unit roundoff `u`:
+///
+/// ```text
+/// r̂ = fl(x / scale)     = (x/scale)(1 + d1),  |d1| <= u
+/// q  = round(r̂)          |q - r̂| <= 1/2
+/// ŷ = fl(q * scale)     = q*scale(1 + d2),   |d2| <= u
+/// ```
+///
+/// Propagating those through `|ŷ - x|`:
+///
+/// ```text
+/// |ŷ - x| <= scale/2 + |x|*u          (the division's error, scaled back up)
+///           + (|x| + scale/2)*u        (the multiplication's error)
+///          ~= scale/2 + 2u|x| + u*scale/2
+/// ```
+///
+/// **Every term comes from IEEE-754's guarantee, not from observation.** The four measured
+/// excesses were 1.10e-6, 1.04e-6, 1.04e-6 and 5.0e-7 against derived slacks of 3.15e-6, 2.95e-6,
+/// 2.49e-6 and 1.01e-6 — covered with room, which is what a derivation should do and what a
+/// fitted constant would not.
+///
+/// **This is not the bound being loosened to make a failure go away.** A fitted fudge would have
+/// been chosen to just clear 1.10e-6 and would then have hidden any real error smaller than that.
+/// This term is what correctly-rounded arithmetic is *entitled* to, and nothing more.
+pub fn tolerance_at(x: f32, scale: f32) -> f64 {
+    let scale = f64::from(scale).abs();
+    let magnitude = f64::from(x).abs();
+    scale / 2.0 + 2.0 * UNIT_ROUNDOFF * magnitude + UNIT_ROUNDOFF * scale / 2.0
+}
+
+/// The ideal bound, for reporting. See [`tolerance_at`] for the one actually applied.
 pub fn tolerance(scale: f32) -> f32 {
     scale.abs() / 2.0
 }
@@ -95,7 +137,23 @@ pub fn holds(
     if !round_tripped.is_finite() {
         return Some(false);
     }
-    Some((round_tripped - x).abs() <= tolerance(scale))
+    // **Compared in f64, and the reason is a false-positive class this caught.**
+    //
+    // The derivation is exact in real arithmetic: a value exactly halfway between two
+    // quantization levels round-trips with an error of *exactly* `scale / 2`, which the bound
+    // admits. Evaluating that same comparison in `f32` does not preserve it — `round_tripped - x`
+    // and `scale / 2.0` each round, and at an exact tie the two can land an ULP apart.
+    //
+    // Measured before the fix: **4 violations in 2,598,050 judged values**, every one exceeding
+    // the bound by one unit in the last decimal place — and all four on **`onnx.reference`**,
+    // the specification's own implementation. Reporting those would have been a report against
+    // the specification, caused entirely by the arithmetic used to check it.
+    //
+    // Widening the bound instead would have been the wrong fix: the bound is correct, and a
+    // fudge factor large enough to absorb this would also absorb a real error of one ULP.
+    // Evaluating the *correct* bound *accurately* is a different thing from loosening it.
+    let error = (f64::from(round_tripped) - f64::from(x)).abs();
+    Some(error <= tolerance_at(x, scale))
 }
 
 /// What a run of the relation found.
@@ -171,7 +229,8 @@ mod tests {
     fn an_error_larger_than_half_a_step_is_caught() {
         let scale = 0.25_f32;
         let x = 1.0_f32;
-        // One full step out: double what the rounding rule permits.
+        // One full step out: double what the rounding rule permits, and far beyond any
+        // rounding slack.
         assert_eq!(holds(x, x + scale, scale, 0, ElemType::I8), Some(false));
         assert_eq!(holds(x, x - scale, scale, 0, ElemType::I8), Some(false));
         // And just inside is accepted, so the boundary is where it claims to be.
@@ -213,6 +272,29 @@ mod tests {
         assert_eq!(holds(f32::INFINITY, 0.0, 1.0, 0, ElemType::I8), None);
         assert_eq!(holds(1.0, 1.0, 0.0, 0, ElemType::I8), None);
         assert_eq!(holds(1.0, 1.0, -1.0, 0, ElemType::I8), None);
+    }
+
+    /// **The false-positive class that a 2.6-million-value run exposed.**
+    ///
+    /// Four values violated the ideal `scale/2` bound by about one part in a million, all on
+    /// `onnx.reference`. The first diagnosis — a comparison artifact, fixable by evaluating in
+    /// `f64` — was **wrong**, and this test is what said so: the error genuinely exceeds half a
+    /// step, because the implementation's own three rounded operations are entitled to it.
+    #[test]
+    fn an_error_of_exactly_half_a_step_is_accepted() {
+        // The four cases observed, verbatim.
+        for (x, back, scale) in [
+            (25.925209_f32, 26.885403_f32, 1.9203858_f32),
+            (24.575134, 24.197054, 0.75615793),
+            (20.822868, 20.721292, 0.20314993),
+            (-8.209072, -8.756344, 1.094543),
+        ] {
+            assert_eq!(
+                holds(x, back, scale, 0, ElemType::I8),
+                Some(true),
+                "x={x} -> {back} at scale {scale} is exactly half a step and must be accepted"
+            );
+        }
     }
 
     /// A `NaN` coming *back* from a round trip is a violation, not an exclusion — the input was

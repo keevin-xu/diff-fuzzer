@@ -109,6 +109,15 @@ pub const PROBLEMS: &[Problem] = &[
         operator: OpKind::Div,
         kind: Kind::Crash,
     },
+    Problem {
+        id: "P-005",
+        finding: "F-008",
+        implementation: "tract",
+        what: "DynamicQuantizeLinear adds the zero-point before rounding; the spec rounds first",
+        status: Status::Ready,
+        operator: OpKind::DynamicQuantizeLinear,
+        kind: Kind::Value,
+    },
 ];
 
 /// A campaign's grouping of signatures into problems.
