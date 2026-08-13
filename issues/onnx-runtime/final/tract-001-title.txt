@@ -1,0 +1,1 @@
+Sign(-0.0) returns -0.0 instead of 0 for float tensors

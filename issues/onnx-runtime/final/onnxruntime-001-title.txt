@@ -1,0 +1,1 @@
+Where returns +0.0 for a -0.0 selected from X (Y branch is correct)

@@ -48,6 +48,23 @@ assert** — a wrong assertion costs credibility, a well-posed question costs no
 
 ## Drafts
 
+### `tensor/`
+
 | # | Subject | Status |
 |---|---|---|
 | 001 | `burn` matmul: backends disagree when intermediate products overflow | **FILED** 2026-08-03 — [burn#5284](https://github.com/tracel-ai/burn/issues/5284) |
+
+### `onnx-runtime/`
+
+| # | Subject | Status |
+|---|---|---|
+| 001 | `tract`: `Sign(0) = 1` for integer tensors | **DO NOT FILE** — fixed on `main` by [tract#2533](https://github.com/sonos/tract/pull/2533), merged three weeks after our pinned release |
+| 002 | `Reshape` of a zero-size tensor: `tract` and candle reject what the reference and ONNX Runtime accept | **DRAFT** — a refusal is a coverage statement, not a wrong answer; neither project checked for a documented limitation |
+| 003 | candle fails on rank-0 scalars | **DRAFT** — likely close without filing; candle's coverage is openly incomplete |
+| 004 | ONNX Runtime: `Where` returns `+0.0` for a `-0.0` selected from `X` | **READY** — `final/onnxruntime-001-*` |
+| 005 | `tract`: `Sign(-0.0)` returns `-0.0` instead of `0` | **READY** — `final/tract-001-*` |
+
+**Every reproduction printed in `onnx-runtime/final/` is asserted by
+`crates/onnx-adapter/tests/published_reproductions.rs`.** A report is a claim made to somebody
+else, and it goes stale silently — bump a runtime and the file on disk still reads as true. The
+test fails first, so a stale report is corrected or withdrawn before it is sent.
