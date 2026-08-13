@@ -63,6 +63,8 @@ pub mod outcome;
 pub mod reference;
 pub mod runtimes;
 pub mod sentinel;
+pub mod shrink;
+pub mod signature;
 pub mod testing;
 pub mod timeout;
 pub mod validation;
