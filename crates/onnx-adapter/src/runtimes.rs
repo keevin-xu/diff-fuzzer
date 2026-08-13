@@ -32,6 +32,17 @@
 //! semantics-preserving, so the default is the one level a conformance comparison must not
 //! use. `tract` gets the matching treatment (`into_typed()`, not `into_optimized()`), which
 //! keeps the comparison about operator kernels rather than about two different optimizers.
+//!
+//! **Cited, not recalled:** `SPECS.md` §3.1 quotes the primary source. Two details there are
+//! easy to overstate and are not overstated here. The page says Basic optimizations *are*
+//! "semantics-preserving graph rewrites"; it does **not** say the higher levels are not — that
+//! is an absence of a guarantee, not a denial. And ONNX Runtime's own docs record an
+//! optimization that changes numeric results (GELU Approximation, "F1 ... 87.05 vs 87.03"),
+//! which is the concrete reason a conformance comparison declines the default.
+//!
+//! Running at `Disable` is the **tightening** direction and so needs only evidence it is
+//! achievable. Relaxing to `Level1` would be a loosening, and §3.1 now carries the citation
+//! that would justify it if throughput ever demanded it.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
