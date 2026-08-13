@@ -61,6 +61,7 @@ pub mod ops;
 pub mod oracle;
 pub mod outcome;
 pub mod policy;
+pub mod problems;
 pub mod reference;
 pub mod repro;
 pub mod runtimes;
