@@ -43,8 +43,8 @@ use crate::census::{Census, Support};
 /// What the runtimes claim, derived from a census.
 #[derive(Debug, Clone)]
 pub struct Capabilities {
-    claimed: BTreeSet<(String, String, ElemType)>,
-    measured: BTreeSet<(String, String, ElemType)>,
+    claimed: BTreeSet<(String, String, ElemType, usize)>,
+    measured: BTreeSet<(String, String, ElemType, usize)>,
     environment: Vec<(String, String)>,
     taken: String,
     opset: i64,
@@ -61,7 +61,12 @@ impl Capabilities {
         let mut claimed = BTreeSet::new();
         let mut measured = BTreeSet::new();
         for cell in &census.cells {
-            let key = (cell.runtime.clone(), cell.op.clone(), cell.elem_type);
+            let key = (
+                cell.runtime.clone(),
+                cell.op.clone(),
+                cell.elem_type,
+                cell.rank,
+            );
             measured.insert(key.clone());
             if cell.support == Support::Supported {
                 claimed.insert(key);
@@ -85,10 +90,22 @@ impl Capabilities {
         Ok(Self::from_census(&census))
     }
 
-    /// Does this runtime claim this operator at this element type?
-    pub fn claims(&self, runtime: &str, op: OpKind, elem: ElemType) -> bool {
-        self.claimed
-            .contains(&(runtime.to_string(), op.onnx_name().to_string(), elem))
+    /// Does this runtime claim this operator at this element type **and rank**?
+    ///
+    /// The rank is part of the key because support is a property of the combination:
+    /// candle implements `Neg` at `i64` above rank 0 and fails at rank 0. `PENDING` 1.14.
+    ///
+    /// A rank the census never probed — anything above [`crate::ops::PROBED_RANKS`] — falls
+    /// back to the **highest probed rank**, since implementations that work at rank 3 do not
+    /// generally break at rank 4, while rank 0 and 1 are the genuine boundaries.
+    pub fn claims(&self, runtime: &str, op: OpKind, elem: ElemType, rank: usize) -> bool {
+        let probed = rank.min(*crate::ops::PROBED_RANKS.last().expect("non-empty"));
+        self.claimed.contains(&(
+            runtime.to_string(),
+            op.onnx_name().to_string(),
+            elem,
+            probed,
+        ))
     }
 
     /// Was this combination ever measured?
@@ -96,9 +113,14 @@ impl Capabilities {
     /// Distinct from [`Self::claims`] on purpose. "Measured and refused" and "never measured"
     /// are different states, and collapsing them would let a gap in the census read as a
     /// statement about a runtime.
-    pub fn was_measured(&self, runtime: &str, op: OpKind, elem: ElemType) -> bool {
-        self.measured
-            .contains(&(runtime.to_string(), op.onnx_name().to_string(), elem))
+    pub fn was_measured(&self, runtime: &str, op: OpKind, elem: ElemType, rank: usize) -> bool {
+        let probed = rank.min(*crate::ops::PROBED_RANKS.last().expect("non-empty"));
+        self.measured.contains(&(
+            runtime.to_string(),
+            op.onnx_name().to_string(),
+            elem,
+            probed,
+        ))
     }
 
     /// **The question N5 asks.** A runtime failed on a case — may that be reported as a crash?
@@ -106,8 +128,14 @@ impl Capabilities {
     /// Only when the runtime claimed the operator. Everything else, including an unmeasured
     /// combination, is a legitimate skip. One-way by construction: this can promote a failure
     /// to a finding but never excuse one.
-    pub fn failure_is_reportable(&self, runtime: &str, op: OpKind, elem: ElemType) -> bool {
-        self.claims(runtime, op, elem)
+    pub fn failure_is_reportable(
+        &self,
+        runtime: &str,
+        op: OpKind,
+        elem: ElemType,
+        rank: usize,
+    ) -> bool {
+        self.claims(runtime, op, elem, rank)
     }
 
     /// Which element types a runtime was ever measured to handle successfully.
@@ -122,8 +150,8 @@ impl Capabilities {
     pub fn representable_types(&self, runtime: &str) -> BTreeSet<ElemType> {
         self.claimed
             .iter()
-            .filter(|(r, _, _)| r == runtime)
-            .map(|(_, _, elem)| *elem)
+            .filter(|(r, _, _, _)| r == runtime)
+            .map(|(_, _, elem, _)| *elem)
             .collect()
     }
 
@@ -151,12 +179,18 @@ impl Capabilities {
 
     /// The runtimes the census covered.
     pub fn runtimes(&self) -> BTreeSet<&str> {
-        self.measured.iter().map(|(r, _, _)| r.as_str()).collect()
+        self.measured
+            .iter()
+            .map(|(r, _, _, _)| r.as_str())
+            .collect()
     }
 
     /// How many combinations this runtime claims.
     pub fn claim_count(&self, runtime: &str) -> usize {
-        self.claimed.iter().filter(|(r, _, _)| r == runtime).count()
+        self.claimed
+            .iter()
+            .filter(|(r, _, _, _)| r == runtime)
+            .count()
     }
 
     /// Whether this matrix was taken under a different environment than the one now running.
@@ -286,8 +320,15 @@ where
         // The element type the census keyed on — **not** `inputs[0]`, which for `Where` is the
         // boolean condition rather than the data type. See `ops::data_elem_type`.
         let elem = crate::ops::data_elem_type(input);
+        // And the rank, for the same reason the element type is keyed: support is a property of
+        // the combination. Taken from the data input rather than `inputs[0]`, which for the
+        // shape-input operators is not the tensor whose rank the operator works on.
+        let rank = crate::ops::data_rank(input);
 
-        if self.capabilities.claims(self.inner.name(), input.op, elem) {
+        if self
+            .capabilities
+            .claims(self.inner.name(), input.op, elem, rank)
+        {
             // It claims the operator and still refused this case. That is a statement about
             // *this input*, and stays a comparable value — rows-versus-error was one of the SQL
             // domain's most productive signals.
@@ -295,7 +336,7 @@ where
         } else {
             Ok(OnnxOutcome::Unsupported {
                 reason: format!(
-                    "{} does not implement {} at {elem:?} (census {}): {}",
+                    "{} does not implement {} at {elem:?} rank {rank} (census {}): {}",
                     self.inner.name(),
                     input.op.onnx_name(),
                     self.capabilities.taken(),
@@ -326,13 +367,13 @@ mod tests {
         let caps = sample();
 
         // ONNX Runtime answered `Add` on f32 in the census, so it claims it.
-        assert!(caps.claims("onnxruntime", OpKind::Add, ElemType::F32));
-        assert!(caps.failure_is_reportable("onnxruntime", OpKind::Add, ElemType::F32));
+        assert!(caps.claims("onnxruntime", OpKind::Add, ElemType::F32, 2));
+        assert!(caps.failure_is_reportable("onnxruntime", OpKind::Add, ElemType::F32, 2));
 
         // It declined `Where` on bool — measured, but not a claim.
-        assert!(caps.was_measured("onnxruntime", OpKind::Where, ElemType::Bool));
-        assert!(!caps.claims("onnxruntime", OpKind::Where, ElemType::Bool));
-        assert!(!caps.failure_is_reportable("onnxruntime", OpKind::Where, ElemType::Bool));
+        assert!(caps.was_measured("onnxruntime", OpKind::Where, ElemType::Bool, 2));
+        assert!(!caps.claims("onnxruntime", OpKind::Where, ElemType::Bool, 2));
+        assert!(!caps.failure_is_reportable("onnxruntime", OpKind::Where, ElemType::Bool, 2));
     }
 
     /// An unmeasured combination is treated as *not claimed*. The safe direction: an absent
@@ -343,12 +384,14 @@ mod tests {
         assert!(!caps.was_measured(
             "a-runtime-that-was-not-in-the-census",
             OpKind::Add,
-            ElemType::F32
+            ElemType::F32,
+            2
         ));
         assert!(!caps.failure_is_reportable(
             "a-runtime-that-was-not-in-the-census",
             OpKind::Add,
-            ElemType::F32
+            ElemType::F32,
+            2
         ));
     }
 
@@ -359,8 +402,8 @@ mod tests {
         let caps = sample();
         // Sqrt has no integer probe at all — the specification forbids it — so it was never
         // measured, as opposed to having been measured and refused.
-        assert!(!caps.was_measured("tract", OpKind::Sqrt, ElemType::I64));
-        assert!(!caps.claims("tract", OpKind::Sqrt, ElemType::I64));
+        assert!(!caps.was_measured("tract", OpKind::Sqrt, ElemType::I64, 2));
+        assert!(!caps.claims("tract", OpKind::Sqrt, ElemType::I64, 2));
     }
 
     /// A stale matrix must be detectable. Classifying crashes against versions that are no
@@ -592,7 +635,7 @@ mod tests {
             eprintln!("note: no census at {path}; run the n2_census example to generate it");
             return;
         };
-        assert!(stored.claims("onnxruntime", OpKind::Add, ElemType::F32));
+        assert!(stored.claims("onnxruntime", OpKind::Add, ElemType::F32, 2));
         assert!(stored.opset() > 0);
     }
 }

@@ -82,12 +82,28 @@ impl Support {
 pub struct Cell {
     pub op: String,
     pub elem_type: ElemType,
+    /// The rank the probe was built at.
+    ///
+    /// **Support is a property of the combination, not of the operator.** Probing one shape
+    /// made this field look unnecessary until candle was found to implement `Neg` at `i64`
+    /// above rank 0 and fail at rank 0 — recorded as a claim, reached by the generator, and
+    /// reported as a divergence against three runtimes that agreed. `PENDING` 1.14.
+    ///
+    /// Defaulted on load so a census taken before this field existed still parses; it is
+    /// treated as the rank that version probed.
+    #[serde(default = "legacy_rank")]
+    pub rank: usize,
     pub runtime: String,
     pub support: Support,
     /// The runtime's own words, when it declined. Kept because *why* a runtime refused is
     /// what turns a cell into an investigation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// The rank a census taken before ranks existed was probed at.
+fn legacy_rank() -> usize {
+    2
 }
 
 /// The whole matrix, plus what produced it.
@@ -103,15 +119,27 @@ pub struct Census {
 }
 
 impl Census {
-    /// Which runtimes produced a result for this operator and element type.
+    /// Which runtimes produced a result for this operator and element type, **at any rank**.
+    ///
+    /// Deliberately rank-agnostic: this feeds the go/no-go bar, which asks whether an operator
+    /// is testable at all. The per-rank detail is what [`crate::capability`] keys on.
     pub fn supporting(&self, op: OpKind, elem: ElemType) -> Vec<&str> {
-        self.cells
+        // **Distinct runtimes, not distinct cells.** Once the census gained a rank axis there
+        // were four cells per (operator, type, runtime), and returning them all made one
+        // runtime count as four supporters — which silently lifted the go/no-go bar from 0 to
+        // 33 operators "supported by three participants" with only two participants present.
+        // Caught by the negative control that exists to prove the bar can fail.
+        let mut runtimes: Vec<&str> = self
+            .cells
             .iter()
             .filter(|c| {
                 c.op == op.onnx_name() && c.elem_type == elem && c.support == Support::Supported
             })
             .map(|c| c.runtime.as_str())
-            .collect()
+            .collect();
+        runtimes.sort_unstable();
+        runtimes.dedup();
+        runtimes
     }
 
     /// Operators supported by at least `n` participants at **at least one** element type.
@@ -223,8 +251,9 @@ pub fn take(
 ) -> Census {
     let mut cells = Vec::new();
 
-    for (op, elem) in ops::candidates(opset) {
-        let case = ops::probe(op, elem, opset).expect("candidates only yields buildable pairs");
+    for (op, elem, rank) in ops::candidates_by_rank(opset) {
+        let case = ops::probe_at(op, elem, opset, rank)
+            .expect("candidates_by_rank only yields buildable cells");
         // Derived from the case by the same function the capability model uses, rather than
         // taken from the loop variable. Two paths computing a key independently is how they
         // come to disagree — and for `Where` they did, since its first input is the boolean
@@ -247,6 +276,7 @@ pub fn take(
             cells.push(Cell {
                 op: op.onnx_name().to_string(),
                 elem_type: elem,
+                rank,
                 runtime: runtime.name().to_string(),
                 support: Support::from(&outcome),
                 detail,
@@ -306,14 +336,41 @@ mod tests {
         assert_eq!(MIN_PARTICIPANTS, 3);
     }
 
-    /// A census over two runtimes must produce one cell per candidate pair per runtime —
-    /// no silent drops.
+    /// A census over two runtimes must produce one cell per candidate **cell** per runtime —
+    /// no silent drops. Keyed by rank as well as element type since `PENDING` 1.14.
     #[test]
     fn the_census_covers_every_candidate() {
         let census = take(&[&OrtRuntime, &TractRuntime], OPSET);
-        assert_eq!(census.cells.len(), ops::candidates(OPSET).len() * 2);
+        assert_eq!(census.cells.len(), ops::candidates_by_rank(OPSET).len() * 2);
         assert_eq!(census.runtimes, vec!["onnxruntime", "tract"]);
         assert!(!census.taken.is_empty());
+    }
+
+    /// **The bug the negative control caught.** Adding the rank axis multiplied the cells per
+    /// (operator, type, runtime) by four; `supporting` returned each of them, so one runtime
+    /// counted as four supporters and a two-participant census claimed 33 operators supported
+    /// by three. A count of supporters must count *runtimes*.
+    #[test]
+    fn supporting_counts_runtimes_not_cells() {
+        let census = take(&[&OrtRuntime, &TractRuntime], OPSET);
+        for op in OpKind::ALL {
+            for elem in ElemType::ALL {
+                let supporters = census.supporting(op, elem);
+                let mut unique = supporters.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                assert_eq!(
+                    supporters.len(),
+                    unique.len(),
+                    "{op:?}/{elem:?} counted a runtime more than once"
+                );
+                assert!(
+                    supporters.len() <= 2,
+                    "{op:?}/{elem:?} reports {} supporters from a 2-runtime census",
+                    supporters.len()
+                );
+            }
+        }
     }
 
     /// The verdict must be computable and must *fail* when it should. Two runtimes cannot

@@ -431,6 +431,19 @@ fn i64_input(case: &OnnxCase, index: usize) -> Vec<i64> {
     }
 }
 
+/// The rank of the tensor whose shape the operator actually works on.
+///
+/// The companion to [`data_elem_type`], and keyed the same way for the same reason: for the
+/// shape-input operators, `inputs[0]` is not always the tensor the operator's support depends
+/// on. Defined once so the census and the capability lookup cannot compute it differently —
+/// which they did for the element type, and it took a `Where` misclassification to notice.
+pub fn data_rank(case: &OnnxCase) -> usize {
+    case.inputs
+        .iter()
+        .find(|input| !input.is_initializer())
+        .map_or(0, |input| input.dims.len())
+}
+
 /// The element type a case is *about* — the one the census keys on.
 ///
 /// # Why this is a function and not `inputs[0].elem_type()`
@@ -497,25 +510,80 @@ pub fn required_elem_types(case: &OnnxCase) -> Vec<ElemType> {
 /// would confuse that with "does it handle `NaN` correctly" — a different question, asked by
 /// the generator at N3.
 pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
+    probe_at(op, elem, opset, 2)
+}
+
+/// The ranks the census probes.
+///
+/// # Why more than one
+///
+/// The census originally probed every operator at exactly `[2, 3]` — one shape, rank 2. That
+/// made *support* look like a property of (operator, element type), and it is not: candle
+/// implements `Neg` at `i64` **above rank 0 and fails at rank 0**, so the census recorded a
+/// claim, the generator reached rank 0, and the refusal was reported as a divergence against
+/// three runtimes that agreed. It looked exactly like a finding.
+///
+/// This is the same class the census already fixed once for element types: **support is a
+/// property of the combination**, and a census scoped more narrowly than the generator
+/// misclassifies whatever the generator reaches and the census did not. `PENDING` 1.14.
+///
+/// Rank 0 and rank 1 are the boundaries where implementations actually differ; rank 3 checks
+/// that nothing degrades above the probed shape.
+pub const PROBED_RANKS: [usize; 4] = [0, 1, 2, 3];
+
+/// A representative shape at the given rank.
+fn shape_at(rank: usize) -> Vec<i64> {
+    match rank {
+        0 => vec![],
+        1 => vec![3],
+        2 => vec![2, 3],
+        _ => vec![2, 3, 2],
+    }
+}
+
+/// Build a probe at a specific rank.
+///
+/// `None` means the combination cannot be built — either the schema forbids the element type,
+/// or the family is not expressible at that rank (`Transpose` of a scalar, `Concat` with no
+/// axis to join along). Both are **specification** facts, not capability ones.
+pub fn probe_at(op: OpKind, elem: ElemType, opset: i64, rank: usize) -> Option<OnnxCase> {
     let spec = spec(op);
     if !spec.data_types.contains(&elem) || opset < spec.since {
         return None;
     }
+    let dims = shape_at(rank);
+    let count: i64 = dims.iter().product::<i64>().max(1);
+
+    // Families that need an axis, a permutation, or a dimension to remove cannot be built
+    // against a scalar. Declining to build is the honest answer; inventing a rank-1 stand-in
+    // would record a rank-0 claim that was never measured at rank 0.
+    let needs_an_axis = matches!(
+        spec.family,
+        Family::Transpose
+            | Family::Concat
+            | Family::Gather
+            | Family::Squeeze
+            | Family::Slice
+            | Family::Pad
+    );
+    if rank == 0 && needs_an_axis {
+        return None;
+    }
 
     let case = match spec.family {
-        Family::UnaryElementwise => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)]),
+        Family::UnaryElementwise => OnnxCase::new(op, opset, vec![data("a", &dims, elem, 0)]),
         Family::BinaryElementwise | Family::Comparison => OnnxCase::new(
             op,
             opset,
-            vec![data("a", &[2, 3], elem, 0), data("b", &[2, 3], elem, 1)],
+            vec![data("a", &dims, elem, 0), data("b", &dims, elem, 1)],
         ),
         Family::Select => OnnxCase::new(
             op,
             opset,
             vec![
-                data("a", &[2, 3], ElemType::Bool, 0),
-                data("b", &[2, 3], elem, 1),
-                data("c", &[2, 3], elem, 2),
+                data("a", &dims, ElemType::Bool, 0),
+                data("b", &dims, elem, 1),
+                data("c", &dims, elem, 2),
             ],
         ),
         Family::Cast => {
@@ -526,33 +594,34 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             } else {
                 ElemType::I64
             };
-            OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)])
+            OnnxCase::new(op, opset, vec![data("a", &dims, elem, 0)])
                 .with_attrs(Attrs::new().int("to", i64::from(target.wire())))
         }
         Family::Reshape => OnnxCase::new(
             op,
             opset,
             vec![
-                data("a", &[2, 3], elem, 0),
-                TensorValue::new("b", vec![2], TensorData::I64(vec![3, 2])).as_initializer(),
+                data("a", &dims, elem, 0),
+                // Flattened to rank 1, so the element count matches at any input rank.
+                TensorValue::new("b", vec![1], TensorData::I64(vec![count])).as_initializer(),
             ],
         ),
-        Family::Transpose => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)])
-            .with_attrs(Attrs::new().ints("perm", vec![1, 0])),
+        Family::Transpose => OnnxCase::new(op, opset, vec![data("a", &dims, elem, 0)])
+            .with_attrs(Attrs::new().ints("perm", (0..dims.len() as i64).rev().collect())),
         Family::Concat => OnnxCase::new(
             op,
             opset,
-            vec![data("a", &[2, 3], elem, 0), data("b", &[2, 3], elem, 1)],
+            vec![data("a", &dims, elem, 0), data("b", &dims, elem, 1)],
         )
         .with_attrs(Attrs::new().int("axis", 0)),
         Family::Gather => OnnxCase::new(
             op,
             opset,
             vec![
-                data("a", &[3, 2], elem, 0),
+                data("a", &dims, elem, 0),
                 // `Gather`'s indices are genuinely data — they select, and their *values*
-                // decide the answer — so they stay a fed input.
-                TensorValue::new("b", vec![2], TensorData::I64(vec![0, 2])),
+                // decide the answer — so they stay a fed input. Index 0 exists at any rank.
+                TensorValue::new("b", vec![1], TensorData::I64(vec![0])),
             ],
         )
         .with_attrs(Attrs::new().int("axis", 0)),
@@ -561,7 +630,7 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             opset,
             vec![
                 // A length-1 dimension, since that is the only kind `Squeeze` may remove.
-                data("a", &[1, 3], elem, 0),
+                data("a", &squeezable(&dims), elem, 0),
                 TensorValue::new("b", vec![1], TensorData::I64(vec![0])).as_initializer(),
             ],
         ),
@@ -569,32 +638,45 @@ pub fn probe(op: OpKind, elem: ElemType, opset: i64) -> Option<OnnxCase> {
             op,
             opset,
             vec![
-                data("a", &[3], elem, 0),
+                data("a", &dims, elem, 0),
                 TensorValue::new("b", vec![1], TensorData::I64(vec![0])).as_initializer(),
             ],
         ),
-        Family::Shape | Family::Size => OnnxCase::new(op, opset, vec![data("a", &[2, 3], elem, 0)]),
+        Family::Shape | Family::Size => OnnxCase::new(op, opset, vec![data("a", &dims, elem, 0)]),
         Family::Slice => OnnxCase::new(
             op,
             opset,
             vec![
-                data("a", &[4], elem, 0),
-                TensorValue::new("b", vec![1], TensorData::I64(vec![1])).as_initializer(),
-                TensorValue::new("c", vec![1], TensorData::I64(vec![3])).as_initializer(),
+                data("a", &dims, elem, 0),
+                // A slice of [0, 1) along axis 0 is non-empty at every rank the probe builds.
+                TensorValue::new("b", vec![1], TensorData::I64(vec![0])).as_initializer(),
+                TensorValue::new("c", vec![1], TensorData::I64(vec![1])).as_initializer(),
             ],
         ),
         Family::Pad => OnnxCase::new(
             op,
             opset,
             vec![
-                data("a", &[2], elem, 0),
+                data("a", &dims, elem, 0),
                 // `pads` is [begin.., end..], so 2 * rank entries.
-                TensorValue::new("b", vec![2], TensorData::I64(vec![1, 1])).as_initializer(),
+                TensorValue::new(
+                    "b",
+                    vec![2 * dims.len() as i64],
+                    TensorData::I64(vec![1; 2 * dims.len()]),
+                )
+                .as_initializer(),
             ],
         )
         .with_attrs(Attrs::new().string("mode", "constant")),
     };
     Some(case)
+}
+
+/// A shape with a length-1 dimension, which is the only kind `Squeeze` may remove.
+fn squeezable(dims: &[i64]) -> Vec<i64> {
+    let mut shape = dims.to_vec();
+    shape[0] = 1;
+    shape
 }
 
 /// Ordinary, distinct values of the requested type.
@@ -624,12 +706,33 @@ pub fn candidates(opset: i64) -> Vec<(OpKind, ElemType)> {
     let mut pairs = Vec::new();
     for op in OpKind::ALL {
         for elem in ElemType::ALL {
-            if probe(op, elem, opset).is_some() {
+            if PROBED_RANKS
+                .iter()
+                .any(|rank| probe_at(op, elem, opset, *rank).is_some())
+            {
                 pairs.push((op, elem));
             }
         }
     }
     pairs
+}
+
+/// Every (operator, element type, rank) the specification permits at `opset`.
+///
+/// The census's real candidate list. Wider than [`candidates`] because support is a property
+/// of the combination — see [`PROBED_RANKS`].
+pub fn candidates_by_rank(opset: i64) -> Vec<(OpKind, ElemType, usize)> {
+    let mut cells = Vec::new();
+    for op in OpKind::ALL {
+        for elem in ElemType::ALL {
+            for rank in PROBED_RANKS {
+                if probe_at(op, elem, opset, rank).is_some() {
+                    cells.push((op, elem, rank));
+                }
+            }
+        }
+    }
+    cells
 }
 
 #[cfg(test)]
@@ -733,15 +836,15 @@ mod tests {
         expect(OpKind::Identity, vec![2, 3]);
         expect(OpKind::Add, vec![2, 3]);
         expect(OpKind::Transpose, vec![3, 2]); // perm [1,0]
-        expect(OpKind::Reshape, vec![3, 2]); // shape input [3,2]
+        expect(OpKind::Reshape, vec![6]); // flattened, so the probe builds at any rank
         expect(OpKind::Concat, vec![4, 3]); // two [2,3] along axis 0
-        expect(OpKind::Gather, vec![2, 2]); // [3,2] indexed by [2] on axis 0
+        expect(OpKind::Gather, vec![1, 3]); // [2,3] indexed by [1] on axis 0
         expect(OpKind::Squeeze, vec![3]); // [1,3] minus axis 0
-        expect(OpKind::Unsqueeze, vec![1, 3]); // [3] plus a 1 at axis 0
+        expect(OpKind::Unsqueeze, vec![1, 2, 3]); // [2,3] plus a 1 at axis 0
         expect(OpKind::Shape, vec![2]); // rank of [2,3]
         expect(OpKind::Size, vec![]); // a scalar, rank 0
-        expect(OpKind::Slice, vec![2]); // [4] sliced 1..3
-        expect(OpKind::Pad, vec![4]); // [2] padded 1 each side
+        expect(OpKind::Slice, vec![1, 3]); // [2,3] sliced 0..1 on axis 0
+        expect(OpKind::Pad, vec![4, 5]); // [2,3] padded 1 on every side
         expect(OpKind::Where, vec![2, 3]);
     }
 
