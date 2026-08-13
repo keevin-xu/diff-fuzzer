@@ -182,6 +182,30 @@ impl diff_fuzzer_core::Normalizer for OnnxNormalizer {
     }
 }
 
+/// How two results agreed — because *why* they agreed decides whether the case counts.
+///
+/// # Why a bool was not enough
+///
+/// `06-ORACLES-AND-LEGAL-DIFFERENCES.md` §6 forbids reporting a **licensed** difference as
+/// `Agree`: a licensed difference is `Skipped`. The reasoning is the same one behind
+/// `SkipReason::NothingComparable` and `Unjudgeable` in the engine — a rule that *excuses* a
+/// difference has not verified anything, and counting it as a pass inflates what a campaign
+/// appears to prove. The tensor domain measured that exact failure: 96% of its `matmul` cases
+/// carried a bound nothing could fail, and six hours of fuzzing reported agreement rather than
+/// "could not judge".
+///
+/// So the comparison reports three states, not two. `ByLicense` means the two results differed
+/// in bits and a rule in the special-value table forgave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agreement {
+    /// Identical bit patterns, or the same non-tensor outcome kind. Real evidence.
+    Exactly,
+    /// Agreed **only** because a rule licensed the difference away. Not evidence.
+    ByLicense,
+    /// Did not agree.
+    No,
+}
+
 /// How two values of the same element type compare, before any tolerance is considered.
 ///
 /// # The table, and the one row that is a *loosening*
@@ -208,13 +232,13 @@ impl diff_fuzzer_core::Normalizer for OnnxNormalizer {
 /// achievable, which every measurement so far provides: all four participants agree on the sign
 /// of zero everywhere it has been observed. Loosening it later would need a citation; adopting
 /// it now does not. `PENDING` 1.6.
-fn values_agree(elem: ElemType, left: u64, right: u64) -> bool {
+fn values_agree(elem: ElemType, left: u64, right: u64) -> Agreement {
     if left == right {
-        return true;
+        return Agreement::Exactly;
     }
     // Only the floating types have values that differ in bits while agreeing in meaning.
     if !elem.is_floating() {
-        return false;
+        return Agreement::No;
     }
     let (a, b) = match elem {
         ElemType::F32 => (
@@ -229,40 +253,81 @@ fn values_agree(elem: ElemType, left: u64, right: u64) -> bool {
     // keeps `+0.0` vs `−0.0` a disagreement. Comparing with `==` here instead would silently
     // make them agree, since `-0.0 == 0.0` is true, and that is precisely the blind spot the
     // tensor domain documented.
-    a.is_nan() && b.is_nan()
+    if a.is_nan() && b.is_nan() {
+        Agreement::ByLicense
+    } else {
+        Agreement::No
+    }
 }
 
-/// Whether two canonical tensors agree under the special-value table.
-fn tensors_agree(left: &[CanonTensor], right: &[CanonTensor]) -> bool {
+/// Whether two canonical tensors agree under the special-value table, **and how**.
+fn tensors_agree(left: &[CanonTensor], right: &[CanonTensor]) -> Agreement {
     if left.len() != right.len() {
-        return false;
+        return Agreement::No;
     }
-    left.iter().zip(right.iter()).all(|(a, b)| {
+    let mut verdict = Agreement::Exactly;
+    for (a, b) in left.iter().zip(right.iter()) {
         // Shape and element type are structural: no rule in the table can absorb a difference
         // in either, and neither can any tolerance.
-        a.dims == b.dims
-            && a.elem_type == b.elem_type
-            && a.bits.len() == b.bits.len()
-            && a.bits
-                .iter()
-                .zip(b.bits.iter())
-                .all(|(x, y)| values_agree(a.elem_type, *x, *y))
-    })
+        if a.dims != b.dims || a.elem_type != b.elem_type || a.bits.len() != b.bits.len() {
+            return Agreement::No;
+        }
+        for (x, y) in a.bits.iter().zip(b.bits.iter()) {
+            match values_agree(a.elem_type, *x, *y) {
+                Agreement::No => return Agreement::No,
+                // One licensed element is enough to taint the whole comparison: the case can
+                // no longer be said to have been judged, even if every other element matched
+                // bit for bit.
+                Agreement::ByLicense => verdict = Agreement::ByLicense,
+                Agreement::Exactly => {}
+            }
+        }
+    }
+    verdict
 }
 
 /// Compare two canonical results for the purposes of the oracle.
 ///
 /// A free function rather than relying on `==` alone, because **what counts as equal is a
 /// policy decision** and it should live in one place.
-pub fn equivalent(left: &Canonical, right: &Canonical) -> bool {
+pub fn compare(left: &Canonical, right: &Canonical) -> Agreement {
     if left.kind != right.kind {
-        return false;
+        return Agreement::No;
     }
     match left.kind {
         // Message text is not comparable across implementations; the *kind* is.
-        "rejected" | "unsupported" | "crashed" | "timed-out" => true,
+        "rejected" | "unsupported" | "crashed" | "timed-out" => Agreement::Exactly,
         _ => tensors_agree(&left.tensors, &right.tensors),
     }
+}
+
+/// How many elements agreed **only because a rule forgave the difference**.
+///
+/// Reported into the skip reason so the record says how much of the case went unjudged, rather
+/// than merely that some of it did.
+pub fn licensed_elements(left: &Canonical, right: &Canonical) -> usize {
+    left.tensors
+        .iter()
+        .zip(right.tensors.iter())
+        .map(|(a, b)| {
+            if a.elem_type != b.elem_type || a.bits.len() != b.bits.len() {
+                return 0;
+            }
+            a.bits
+                .iter()
+                .zip(b.bits.iter())
+                .filter(|(x, y)| values_agree(a.elem_type, **x, **y) == Agreement::ByLicense)
+                .count()
+        })
+        .sum()
+}
+
+/// Whether two canonical results agree at all, discarding *how*.
+///
+/// Grouping participants only needs the yes/no; the oracle asks `compare` separately for the
+/// distinction that decides `Agree` versus `Skipped`.
+pub fn equivalent(left: &Canonical, right: &Canonical) -> bool {
+    compare(left, right) != Agreement::No
 }
 
 #[cfg(test)]

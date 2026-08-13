@@ -50,6 +50,7 @@ pub mod capability;
 pub mod case;
 pub mod census;
 pub mod environment;
+pub mod findings;
 pub mod gen_shape;
 pub mod gen_value;
 pub mod generator;

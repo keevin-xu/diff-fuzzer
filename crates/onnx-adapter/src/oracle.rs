@@ -33,7 +33,7 @@ use diff_fuzzer_core::report::Divergence;
 use diff_fuzzer_core::traits::{NamedOutput, Oracle, SkipReason, Verdict};
 
 use crate::case::OnnxCase;
-use crate::normalize::{Canonical, equivalent};
+use crate::normalize::{Agreement, Canonical, compare, equivalent, licensed_elements};
 
 /// The differential oracle for ONNX runtimes.
 #[derive(Debug, Clone, Copy, Default)]
@@ -109,6 +109,27 @@ impl Oracle for OnnxOracle {
                     .map(|o| o.output.tensors.iter().map(|t| t.bits.len()).sum())
                     .unwrap_or(0);
                 return Verdict::Skipped(SkipReason::NothingComparable { elements });
+            }
+
+            // ── 5. A licensed difference is not a pass ─────────────────────────────
+            // The participants landed in one group, but some pair got there only because a
+            // rule in the special-value table forgave a difference in their bits. Nothing was
+            // verified about that case, so it is recorded as unjudged.
+            //
+            // **This check sits after the defect check on purpose.** A crash alongside a
+            // licensed difference must still be reported — the licence excuses the difference
+            // it names, never the complaint standing next to it. Step 1 has already returned
+            // by the time control reaches here, which is what makes that ordering structural
+            // rather than a matter of remembering it.
+            let first = &comparable[0].output;
+            let licensed: usize = comparable
+                .iter()
+                .filter(|o| compare(first, &o.output) == Agreement::ByLicense)
+                .map(|o| licensed_elements(first, &o.output))
+                .max()
+                .unwrap_or(0);
+            if licensed > 0 {
+                return Verdict::Skipped(SkipReason::NothingComparable { elements: licensed });
             }
             return Verdict::Agree;
         }
@@ -491,6 +512,66 @@ mod tests {
         assert!(
             rendered.contains("80000000"),
             "the negative-zero bit pattern must be visible: {rendered}"
+        );
+    }
+
+    /// **The licensed-difference ordering.** Two runtimes producing `NaN`s with different
+    /// payloads agree under the special-value table — but the table *forgave* that difference
+    /// rather than verifying anything, so the case must be recorded as unjudged.
+    ///
+    /// Reporting it as `Agree` would make an excused difference look like evidence of
+    /// correctness, which is the failure `SkipReason::Unjudgeable` exists to document.
+    #[test]
+    fn a_licensed_difference_is_skipped_not_agreed() {
+        // Same value in element 0, two different `NaN` payloads in element 1.
+        let quiet = f32::from_bits(0x7fc0_0000);
+        let other = f32::from_bits(0x7fc0_1234);
+        let outputs = vec![
+            answered("ort", vec![1.0, quiet]),
+            answered("tract", vec![1.0, other]),
+        ];
+        assert_eq!(
+            OnnxOracle.check(&case(), &outputs),
+            Verdict::Skipped(SkipReason::NothingComparable { elements: 1 }),
+            "an excused difference is not a pass"
+        );
+    }
+
+    /// The other half of the ordering: a licence excuses the difference it names, never a
+    /// complaint standing beside it. A crash alongside a licensed difference still diverges.
+    #[test]
+    fn a_licence_does_not_excuse_a_crash_beside_it() {
+        let quiet = f32::from_bits(0x7fc0_0000);
+        let other = f32::from_bits(0x7fc0_1234);
+        let outputs = vec![
+            answered("ort", vec![1.0, quiet]),
+            answered("tract", vec![1.0, other]),
+            named(
+                "candle",
+                OnnxOutcome::Crashed {
+                    detail: "boom".into(),
+                },
+            ),
+        ];
+        let Verdict::Diverged(divergence) = OnnxOracle.check(&case(), &outputs) else {
+            panic!("the crash must survive the licence");
+        };
+        assert!(divergence.summary.contains("candle"));
+    }
+
+    /// And a licence must not rescue a real disagreement: agreeing about a `NaN` in one
+    /// element says nothing about a numeric difference in another.
+    #[test]
+    fn a_licence_does_not_absorb_a_real_disagreement() {
+        let quiet = f32::from_bits(0x7fc0_0000);
+        let other = f32::from_bits(0x7fc0_1234);
+        let outputs = vec![
+            answered("ort", vec![1.0, quiet]),
+            answered("tract", vec![2.0, other]),
+        ];
+        assert!(
+            matches!(OnnxOracle.check(&case(), &outputs), Verdict::Diverged(_)),
+            "a forgiven NaN must not forgive the number next to it"
         );
     }
 

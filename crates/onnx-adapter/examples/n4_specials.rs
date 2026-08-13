@@ -13,6 +13,8 @@
 //! Run with:
 //!   cargo run --release -p onnx-adapter --example n4_specials --features candle
 
+use diff_fuzzer_core::axes::GenerationAxes;
+use onnx_adapter::findings::{FindingsLog, StoredFinding};
 use std::collections::BTreeMap;
 
 use diff_fuzzer_core::Normalizer;
@@ -49,6 +51,16 @@ fn main() {
         ("special values on", Bounds::default().with_special_values()),
     ] {
         let generator = OnnxGenerator::new(bounds.clone());
+        let mut log = FindingsLog::open(format!(
+            "{}/divergences-{}.jsonl",
+            onnx_adapter::FINDINGS_ROOT,
+            if bounds.special_values {
+                "specials"
+            } else {
+                "baseline"
+            }
+        ))
+        .expect("opening the findings log");
         let (mut judged, mut agreed, mut diverged, mut skipped, mut degenerate) = (0, 0, 0, 0, 0);
         let mut signatures: BTreeMap<String, usize> = BTreeMap::new();
         // How often the one loosening actually decides a case.
@@ -108,9 +120,23 @@ fn main() {
                 Verdict::Diverged(d) => {
                     diverged += 1;
                     judged += 1;
-                    *signatures
-                        .entry(format!("{} | {}", case.op.onnx_name(), d.summary))
-                        .or_default() += 1;
+                    let signature = format!("{} | {}", case.op.onnx_name(), d.summary);
+                    *signatures.entry(signature.clone()).or_default() += 1;
+
+                    // **The gate asks for divergences logged, not for a log that works.** One
+                    // record per distinct signature, each carrying the whole serialized case —
+                    // so a reader six months from now can replay it without this generator, and
+                    // without trusting that seed 901 still means what it meant today.
+                    let finding = StoredFinding::new(
+                        signature,
+                        d.summary.clone(),
+                        seed,
+                        bounds.description(),
+                        case.clone(),
+                        d.outputs.clone(),
+                    );
+                    log.record(&finding)
+                        .expect("writing a finding must not fail");
                 }
                 Verdict::Skipped(_) => skipped += 1,
             }
@@ -138,6 +164,7 @@ fn main() {
             "    of which the bit patterns DIFFER: {nan_differing_bits}  <- the loosening firing"
         );
         println!("  distinct divergence signatures: {}", signatures.len());
+        println!("  recorded in the findings log:   {}", log.distinct());
         for (sig, n) in signatures.iter().take(12) {
             println!("    {n:>4}x  {sig}");
         }
