@@ -106,7 +106,13 @@ fn value_info(name: &str, elem: ElemType, dims: &[i64]) -> ValueInfoProto {
 pub fn build(case: &OnnxCase) -> ModelProto {
     let node = NodeProto {
         input: case.inputs.iter().map(|t| t.name.clone()).collect(),
-        output: vec![OnnxCase::OUTPUT_NAME.to_owned()],
+        output: std::iter::once(OnnxCase::OUTPUT_NAME.to_owned())
+            .chain(
+                crate::ops::extra_outputs(case)
+                    .into_iter()
+                    .map(|(name, _, _)| name.to_owned()),
+            )
+            .collect(),
         name: Some(format!("{}_0", case.op.onnx_name().to_lowercase())),
         op_type: Some(case.op.onnx_name().to_owned()),
         // Order is preserved from the case, which is what keeps serialization
@@ -134,7 +140,13 @@ pub fn build(case: &OnnxCase) -> ModelProto {
         // Configuration inputs — shape vectors, axis lists, pad amounts — are baked in, so a
         // runtime doing static shape inference can see them at load time. See `InputRole`.
         initializer: case.initializers().map(tensor_proto).collect(),
-        output: vec![value_info(OnnxCase::OUTPUT_NAME, elem_type, &output_dims)],
+        output: std::iter::once(value_info(OnnxCase::OUTPUT_NAME, elem_type, &output_dims))
+            .chain(
+                crate::ops::extra_outputs(case)
+                    .into_iter()
+                    .map(|(name, elem, dims)| value_info(name, elem, &dims)),
+            )
+            .collect(),
         ..Default::default()
     };
 
@@ -224,7 +236,23 @@ mod tests {
                 case.initializers().count(),
                 "{op:?} initializers must reach the model"
             );
-            assert_eq!(graph.output.len(), 1);
+            // One output for almost every operator, and exactly as many extra as the operator
+            // declares. `DynamicQuantizeLinear` returns three: the quantized tensor plus the
+            // scale and zero-point it derived (`SPECS.md` §2q.4). Asserted against
+            // `extra_outputs` rather than hard-coded, so a new multi-output operator cannot
+            // pass by having its count written into the test.
+            assert_eq!(
+                graph.output.len(),
+                1 + crate::ops::extra_outputs(&case).len(),
+                "{op:?} declared the wrong number of outputs"
+            );
+            // The node and the graph must agree, or a runtime binds outputs it was never told
+            // about.
+            assert_eq!(
+                graph.node[0].output.len(),
+                graph.output.len(),
+                "{op:?} node and graph disagree on output count"
+            );
         }
     }
 

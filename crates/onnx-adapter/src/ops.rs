@@ -49,6 +49,15 @@ pub enum Tier {
     A,
     /// IEEE-754 elementwise float. Bit-exact expected.
     B,
+    /// Quantization. **The strongest oracle in the domain**, and the reason is structural:
+    /// `QuantizeLinear`, `MatMulInteger` and `DynamicQuantizeLinear` produce **integer**
+    /// outputs, so comparison is exact with no tolerance, no rounding argument and no special
+    /// values. `SPECS.md` §2q.
+    ///
+    /// A separate tier rather than folding into A, because N9.7 has to report this surface's
+    /// yield *against* the Tier A/B baseline — and two things reported as one number cannot be
+    /// compared with each other.
+    Q,
 }
 
 /// The shape of an operator's signature, which is what drives output inference.
@@ -88,6 +97,14 @@ pub enum Family {
     Slice,
     /// data + pads.
     Pad,
+    /// `x`, `y_scale`, `y_zero_point` → quantized integer of the zero-point's type.
+    Quantize,
+    /// `x`, `x_scale`, `x_zero_point` → float of the scale's type.
+    Dequantize,
+    /// Two 8-bit matrices plus optional zero-points → **`int32`**, always.
+    MatMulInteger,
+    /// One float tensor → `uint8` output, plus the scale and zero-point it derived.
+    DynamicQuantize,
 }
 
 /// Everything the harness needs to know about one operator.
@@ -112,6 +129,11 @@ pub struct OpSpec {
 const FLOATS: &[ElemType] = &[ElemType::F32, ElemType::F64];
 const NUMERIC: &[ElemType] = &[ElemType::F32, ElemType::F64, ElemType::I32, ElemType::I64];
 const BOOL_ONLY: &[ElemType] = &[ElemType::Bool];
+/// The 8-bit quantization targets. `SPECS.md` §2q.1.
+const QUANTIZED: &[ElemType] = &[ElemType::I8, ElemType::U8];
+/// `QuantizeLinear` and `DynamicQuantizeLinear` take a float *input*; the quantized type is on
+/// the output. Keyed on the input, like every other row, so `data_elem_type` stays one rule.
+const F32_ONLY: &[ElemType] = &[ElemType::F32];
 const ANY: &[ElemType] = &[
     ElemType::F32,
     ElemType::F64,
@@ -124,7 +146,7 @@ const ANY: &[ElemType] = &[
 pub fn spec(kind: OpKind) -> OpSpec {
     use Family as F;
     use OpKind as O;
-    use Tier::{A, B};
+    use Tier::{A, B, Q};
 
     let (tier, family, since, data_types, value_dependent) = match kind {
         // ── Tier A: structural. Output depends on shapes, not values. ──────────────
@@ -157,6 +179,13 @@ pub fn spec(kind: OpKind) -> OpSpec {
         O::Sqrt | O::Floor | O::Ceil => (B, F::UnaryElementwise, 13, FLOATS, true),
         // `Round` does not exist below opset 22.
         O::Round => (B, F::UnaryElementwise, 22, FLOATS, true),
+
+        // ── Tier Q: quantization. `SPECS.md` §2q, all four retrieved before any code. ──
+        // `since` values are the operator revisions in force at opset 22.
+        O::QuantizeLinear => (Q, F::Quantize, 21, F32_ONLY, true),
+        O::DequantizeLinear => (Q, F::Dequantize, 21, QUANTIZED, true),
+        O::MatMulInteger => (Q, F::MatMulInteger, 10, QUANTIZED, true),
+        O::DynamicQuantizeLinear => (Q, F::DynamicQuantize, 11, F32_ONLY, true),
     };
 
     OpSpec {
@@ -199,6 +228,14 @@ pub fn arity_range(kind: OpKind) -> (usize, usize) {
         Family::Squeeze => (1, 2),
         // data, starts, ends, then optional axes and steps.
         Family::Slice => (3, 5),
+        // x, scale, zero_point — the zero-point is optional in the schema but always supplied
+        // here, because omitting it means a *default* zero-point and the default differs by
+        // output type. Supplying it makes the case say what it means.
+        Family::Quantize | Family::Dequantize => (3, 3),
+        // A, B, then the two optional zero-points. Always supplied, same reasoning.
+        Family::MatMulInteger => (4, 4),
+        // One input and no parameters at all: it derives its own. `SPECS.md` §2q.4.
+        Family::DynamicQuantize => (1, 1),
     }
 }
 
@@ -231,6 +268,11 @@ pub fn input_agreement(kind: OpKind) -> InputAgreement {
         Family::Concat => (false, true),
         // `Where` is `cond: Bool, x: T, y: T` — one shape, two types.
         Family::Select => (true, false),
+        // Quantization parameters are scalars of a different type from the data, and the
+        // zero-point's type is the *output* type rather than the input's. Nothing agrees.
+        Family::Quantize | Family::Dequantize | Family::MatMulInteger => (false, false),
+        // One input, so agreement is vacuous.
+        Family::DynamicQuantize => (true, true),
         // The rest take structural inputs (shape vectors, index vectors, pad amounts) whose
         // shape and type are deliberately unlike the data input's.
         _ => (false, false),
@@ -244,6 +286,29 @@ pub fn input_agreement(kind: OpKind) -> InputAgreement {
 /// deliberately **not** defensive: if a case is malformed the result is meaningless, and
 /// `validate` plus the reference implementation are what catch that. Making this function
 /// tolerant would hide the very errors those gates exist to report.
+/// The operator's **additional** outputs, beyond the first.
+///
+/// Almost every operator here produces exactly one output, and `output_spec` describes it. The
+/// exception is `DynamicQuantizeLinear`, which returns the quantized tensor *and* the scale and
+/// zero-point it derived (`SPECS.md` §2q.4).
+///
+/// A separate function rather than making `output_spec` return a list, because the single-output
+/// case is overwhelmingly the common one and every existing caller wants exactly one answer.
+/// Returning a list everywhere would push an `unwrap`-shaped decision into a dozen call sites.
+///
+/// **The extra outputs are oracle surface, not overhead.** All three must agree across runtimes,
+/// so an implementation that quantizes correctly but derives the wrong scale is caught.
+pub fn extra_outputs(case: &OnnxCase) -> Vec<(&'static str, ElemType, Vec<i64>)> {
+    match spec(case.op).family {
+        // y_scale is a scalar float; y_zero_point is a scalar uint8.
+        Family::DynamicQuantize => vec![
+            ("out_scale", ElemType::F32, vec![]),
+            ("out_zero_point", ElemType::U8, vec![]),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 pub fn output_spec(case: &OnnxCase) -> (ElemType, Vec<i64>) {
     let spec = spec(case.op);
     let first = case.inputs.first();
@@ -255,6 +320,44 @@ pub fn output_spec(case: &OnnxCase) -> (ElemType, Vec<i64>) {
 
         // Whatever went in, a truth value comes out.
         Family::Comparison => (ElemType::Bool, dims),
+
+        // ── Quantization. `SPECS.md` §2q. ────────────────────────────────────────────
+        // The output type is the **zero-point's**, not the input's: `y_zero_point` and `y`
+        // share a data type (§2q.1). Shape is the input's — quantization is elementwise.
+        Family::Quantize => case
+            .inputs
+            .get(2)
+            .map_or((ElemType::I8, dims.clone()), |zp| {
+                (zp.elem_type(), dims.clone())
+            }),
+
+        // The mirror: `y = (x - x_zero_point) * x_scale`, and at opset 22 there is no
+        // `output_dtype` attribute, so the output type is the **scale's** (§2q.2).
+        Family::Dequantize => case
+            .inputs
+            .get(1)
+            .map_or((ElemType::F32, dims.clone()), |s| {
+                (s.elem_type(), dims.clone())
+            }),
+
+        // **`int32` only**, whatever the 8-bit inputs were (§2q.3). Shape follows matmul:
+        // `[m, k] x [k, n]` → `[m, n]`.
+        Family::MatMulInteger => {
+            let n = case
+                .inputs
+                .get(1)
+                .and_then(|b| b.dims.last().copied())
+                .unwrap_or(1);
+            let mut shape = dims.clone();
+            if let Some(last) = shape.last_mut() {
+                *last = n;
+            }
+            (ElemType::I32, shape)
+        }
+
+        // Three outputs; `output_spec` describes the first, which is the quantized tensor.
+        // `uint8` always (§2q.4).
+        Family::DynamicQuantize => (ElemType::U8, dims),
 
         // `cond, x, y` — the answer has x's shape and type, not the condition's.
         Family::Select => case
@@ -653,6 +756,46 @@ pub fn probe_at(op: OpKind, elem: ElemType, opset: i64, rank: usize) -> Option<O
                 TensorValue::new("c", vec![1], TensorData::I64(vec![1])).as_initializer(),
             ],
         ),
+        // ── Quantization probes. `SPECS.md` §2q. ─────────────────────────────────────
+        // Scale and zero-point are **scalars** — per-tensor granularity, the simplest of the
+        // three the spec allows (§2q.1). Per-axis and blocked are deliberately not probed:
+        // support for one does not imply support for the others, and the census should not
+        // claim what it did not measure.
+        Family::Quantize => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &dims, elem, 0),
+                TensorValue::new("scale", vec![], TensorData::F32(vec![0.5])),
+                // The zero-point's type IS the output type.
+                quantized_scalar("zp", ElemType::I8, 0),
+            ],
+        ),
+        Family::Dequantize => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &dims, elem, 0),
+                TensorValue::new("scale", vec![], TensorData::F32(vec![0.5])),
+                quantized_scalar("zp", elem, 0),
+            ],
+        ),
+        // `[m, k] x [k, n]`, with a deliberately small `k`: §2q.3 permits the int32
+        // accumulation to overflow, and keeping the contracted dimension small makes that
+        // impossible — so every probe has one determined answer.
+        Family::MatMulInteger => OnnxCase::new(
+            op,
+            opset,
+            vec![
+                data("a", &[2, 3], elem, 0),
+                data("b", &[3, 2], elem, 1),
+                quantized_scalar("a_zp", elem, 0),
+                quantized_scalar("b_zp", elem, 1),
+            ],
+        ),
+        // No parameters at all — it derives its own (§2q.4).
+        Family::DynamicQuantize => OnnxCase::new(op, opset, vec![data("a", &dims, elem, 0)]),
+
         Family::Pad => OnnxCase::new(
             op,
             opset,
@@ -679,6 +822,20 @@ fn squeezable(dims: &[i64]) -> Vec<i64> {
     shape
 }
 
+/// A scalar of a quantized type, for a zero-point input.
+///
+/// Zero-points are kept **in range and small** rather than at the saturation boundary: a
+/// zero-point at `127` combined with a positive input saturates every output element, and a
+/// probe whose every answer is the same boundary value cannot tell a working implementation
+/// from a broken one. The census asks "is this operator implemented", not "does it saturate".
+fn quantized_scalar(name: &str, elem: ElemType, offset: i64) -> TensorValue {
+    let payload = match elem {
+        ElemType::U8 => TensorData::U8(vec![(128 + offset) as u8]),
+        _ => TensorData::I8(vec![offset as i8]),
+    };
+    TensorValue::new(name, vec![], payload)
+}
+
 /// Ordinary, distinct values of the requested type.
 ///
 /// `offset` differs per input so a probe cannot pass by symmetry — a runtime that swapped
@@ -694,6 +851,16 @@ fn data(name: &str, dims: &[i64], elem: ElemType, offset: usize) -> TensorValue 
         ElemType::Bool => {
             TensorData::Bool((0..count).map(|i| (i + offset).is_multiple_of(2)).collect())
         }
+        ElemType::I8 => TensorData::I8(
+            (0..count)
+                .map(|i| ((base + i as i64) % 127) as i8)
+                .collect(),
+        ),
+        ElemType::U8 => TensorData::U8(
+            (0..count)
+                .map(|i| ((base + i as i64) % 255) as u8)
+                .collect(),
+        ),
     };
     TensorValue::new(name, dims.to_vec(), payload)
 }

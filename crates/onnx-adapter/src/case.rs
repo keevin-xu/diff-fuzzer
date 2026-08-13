@@ -57,6 +57,14 @@ pub enum ElemType {
     I64,
     /// ONNX `BOOL` = 9.
     Bool,
+    /// ONNX `INT8` = 3. Carried for the quantized operators (PHASE-N9).
+    ///
+    /// Unlike the other integer types this one exists almost entirely to be *quantized into*:
+    /// `QuantizeLinear` produces it and `MatMulInteger` consumes it. Its saturation range is
+    /// `[-128, 127]`, quoted in `SPECS.md` §2q.1.
+    I8,
+    /// ONNX `UINT8` = 2. The other quantization target, range `[0, 255]`.
+    U8,
 }
 
 impl ElemType {
@@ -71,6 +79,8 @@ impl ElemType {
             ElemType::I32 => DataType::Int32 as i32,
             ElemType::I64 => DataType::Int64 as i32,
             ElemType::Bool => DataType::Bool as i32,
+            ElemType::I8 => DataType::Int8 as i32,
+            ElemType::U8 => DataType::Uint8 as i32,
         }
     }
 
@@ -95,13 +105,40 @@ impl ElemType {
 
     /// Every element type, so an exhaustive test cannot silently cover only the ones that
     /// existed when it was written.
-    pub const ALL: [ElemType; 5] = [
+    pub const ALL: [ElemType; 7] = [
         ElemType::F32,
         ElemType::F64,
         ElemType::I32,
         ElemType::I64,
         ElemType::Bool,
+        ElemType::I8,
+        ElemType::U8,
     ];
+
+    /// The types quantized operators produce and consume.
+    ///
+    /// Separate from [`Self::ALL`] because the Tier A and Tier B operators do **not** accept
+    /// them — feeding `Add` an `int8` tensor builds a model the schema forbids, and a runtime
+    /// rejecting *that* says nothing about the runtime.
+    pub const QUANTIZED: [ElemType; 2] = [ElemType::I8, ElemType::U8];
+
+    /// Whether this is an 8-bit quantization target.
+    pub fn is_quantized(self) -> bool {
+        matches!(self, ElemType::I8 | ElemType::U8)
+    }
+
+    /// The saturation range, quoted from `SPECS.md` §2q.1.
+    ///
+    /// `None` for types that are not quantization targets. Returned rather than hard-coded at
+    /// each call site so the two ranges have one definition — the same rule that
+    /// `ops::data_elem_type` exists for.
+    pub fn saturation_range(self) -> Option<(i64, i64)> {
+        match self {
+            ElemType::I8 => Some((-128, 127)),
+            ElemType::U8 => Some((0, 255)),
+            _ => None,
+        }
+    }
 }
 
 /// A tensor's contents, typed.
@@ -120,6 +157,8 @@ pub enum TensorData {
     I32(Vec<i32>),
     I64(Vec<i64>),
     Bool(Vec<bool>),
+    I8(Vec<i8>),
+    U8(Vec<u8>),
 }
 
 impl TensorData {
@@ -128,6 +167,8 @@ impl TensorData {
         match self {
             TensorData::F32(_) => ElemType::F32,
             TensorData::F64(_) => ElemType::F64,
+            TensorData::I8(_) => ElemType::I8,
+            TensorData::U8(_) => ElemType::U8,
             TensorData::I32(_) => ElemType::I32,
             TensorData::I64(_) => ElemType::I64,
             TensorData::Bool(_) => ElemType::Bool,
@@ -142,6 +183,8 @@ impl TensorData {
             TensorData::I32(v) => v.len(),
             TensorData::I64(v) => v.len(),
             TensorData::Bool(v) => v.len(),
+            TensorData::I8(v) => v.len(),
+            TensorData::U8(v) => v.len(),
         }
     }
 
@@ -162,6 +205,10 @@ impl TensorData {
             TensorData::I32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
             TensorData::I64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
             TensorData::Bool(v) => v.iter().map(|x| u8::from(*x)).collect(),
+            // One byte per value, like `Bool`. `i8` is reinterpreted rather than converted:
+            // the wire carries the two's-complement byte, not a widened number.
+            TensorData::I8(v) => v.iter().map(|x| *x as u8).collect(),
+            TensorData::U8(v) => v.clone(),
         }
     }
 
@@ -179,6 +226,8 @@ impl TensorData {
             ElemType::I32 => TensorData::I32(chunks::<4>(bytes).map(i32::from_le_bytes).collect()),
             ElemType::I64 => TensorData::I64(chunks::<8>(bytes).map(i64::from_le_bytes).collect()),
             ElemType::Bool => TensorData::Bool(bytes.iter().map(|b| *b != 0).collect()),
+            ElemType::I8 => TensorData::I8(bytes.iter().map(|b| *b as i8).collect()),
+            ElemType::U8 => TensorData::U8(bytes.to_vec()),
         }
     }
 
@@ -194,6 +243,11 @@ impl TensorData {
             TensorData::F64(v) => v.iter().map(|x| x.to_bits()).collect(),
             TensorData::I32(v) => v.iter().map(|x| *x as u32 as u64).collect(),
             TensorData::I64(v) => v.iter().map(|x| *x as u64).collect(),
+            // Widened through the *unsigned* byte first, so the key holds the two's-complement
+            // pattern rather than a sign-extended one. Consistent with the `I32` arm above:
+            // what is compared is the stored bits, not the numeric value.
+            TensorData::I8(v) => v.iter().map(|x| *x as u8 as u64).collect(),
+            TensorData::U8(v) => v.iter().map(|x| u64::from(*x)).collect(),
             TensorData::Bool(v) => v.iter().map(|x| u64::from(*x)).collect(),
         }
     }
@@ -405,6 +459,18 @@ pub enum OpKind {
     Size,
     Slice,
     Pad,
+
+    // ── Tier Q — quantization (PHASE-N9) ──────────────────────────────────────────
+    // Integer outputs mean exact comparison: no tolerance, no rounding argument, no
+    // special values. `SPECS.md` §2q.
+    /// float → int8/uint8, rounding **half to even**, saturating. `SPECS.md` §2q.1.
+    QuantizeLinear,
+    /// int8/uint8 → float, `y = (x - zero_point) * scale`. `SPECS.md` §2q.2.
+    DequantizeLinear,
+    /// Two 8-bit matrices → **int32**. The strongest oracle here. `SPECS.md` §2q.3.
+    MatMulInteger,
+    /// float → uint8, deriving its own scale and zero-point. `SPECS.md` §2q.4.
+    DynamicQuantizeLinear,
     // ── Tier A — discrete, value-reading ──────────────────────────────────────────
     Gather,
     Where,
@@ -449,6 +515,10 @@ impl OpKind {
             OpKind::Size => "Size",
             OpKind::Slice => "Slice",
             OpKind::Pad => "Pad",
+            OpKind::QuantizeLinear => "QuantizeLinear",
+            OpKind::DequantizeLinear => "DequantizeLinear",
+            OpKind::MatMulInteger => "MatMulInteger",
+            OpKind::DynamicQuantizeLinear => "DynamicQuantizeLinear",
             OpKind::Gather => "Gather",
             OpKind::Where => "Where",
             OpKind::Cast => "Cast",
@@ -493,7 +563,7 @@ impl OpKind {
 
     /// Every operator, so an exhaustive test cannot silently cover only the ones that
     /// existed when it was written.
-    pub const ALL: [OpKind; 33] = [
+    pub const ALL: [OpKind; 37] = [
         OpKind::Identity,
         OpKind::Reshape,
         OpKind::Transpose,
@@ -504,6 +574,10 @@ impl OpKind {
         OpKind::Size,
         OpKind::Slice,
         OpKind::Pad,
+        OpKind::QuantizeLinear,
+        OpKind::DequantizeLinear,
+        OpKind::MatMulInteger,
+        OpKind::DynamicQuantizeLinear,
         OpKind::Gather,
         OpKind::Where,
         OpKind::Cast,

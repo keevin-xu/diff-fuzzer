@@ -35,6 +35,11 @@ pub fn ordinary(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData
             TensorData::I64((0..count).map(|_| rng.random_range(-100i64..100)).collect())
         }
         ElemType::Bool => TensorData::Bool((0..count).map(|_| rng.random_bool(0.5)).collect()),
+        // Quantized types span their whole saturation range: unlike the wider integers, every
+        // representable value is reachable in a handful of draws, so there is no reason to
+        // sample a narrow band. `SPECS.md` §2q.1.
+        ElemType::I8 => TensorData::I8((0..count).map(|_| rng.random_range(-128..=127)).collect()),
+        ElemType::U8 => TensorData::U8((0..count).map(|_| rng.random_range(0..=255)).collect()),
     }
 }
 
@@ -176,6 +181,11 @@ pub fn with_specials(
         ),
         // A boolean has no special values: both of its two values are ordinary.
         ElemType::Bool => ordinary(ElemType::Bool, count, rng),
+        // **The quantized types are all boundary.** `ordinary` already draws uniformly across
+        // the whole saturation range, so every value — including both extremes — is reachable
+        // in a few draws. There is no separate "special" pool to bias toward, and inventing one
+        // would only re-weight a range that is already fully covered. `SPECS.md` §2q.1.
+        ElemType::I8 | ElemType::U8 => ordinary(elem, count, rng),
     }
 }
 

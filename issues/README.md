@@ -59,7 +59,9 @@ assert** — a wrong assertion costs credibility, a well-posed question costs no
 | # | Subject | Status |
 |---|---|---|
 | 001 | `tract`: `Sign(0) = 1` for integer tensors | **DO NOT FILE** — fixed on `main` by [tract#2533](https://github.com/sonos/tract/pull/2533), merged three weeks after our pinned release |
-| 002 | `Reshape` of a zero-size tensor: `tract` and candle reject what the reference and ONNX Runtime accept | **READY as two reports** — `final/tract-002-*` and `final/candle-001-*`. Different bugs: tract fails to analyse; candle appears to ignore `allowzero=1` |
+| 002 | `tract`: `Reshape` of a zero-size tensor fails to load | **READY** — `final/tract-002-*` |
+| 006 | `tract`: `Div` panics on `int32::MIN / -1` | **CANDIDATE** — ONNX is silent on integer overflow; declined by the generator and preserved as a draft |
+| 007 | candle: `Reshape` appears to ignore `allowzero=1` | **READY** — `final/candle-001-*`. Split out of 002 once the error text showed a different cause |
 | 003 | candle fails on rank-0 scalars | **DRAFT** — likely close without filing; candle's coverage is openly incomplete |
 | 004 | ONNX Runtime: `Where` returns `+0.0` for a `-0.0` selected from `X` | **READY** — `final/onnxruntime-001-*` |
 | 005 | `tract`: `Sign(-0.0)` returns `-0.0` instead of `0` | **READY** — `final/tract-001-*` |

@@ -115,6 +115,8 @@ def _write_tensor(stream, name, array):
 # decoding as something else.
 _DTYPES = {
     1: np.float32,   # FLOAT
+    2: np.uint8,     # UINT8   — quantization target, PHASE-N9
+    3: np.int8,      # INT8    — quantization target, PHASE-N9
     6: np.int32,     # INT32
     7: np.int64,     # INT64
     9: np.bool_,     # BOOL

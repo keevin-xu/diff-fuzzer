@@ -13,7 +13,7 @@ directory follows it.
 | `tract-001-*` | [sonos/tract](https://github.com/sonos/tract) | `Sign(-0.0)` returns `-0.0` instead of `0` | `../FINDING-005-tract-sign-negative-zero.md` |
 | `onnxruntime-001-*` | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) | `Where` loses the sign of `-0.0` selected from `X` | `../FINDING-004-onnxruntime-where-signed-zero.md` |
 | `tract-002-*` | [sonos/tract](https://github.com/sonos/tract) | `Reshape` of a zero-size tensor fails to load | `../FINDING-002-reshape-empty-tensor.md` |
-| `candle-001-*` | [huggingface/candle](https://github.com/huggingface/candle) | `Reshape` appears to ignore `allowzero=1` | `../FINDING-002-reshape-empty-tensor.md` |
+| `candle-001-*` | [huggingface/candle](https://github.com/huggingface/candle) | `Reshape` appears to ignore `allowzero=1` | `../FINDING-007-candle-reshape-allowzero.md` |
 
 ## Not here, and why
 

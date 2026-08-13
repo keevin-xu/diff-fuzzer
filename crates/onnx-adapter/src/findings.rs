@@ -313,6 +313,8 @@ fn render_values(data: &TensorData) -> String {
         TensorData::I32(v) => join(v, 12),
         TensorData::I64(v) => join(v, 12),
         TensorData::Bool(v) => join(v, 12),
+        TensorData::I8(v) => join(v, 16),
+        TensorData::U8(v) => join(v, 16),
     }
 }
 

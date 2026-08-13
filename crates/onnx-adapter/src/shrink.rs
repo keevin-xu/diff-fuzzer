@@ -117,6 +117,8 @@ fn count_nontrivial(data: &TensorData) -> usize {
         TensorData::I32(v) => v.iter().filter(|x| **x != 0 && **x != 1).count(),
         TensorData::I64(v) => v.iter().filter(|x| **x != 0 && **x != 1).count(),
         TensorData::Bool(v) => v.iter().filter(|x| **x).count(),
+        TensorData::I8(v) => v.iter().filter(|x| **x != 0 && **x != 1).count(),
+        TensorData::U8(v) => v.iter().filter(|x| **x != 0 && **x != 1).count(),
     }
 }
 
@@ -241,6 +243,10 @@ fn filled(data: &TensorData, simplify: Simplify) -> TensorData {
         (TensorData::I64(_), Simplify::Zero) => TensorData::I64(vec![0; n]),
         (TensorData::I64(_), Simplify::One) => TensorData::I64(vec![1; n]),
         (TensorData::Bool(_), _) => TensorData::Bool(vec![false; n]),
+        (TensorData::I8(_), Simplify::Zero) => TensorData::I8(vec![0; n]),
+        (TensorData::I8(_), Simplify::One) => TensorData::I8(vec![1; n]),
+        (TensorData::U8(_), Simplify::Zero) => TensorData::U8(vec![0; n]),
+        (TensorData::U8(_), Simplify::One) => TensorData::U8(vec![1; n]),
     }
 }
 
@@ -254,6 +260,8 @@ fn zero_element(case: &OnnxCase, input: usize, position: usize) -> OnnxCase {
         TensorData::I32(v) => v[position] = 0,
         TensorData::I64(v) => v[position] = 0,
         TensorData::Bool(v) => v[position] = false,
+        TensorData::I8(v) => v[position] = 0,
+        TensorData::U8(v) => v[position] = 0,
     }
     out
 }
@@ -336,6 +344,8 @@ fn gather(data: &TensorData, indices: &[usize]) -> TensorData {
         TensorData::I32(v) => TensorData::I32(pick(v, indices)),
         TensorData::I64(v) => TensorData::I64(pick(v, indices)),
         TensorData::Bool(v) => TensorData::Bool(pick(v, indices)),
+        TensorData::I8(v) => TensorData::I8(pick(v, indices)),
+        TensorData::U8(v) => TensorData::U8(pick(v, indices)),
     }
 }
 

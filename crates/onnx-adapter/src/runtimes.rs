@@ -160,6 +160,8 @@ impl OrtRuntime {
                 TensorData::I32(v) => feed!(v),
                 TensorData::I64(v) => feed!(v),
                 TensorData::Bool(v) => feed!(v),
+                TensorData::I8(v) => feed!(v),
+                TensorData::U8(v) => feed!(v),
             }
         }
 
@@ -210,6 +212,13 @@ impl OrtRuntime {
                 Ty::Int32 => extract!(i32, I32),
                 Ty::Int64 => extract!(i64, I64),
                 Ty::Bool => extract!(bool, Bool),
+                // The quantization targets. Added at N9 — and note that the compiler could
+                // *not* find this site when `ElemType` grew, because it matches on ONNX
+                // Runtime's own type enum rather than ours. The exhaustive-match discipline
+                // stops at the adapter boundary; a test that runs every element type through
+                // every runtime is what covers the rest, and it is what caught this.
+                Ty::Int8 => extract!(i8, I8),
+                Ty::Uint8 => extract!(u8, U8),
                 // A type ORT produced that this adapter cannot represent. Reported rather
                 // than decoded as something else — a wrong decode would look like a real
                 // divergence.
@@ -304,6 +313,8 @@ impl TractRuntime {
                 TensorData::I32(v) => feed!(v),
                 TensorData::I64(v) => feed!(v),
                 TensorData::Bool(v) => feed!(v),
+                TensorData::I8(v) => feed!(v),
+                TensorData::U8(v) => feed!(v),
             };
             feeds.push(tensor.into());
         }
@@ -384,6 +395,8 @@ impl TractRuntime {
                 DatumType::I32 => collect!(i32, I32),
                 DatumType::I64 => collect!(i64, I64),
                 DatumType::Bool => collect!(bool, Bool),
+                DatumType::I8 => collect!(i8, I8),
+                DatumType::U8 => collect!(u8, U8),
                 other => {
                     return OnnxOutcome::Rejected {
                         detail: format!(
@@ -471,7 +484,12 @@ impl CandleRuntime {
                 // of the runtime rather than a gap in this adapter, which is why it is
                 // `Unsupported` (a legitimate skip) and not `Rejected` — and it is exactly
                 // the kind of fact the N2 census exists to record.
-                TensorData::I32(_) | TensorData::Bool(_) => {
+                // `candle_core::DType` has a `U8` but no `I8`, so the two quantization
+                // targets land on opposite sides of the same limit. Recorded per type rather
+                // than lumped together, because "candle cannot do quantization" would be
+                // wrong — it can do half of it.
+                TensorData::U8(v) => feed!(v),
+                TensorData::I32(_) | TensorData::Bool(_) | TensorData::I8(_) => {
                     return OnnxOutcome::Unsupported {
                         reason: format!("candle has no DType for {:?}", input.elem_type()),
                     };

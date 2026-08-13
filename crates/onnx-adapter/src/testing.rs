@@ -147,6 +147,19 @@ fn corrupt_element(data: &mut TensorData, index: usize, delta: f32) {
                 *x = x.wrapping_add(1);
             }
         }
+        // Saturating, so corrupting a value already at its boundary is *inert* rather than
+        // wrapping to the opposite extreme — which would be a corruption so large it proves
+        // less than a small one. `classify_fault` reports inert honestly.
+        TensorData::I8(v) => {
+            if let Some(x) = v.get_mut(index) {
+                *x = x.saturating_add(delta as i8);
+            }
+        }
+        TensorData::U8(v) => {
+            if let Some(x) = v.get_mut(index) {
+                *x = x.saturating_add(delta as u8);
+            }
+        }
         TensorData::Bool(v) => {
             if let Some(x) = v.get_mut(index) {
                 *x = !*x;

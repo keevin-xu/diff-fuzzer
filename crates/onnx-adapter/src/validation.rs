@@ -273,6 +273,16 @@ pub fn well_formed_typed(op: OpKind, dims: &[i64], opset: i64, elem: ElemType) -
                 ElemType::I64 => TensorData::I64((0..count).map(|i| base + i as i64).collect()),
                 // Alternating rather than constant, so a runtime that returned a fixed
                 // value would be caught.
+                ElemType::I8 => TensorData::I8(
+                    (0..count)
+                        .map(|i| ((base + i as i64) % 127) as i8)
+                        .collect(),
+                ),
+                ElemType::U8 => TensorData::U8(
+                    (0..count)
+                        .map(|i| ((base + i as i64) % 255) as u8)
+                        .collect(),
+                ),
                 ElemType::Bool => {
                     TensorData::Bool((0..count).map(|i| (i + index) % 2 == 0).collect())
                 }

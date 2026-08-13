@@ -107,6 +107,15 @@ pub struct Bounds {
     /// **Excludes** the five operators that take a shape/axes/pads *input* — see
     /// [`Self::shape_input_operators`].
     pub structural: bool,
+    /// `QuantizeLinear`, `DequantizeLinear`, `MatMulInteger`, `DynamicQuantizeLinear` — the
+    /// Tier Q surface added at PHASE-N9.
+    ///
+    /// **A separate axis so the yield can be measured against the Tier A/B baseline.** N9.7
+    /// requires reporting what quantization buys, and a rate without a baseline is not a
+    /// measurement — the same rule that made `special_values` its own axis at N4.
+    ///
+    /// Off by default for exactly that reason: the baseline is the default configuration.
+    pub quantized: bool,
     /// `Reshape`, `Squeeze`, `Unsqueeze`, `Slice`, `Pad` — the operators whose second input is
     /// an `I64` shape, axes, or pad vector.
     ///
@@ -167,6 +176,7 @@ impl Default for Bounds {
             logical: true,
             structural: true,
             shape_input_operators: true,
+            quantized: false,
 
             float64: true,
             integer_types: true,
@@ -210,6 +220,7 @@ impl Bounds {
             logical: false,
             structural: false,
             shape_input_operators: false,
+            quantized: false,
             float64: false,
             integer_types: false,
             bool_type: false,
@@ -234,6 +245,18 @@ impl Bounds {
     pub fn with_special_values(&self) -> Self {
         Self {
             special_values: true,
+            ..self.clone()
+        }
+    }
+
+    /// The same configuration with the quantized surface on.
+    ///
+    /// A constructor rather than a field flip at the call site, matching
+    /// [`Self::with_special_values`]: a measurement comparing two configurations should differ
+    /// in exactly one named thing, and a hand-edited struct literal cannot be trusted to.
+    pub fn with_quantized(&self) -> Self {
+        Self {
+            quantized: true,
             ..self.clone()
         }
     }
@@ -297,6 +320,10 @@ impl Bounds {
                     self.structural
                 }
             }
+            Family::Quantize
+            | Family::Dequantize
+            | Family::MatMulInteger
+            | Family::DynamicQuantize => self.quantized,
             Family::Select
             | Family::Cast
             | Family::Transpose
@@ -329,6 +356,7 @@ impl GenerationAxes for Bounds {
             ("logical", self.logical),
             ("structural", self.structural),
             ("shape-input-ops", self.shape_input_operators),
+            ("quantized", self.quantized),
             ("float64", self.float64),
             ("integer-types", self.integer_types),
             ("bool-type", self.bool_type),
@@ -384,6 +412,70 @@ pub fn generate_case(
 
     let case = match ops::spec(op).family {
         Family::UnaryElementwise => {
+            let dims = shape(bounds, rng);
+            OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
+        }
+
+        // ── Quantization. `SPECS.md` §2q. Correct-by-construction throughout. ─────────
+        //
+        // Per-tensor granularity only: scale and zero-point are **scalars**. The spec allows
+        // per-axis and blocked (§2q.1), and both are deliberately out of scope for now — each
+        // adds a shape-agreement rule of its own, and the oracle strength is identical.
+        Family::Quantize => {
+            let dims = shape(bounds, rng);
+            // The output type, chosen here because the zero-point carries it (§2q.1).
+            let target = *pick(&ElemType::QUANTIZED, rng);
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, op, bounds, rng),
+                    scale_tensor(bounds, rng),
+                    zero_point_tensor(target, rng),
+                ],
+            )
+        }
+
+        Family::Dequantize => {
+            let dims = shape(bounds, rng);
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &dims, elem, op, bounds, rng),
+                    scale_tensor(bounds, rng),
+                    // "x_zero_point and x must have the same type" (§2q.2).
+                    zero_point_tensor(elem, rng),
+                ],
+            )
+        }
+
+        // `[m, k] x [k, n]` → `[m, n]`.
+        //
+        // **`k` is capped deliberately.** §2q.3 permits the `int32` accumulation to overflow,
+        // which would make the answer undetermined — the sixth time this domain has met that
+        // shape. Rather than declining the operator, the constraint is satisfied by
+        // construction: with 8-bit inputs the largest product is 128 x 128 = 16,384, so `k`
+        // terms sum to at most 16,384k, and any `k` below ~131,000 cannot overflow. The cap
+        // here is far below that, so overflow is unreachable rather than merely unlikely.
+        Family::MatMulInteger => {
+            let m = bounded_dim(bounds, rng);
+            let k = bounded_dim(bounds, rng);
+            let n = bounded_dim(bounds, rng);
+            OnnxCase::new(
+                op,
+                opset,
+                vec![
+                    tensor("a", &[m, k], elem, op, bounds, rng),
+                    tensor("b", &[k, n], elem, op, bounds, rng),
+                    zero_point_tensor(elem, rng),
+                    zero_point_tensor(elem, rng),
+                ],
+            )
+        }
+
+        // One input, no parameters: it derives its own (§2q.4).
+        Family::DynamicQuantize => {
             let dims = shape(bounds, rng);
             OnnxCase::new(op, opset, vec![tensor("a", &dims, elem, op, bounds, rng)])
         }
@@ -724,6 +816,52 @@ fn factorization(total: i64, bounds: &Bounds, rng: &mut SeededRng) -> Vec<i64> {
 /// `NaN` exclusions apply everywhere rather than at whichever call site remembered them. That
 /// is the same rule as `shape_bounded`: a property belongs in the construction path, not at the
 /// sites where it was first needed.
+/// Uniformly pick one of a slice's elements.
+fn pick<'a, T>(choices: &'a [T], rng: &mut SeededRng) -> &'a T {
+    &choices[rng.random_range(0..choices.len())]
+}
+
+/// A **positive, finite** scale.
+///
+/// Positivity is not decoration: the quantization formula divides by it, so a zero or negative
+/// scale makes the answer undetermined or infinite. `PHASE-N9` names generating invalid
+/// quantization parameters — and then reading the rejection as a divergence — as one of its
+/// three risks, so the parameters are made valid by construction rather than filtered afterwards.
+///
+/// The range spans four orders of magnitude so that both saturation (a tiny scale pushes values
+/// past the boundary) and coarse quantization (a large scale collapses distinct inputs onto one
+/// level) are reachable.
+fn scale_tensor(bounds: &Bounds, rng: &mut SeededRng) -> TensorValue {
+    let scale = if bounds.special_values && rng.random_bool(bounds.special_value_rate) {
+        *pick(&[1.0e-3_f32, 1.0e-2, 0.5, 1.0, 1.0e2], rng)
+    } else {
+        rng.random_range(0.01_f32..2.0)
+    };
+    TensorValue::new("scale", vec![], TensorData::F32(vec![scale]))
+}
+
+/// A zero-point **inside the target type's range**, which is what makes it valid.
+///
+/// The range comes from `ElemType::saturation_range`, itself quoted from `SPECS.md` §2q.1, so
+/// there is one definition of what `int8` and `uint8` can hold rather than a literal here and
+/// another in the census probe.
+fn zero_point_tensor(target: ElemType, rng: &mut SeededRng) -> TensorValue {
+    let (low, high) = target
+        .saturation_range()
+        .expect("a zero-point's type is always a quantization target");
+    let value = rng.random_range(low..=high);
+    let payload = match target {
+        ElemType::U8 => TensorData::U8(vec![value as u8]),
+        _ => TensorData::I8(vec![value as i8]),
+    };
+    TensorValue::new("zero_point", vec![], payload)
+}
+
+/// A single dimension within the configured bound.
+fn bounded_dim(bounds: &Bounds, rng: &mut SeededRng) -> i64 {
+    rng.random_range(1..=bounds.max_dim.max(1))
+}
+
 fn tensor(
     name: &str,
     dims: &[i64],
@@ -829,6 +967,7 @@ mod tests {
             logical: false,
             structural: false,
             shape_input_operators: false,
+            quantized: false,
             float64: false,
             integer_types: false,
             bool_type: false,
@@ -872,6 +1011,7 @@ mod tests {
                 "shape-input-ops",
                 Bounds {
                     shape_input_operators: true,
+                    quantized: false,
                     ..off.clone()
                 },
             ),
@@ -918,6 +1058,7 @@ mod tests {
             logical: false,
             structural: false,
             shape_input_operators: false,
+            quantized: false,
             ..Bounds::default()
         };
         assert!(
@@ -958,6 +1099,7 @@ mod tests {
                 "shape-input-ops",
                 Bounds {
                     shape_input_operators: true,
+                    quantized: false,
                     ..off.clone()
                 },
             ),
@@ -1026,6 +1168,7 @@ mod tests {
             comparisons: false,
             structural: false,
             shape_input_operators: false,
+            quantized: false,
             logical: true,
             bool_type: false,
             ..Bounds::default()
