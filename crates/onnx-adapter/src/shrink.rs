@@ -152,8 +152,15 @@ impl Shrink for OnnxCase {
             .max()
             .unwrap_or(0);
         for axis in 0..max_rank {
-            out.push(reshape_axis(self, axis, |extent| extent / 2));
-            out.push(reshape_axis(self, axis, |_| 1));
+            // **Both halves, for every reduction.** Truncating to the front only would destroy
+            // any defect that lives past the cut, the candidate would fail the predicate, and
+            // the search would report a local minimum while the case was still enormous. That
+            // is exactly what happened: `Where` bottomed out at 144 elements for a defect in a
+            // single element, because the interesting value was never in the front slice.
+            for keep in [Keep::Front, Keep::Back] {
+                out.push(reshape_axis(self, axis, keep, |extent| extent / 2));
+                out.push(reshape_axis(self, axis, keep, |_| 1));
+            }
             out.push(drop_axis(self, axis));
         }
 
@@ -251,22 +258,85 @@ fn zero_element(case: &OnnxCase, input: usize, position: usize) -> OnnxCase {
     out
 }
 
-/// Change the extent of one axis in every data input that has it, truncating the values.
-fn reshape_axis(case: &OnnxCase, axis: usize, extent: impl Fn(i64) -> i64) -> OnnxCase {
+/// Which end of an axis to keep when shortening it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    Front,
+    Back,
+}
+
+/// Change the extent of one axis in every data input that has it, **slicing along that axis**.
+///
+/// # Why this is not a flat truncation
+///
+/// A tensor's values are stored flat, and the obvious implementation keeps the first *n* of them.
+/// That is only equivalent to slicing when the axis being shortened is the leading one. For any
+/// other axis it scrambles the tensor — it keeps whole leading rows rather than a slice through
+/// each of them — so the resulting case is not a reduction of the original at all, and whether it
+/// preserves the defect is luck.
+fn reshape_axis(case: &OnnxCase, axis: usize, keep: Keep, extent: impl Fn(i64) -> i64) -> OnnxCase {
     let mut out = case.clone();
     for input in out.inputs.iter_mut() {
         if input.is_initializer() || axis >= input.dims.len() {
             continue;
         }
-        let updated = extent(input.dims[axis]).max(0);
-        if updated == input.dims[axis] {
+        let before = input.dims[axis];
+        let updated = extent(before).clamp(0, before);
+        if updated == before {
             continue;
         }
+        let start = match keep {
+            Keep::Front => 0,
+            Keep::Back => (before - updated) as usize,
+        };
+        input.data = slice_axis(&input.data, &input.dims, axis, start, updated as usize);
         input.dims[axis] = updated;
-        let wanted = input.dims.iter().product::<i64>().max(0) as usize;
-        input.data = truncated(&input.data, wanted);
     }
     out
+}
+
+/// Take `len` positions starting at `start` along `axis`, in row-major order.
+///
+/// The flat index of an element decomposes into `outer · extent · inner`, where `outer` is the
+/// product of the dimensions before the axis and `inner` the product of those after it. Keeping
+/// a slice means walking those three loops rather than cutting the flat array.
+fn slice_axis(
+    data: &TensorData,
+    dims: &[i64],
+    axis: usize,
+    start: usize,
+    len: usize,
+) -> TensorData {
+    let outer: usize = dims[..axis].iter().product::<i64>().max(0) as usize;
+    let extent: usize = dims[axis].max(0) as usize;
+    let inner: usize = dims[axis + 1..].iter().product::<i64>().max(0) as usize;
+
+    let mut keep = Vec::with_capacity(outer * len * inner);
+    for o in 0..outer {
+        for e in start..(start + len).min(extent) {
+            for i in 0..inner {
+                keep.push((o * extent + e) * inner + i);
+            }
+        }
+    }
+    gather(data, &keep)
+}
+
+/// Build a new tensor from the given flat indices.
+fn gather(data: &TensorData, indices: &[usize]) -> TensorData {
+    fn pick<T: Clone + Default>(values: &[T], indices: &[usize]) -> Vec<T> {
+        indices
+            .iter()
+            .map(|i| values.get(*i).cloned().unwrap_or_default())
+            .collect()
+    }
+    match data {
+        TensorData::F32(v) => TensorData::F32(pick(v, indices)),
+        TensorData::F64(v) => TensorData::F64(pick(v, indices)),
+        TensorData::I32(v) => TensorData::I32(pick(v, indices)),
+        TensorData::I64(v) => TensorData::I64(pick(v, indices)),
+        TensorData::Bool(v) => TensorData::Bool(pick(v, indices)),
+    }
 }
 
 /// Remove an axis entirely, lowering the rank — and fix up the attributes that name axes.
@@ -276,9 +346,10 @@ fn drop_axis(case: &OnnxCase, axis: usize) -> OnnxCase {
         if input.is_initializer() || axis >= input.dims.len() || input.dims.len() <= 1 {
             continue;
         }
+        // Removing an axis keeps the slice at index 0 along it — the same reasoning as
+        // `reshape_axis`: a flat truncation would scramble anything but the leading axis.
+        input.data = slice_axis(&input.data, &input.dims, axis, 0, 1);
         input.dims.remove(axis);
-        let wanted = input.dims.iter().product::<i64>().max(0) as usize;
-        input.data = truncated(&input.data, wanted);
     }
 
     // `perm` is a permutation of the *rank*, so dropping an axis makes the old one invalid.
@@ -301,22 +372,6 @@ fn drop_axis(case: &OnnxCase, axis: usize) -> OnnxCase {
         out.attrs = rebuilt;
     }
     out
-}
-
-/// Keep the first `wanted` values, padding with zeros if the shape grew.
-fn truncated(data: &TensorData, wanted: usize) -> TensorData {
-    fn fit<T: Clone + Default>(values: &[T], wanted: usize) -> Vec<T> {
-        let mut out = values.to_vec();
-        out.resize(wanted, T::default());
-        out
-    }
-    match data {
-        TensorData::F32(v) => TensorData::F32(fit(v, wanted)),
-        TensorData::F64(v) => TensorData::F64(fit(v, wanted)),
-        TensorData::I32(v) => TensorData::I32(fit(v, wanted)),
-        TensorData::I64(v) => TensorData::I64(fit(v, wanted)),
-        TensorData::Bool(v) => TensorData::Bool(fit(v, wanted)),
-    }
 }
 
 /// The predicate a minimisation must be driven by: **the same finding, not merely a finding**.
@@ -359,7 +414,7 @@ mod tests {
 
         let mut more_elements = base.clone();
         more_elements.inputs[0].dims = vec![4, 3];
-        more_elements.inputs[0].data = truncated(&more_elements.inputs[0].data, 12);
+        more_elements.inputs[0].data = TensorData::F32(vec![1.0; 12]);
         assert!(complexity(&more_elements) > start, "elements ignored");
 
         let mut higher_rank = base.clone();
