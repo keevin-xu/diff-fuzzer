@@ -437,7 +437,13 @@ pub fn generate_case(
             let data = if !target.is_floating() && elem.is_floating() {
                 gen_value::cast_safe(elem, count, bounds.special_value_rate, rng)
             } else if bounds.special_values {
-                gen_value::with_specials(elem, count, bounds.special_value_rate, false, rng)
+                gen_value::with_specials(
+                    elem,
+                    count,
+                    bounds.special_value_rate,
+                    gen_value::undetermined_for(op),
+                    rng,
+                )
             } else {
                 gen_value::ordinary(elem, count, rng)
             };
@@ -728,11 +734,11 @@ fn tensor(
 ) -> TensorValue {
     let count = element_count(dims) as usize;
     let data = if bounds.special_values {
-        // `Max` and `Min` never receive a `NaN`: ONNX does not specify which operand wins, and
-        // IEEE-754 does not supply the answer either since they are not basic operations and
-        // its own `maxNum`/`minNum` semantics changed between revisions. `SPECS.md` §2.2c.
-        let exclude_nan = matches!(op, OpKind::Max | OpKind::Min);
-        gen_value::with_specials(elem, count, bounds.special_value_rate, exclude_nan, rng)
+        // Values the specification does not determine for this operator are never generated.
+        // The rule lives in one place (`gen_value::undetermined_for`) so it cannot drift from
+        // the catalog that documents it.
+        let exclude = gen_value::undetermined_for(op);
+        gen_value::with_specials(elem, count, bounds.special_value_rate, exclude, rng)
     } else {
         gen_value::ordinary(elem, count, rng)
     };

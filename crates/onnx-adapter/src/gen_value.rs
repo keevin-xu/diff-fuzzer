@@ -7,7 +7,7 @@
 //! Ordinary values only, for now. The adversarial pool arrives with the special-value axis at
 //! N4, and it arrives with a **baseline** — a rate without a baseline is not a measurement.
 
-use crate::case::{ElemType, TensorData};
+use crate::case::{ElemType, OpKind, TensorData};
 use diff_fuzzer_core::rng::SeededRng;
 use rand::RngExt;
 
@@ -47,6 +47,45 @@ pub fn ordinary(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData
 ///
 /// Every entry is here because it has broken something somewhere: overflow to infinity, the
 /// sign of zero, the subnormal boundary, and the largest finite magnitudes.
+/// Values an operator must never receive, because the specification does not determine the
+/// answer and two runtimes will therefore legitimately differ.
+///
+/// # One definition, consulted everywhere
+///
+/// Defined here rather than inline at the call site for the same reason `ops::data_elem_type`
+/// exists: two places computing the same rule independently is how they come to disagree. Every
+/// entry corresponds to a row of [`crate::known::CATALOG`] handled by declining to generate it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Excluded {
+    /// `NaN` must not appear in an input.
+    pub nan: bool,
+    /// `-0.0` must not appear in an input.
+    pub negative_zero: bool,
+}
+
+/// What the specification leaves undetermined for this operator.
+///
+/// | operator | excluded | why |
+/// |---|---|---|
+/// | `Max`, `Min` | `NaN`, `-0.0` | the page never mentions either, in any of its five versions, and these are not IEEE-754 basic operations — `SPECS.md` §2.2c, §2.9 |
+/// | `Sign` | `NaN` | the page defines `> 0`, `< 0` and `== 0` only; `NaN` satisfies none of them and is never mentioned — `SPECS.md` §2.10 |
+///
+/// `Sign(-0.0)` **is** determined: `-0.0 == 0` is true, so the specified answer is `0`. Only
+/// `NaN` is excluded, and narrowing the exclusion to exactly what is undetermined is the point.
+pub fn undetermined_for(op: OpKind) -> Excluded {
+    match op {
+        OpKind::Max | OpKind::Min => Excluded {
+            nan: true,
+            negative_zero: true,
+        },
+        OpKind::Sign => Excluded {
+            nan: true,
+            negative_zero: false,
+        },
+        _ => Excluded::default(),
+    }
+}
+
 const SPECIAL_F32: [f32; 10] = [
     0.0,
     -0.0,
@@ -83,7 +122,7 @@ pub fn with_specials(
     elem: ElemType,
     count: usize,
     rate: f64,
-    exclude_nan: bool,
+    exclude: Excluded,
     rng: &mut SeededRng,
 ) -> TensorData {
     match elem {
@@ -91,7 +130,7 @@ pub fn with_specials(
             (0..count)
                 .map(|_| {
                     if rng.random_bool(rate) {
-                        pick_f32(exclude_nan, rng)
+                        pick_f32(exclude, rng)
                     } else {
                         rng.random_range(-100.0..100.0)
                     }
@@ -102,7 +141,7 @@ pub fn with_specials(
             (0..count)
                 .map(|_| {
                     if rng.random_bool(rate) {
-                        f64::from(pick_f32(exclude_nan, rng))
+                        f64::from(pick_f32(exclude, rng))
                     } else {
                         f64::from(rng.random_range(-100.0f32..100.0))
                     }
@@ -140,10 +179,15 @@ pub fn with_specials(
     }
 }
 
-fn pick_f32(exclude_nan: bool, rng: &mut SeededRng) -> f32 {
+fn pick_f32(exclude: Excluded, rng: &mut SeededRng) -> f32 {
     loop {
         let value = SPECIAL_F32[rng.random_range(0..SPECIAL_F32.len())];
-        if exclude_nan && value.is_nan() {
+        if exclude.nan && value.is_nan() {
+            continue;
+        }
+        // Checked on the **bit pattern**: `-0.0 == 0.0` is true, so a value comparison would
+        // fail to exclude anything at all here.
+        if exclude.negative_zero && value.to_bits() == (-0.0f32).to_bits() {
             continue;
         }
         return value;

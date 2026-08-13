@@ -146,6 +146,38 @@ pub const CATALOG: &[LegalDifference] = &[
                changed between its 2008 and 2019 revisions. Neither document pins it down.",
     },
     LegalDifference {
+        id: "max-min-signed-zero",
+        operators: &[OpKind::Max, OpKind::Min],
+        elem_types: &[ElemType::F32, ElemType::F64],
+        what: "which zero is returned when the operands are +0.0 and -0.0",
+        handling: Handling::DeclinedByGenerator,
+        citation: Citation {
+            specs_section: "2.9",
+            url: "https://onnx.ai/onnx/operators/onnx__Min.html",
+            kind: SourceKind::Primary,
+        },
+        note: "The Min page mentions neither signed zero nor NaN in any of its five versions, and \
+               these are not IEEE-754 basic operations. Found by the N6.6 funnel: reference, ONNX \
+               Runtime and tract return -0.0 while candle returns +0.0 — three against one, which \
+               looks exactly like a defect and is not one.",
+    },
+    LegalDifference {
+        id: "sign-of-nan",
+        operators: &[OpKind::Sign],
+        elem_types: &[ElemType::F32, ElemType::F64],
+        what: "the result of Sign(NaN)",
+        handling: Handling::DeclinedByGenerator,
+        citation: Citation {
+            specs_section: "2.10",
+            url: "https://onnx.ai/onnx/operators/onnx__Sign.html",
+            kind: SourceKind::Primary,
+        },
+        note: "The page specifies > 0, < 0 and == 0 only. NaN satisfies none of them and is never \
+               mentioned. Reference, ONNX Runtime and tract return NaN; candle returns 0.0, which \
+               is a defensible reading of the same text. Sign(-0.0) is NOT excluded — -0.0 == 0 \
+               is true, so that answer is specified.",
+    },
+    LegalDifference {
         id: "cast-out-of-range",
         operators: &[OpKind::Cast],
         elem_types: &[ElemType::F32, ElemType::F64],
@@ -362,6 +394,8 @@ mod tests {
         let generator = OnnxGenerator::new(Bounds::default().with_special_values());
         let mut divisor_zeros = 0;
         let mut maxmin_nans = 0;
+        let mut maxmin_negative_zeros = 0;
+        let mut sign_nans = 0;
 
         for seed in 0..3000u64 {
             let case = generator.generate(&mut SeededRng::from_seed(seed));
@@ -377,7 +411,31 @@ mod tests {
                 }
                 OpKind::Max | OpKind::Min => {
                     for input in &case.inputs {
-                        maxmin_nans += match &input.data {
+                        // Signed zero is checked on the **bit pattern**: `-0.0 == 0.0` is true,
+                        // so a value comparison here would find nothing however broken the
+                        // generator was.
+                        match &input.data {
+                            TensorData::F32(v) => {
+                                maxmin_nans += v.iter().filter(|x| x.is_nan()).count();
+                                maxmin_negative_zeros += v
+                                    .iter()
+                                    .filter(|x| x.to_bits() == (-0.0f32).to_bits())
+                                    .count();
+                            }
+                            TensorData::F64(v) => {
+                                maxmin_nans += v.iter().filter(|x| x.is_nan()).count();
+                                maxmin_negative_zeros += v
+                                    .iter()
+                                    .filter(|x| x.to_bits() == (-0.0f64).to_bits())
+                                    .count();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                OpKind::Sign => {
+                    for input in &case.inputs {
+                        sign_nans += match &input.data {
                             TensorData::F32(v) => v.iter().filter(|x| x.is_nan()).count(),
                             TensorData::F64(v) => v.iter().filter(|x| x.is_nan()).count(),
                             _ => 0,
@@ -389,5 +447,10 @@ mod tests {
         }
         assert_eq!(divisor_zeros, 0, "integer-division-by-zero was generated");
         assert_eq!(maxmin_nans, 0, "max-min-nan was generated");
+        assert_eq!(
+            maxmin_negative_zeros, 0,
+            "max-min-signed-zero was generated"
+        );
+        assert_eq!(sign_nans, 0, "sign-of-nan was generated");
     }
 }
