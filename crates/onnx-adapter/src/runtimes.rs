@@ -758,13 +758,23 @@ mod tests {
     /// > if input < 0, output -1. **if input == 0, output 0.**"
     /// > — [ONNX `Sign` reference](https://onnx.ai/onnx/operators/onnx__Sign.html)
     ///
-    /// `onnx.reference` and ONNX Runtime both produce `0`; `tract` produces `1`. The float
-    /// paths are correct, so this is specifically the integer path.
+    /// `onnx.reference` and ONNX Runtime both produce `0`; `tract` produces `1`.
+    ///
+    /// **Correction 2026-08-13:** an earlier version of this comment said the float paths
+    /// were correct and that this was specifically the integer path. That was wrong — `tract`
+    /// also returns `-0.0` for `Sign(-0.0)` on floats (F-005, and `tests/published_reproductions.rs`
+    /// pins it). The original claim came from testing values that included `+0.0` and never
+    /// `-0.0`. `Sign` mishandles zero on both type families.
     ///
     /// **The assertion is written to fail when the bug is FIXED**, not while it exists. A
     /// finding recorded only in prose rots: nobody notices when it is fixed, and the report
     /// goes stale. This way a `tract` upgrade that corrects it turns the suite red, which is
     /// the moment to update `FINDING-001` and close it out.
+    ///
+    /// **This is now expected to fire on the next `tract` upgrade.** The integer path is already
+    /// fixed on `main` by [tract#2533](https://github.com/sonos/tract/pull/2533), merged
+    /// 30 July 2026 — three weeks after our pinned 0.23.4, and not yet in any release. When the
+    /// pin moves past that, this test going red is the *good* outcome and F-001 closes.
     #[test]
     fn finding_001_tract_sign_of_integer_zero() {
         use crate::case::{ElemType, TensorData};
