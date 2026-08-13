@@ -14,6 +14,7 @@
 //! upgraded and the behaviour changes, this fails, and the report gets corrected or withdrawn
 //! **before** it is sent rather than after.
 use diff_fuzzer_core::traits::Implementation;
+use onnx_adapter::attrs::Attrs;
 use onnx_adapter::case::{OnnxCase, OpKind, TensorData, TensorValue};
 use onnx_adapter::outcome::OnnxOutcome;
 use onnx_adapter::reference::ReferenceRuntime;
@@ -167,4 +168,61 @@ fn onnxruntime_001_f64_claim_still_holds() {
         bits(&reference.run(&case).expect("never Err")),
         vec![NEG_ZERO_F64]
     );
+}
+
+/// The `Reshape` model both F-002 reports are built on.
+fn zero_size_reshape() -> OnnxCase {
+    OnnxCase::new(
+        OpKind::Reshape,
+        22,
+        vec![
+            TensorValue::f32("a", vec![3, 0], vec![]),
+            TensorValue::new("b", vec![1], TensorData::I64(vec![0])).as_initializer(),
+        ],
+    )
+    .with_attrs(Attrs::new().int("allowzero", 1))
+}
+
+/// **`final/tract-002-body.md`** — the reference and ONNX Runtime accept it; `tract` does not.
+#[test]
+fn tract_002_zero_size_reshape_still_reproduces() {
+    let reference = ReferenceRuntime::start().expect("reference");
+    let case = zero_size_reshape();
+
+    assert!(
+        matches!(reference.run(&case).expect("never Err"), OnnxOutcome::Ok(_)),
+        "the report rests on the reference accepting this model"
+    );
+    assert!(matches!(
+        OrtRuntime.run(&case).expect("never Err"),
+        OnnxOutcome::Ok(_)
+    ));
+    assert!(
+        matches!(
+            TractRuntime.run(&case).expect("never Err"),
+            OnnxOutcome::Rejected { .. }
+        ),
+        "tract now accepts this — the report must be withdrawn or corrected"
+    );
+}
+
+/// **`final/candle-001-body.md`** — and the error text is the report's entire argument.
+///
+/// The claim is that candle reports `rhs: [3]`, which is the `allowzero=0` reading of the target.
+/// If that message ever changes, the inference in the report no longer follows from it, and the
+/// report should not be sent as written.
+#[cfg(feature = "candle")]
+#[test]
+fn candle_001_error_still_names_the_copied_dimension() {
+    use onnx_adapter::runtimes::CandleRuntime;
+    let case = zero_size_reshape();
+    match CandleRuntime.run(&case).expect("never Err") {
+        OnnxOutcome::Rejected { detail } => {
+            assert!(
+                detail.contains("[3]"),
+                "the report argues from candle reporting rhs: [3]; it now says: {detail}"
+            );
+        }
+        other => panic!("candle now accepts this — the report must be corrected: {other:?}"),
+    }
 }
