@@ -100,6 +100,15 @@ pub const PROBLEMS: &[Problem] = &[
         operator: OpKind::Reshape,
         kind: Kind::RejectedVersusOk,
     },
+    Problem {
+        id: "P-004",
+        finding: "F-006",
+        implementation: "tract",
+        what: "Div panics on int32::MIN / -1, which ONNX leaves undetermined",
+        status: Status::Candidate,
+        operator: OpKind::Div,
+        kind: Kind::Crash,
+    },
 ];
 
 /// A campaign's grouping of signatures into problems.

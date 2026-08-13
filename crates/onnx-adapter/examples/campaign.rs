@@ -205,9 +205,14 @@ fn main() {
     .expect("log");
 
     let mut run = Run::open(onnx_adapter::OracleKind::Differential, &run_name).expect("run dir");
-    let (mut sentinel, recovered) =
-        CrashSentinel::open(format!("{}/in-flight.json", onnx_adapter::FINDINGS_ROOT))
-            .expect("sentinel");
+    // **Per-run, not shared.** Two campaigns running concurrently — which is exactly how a real
+    // run and its control are meant to be run — would otherwise overwrite each other's in-flight
+    // record, and the evidence of which case killed a process would name the wrong process.
+    let (mut sentinel, recovered) = CrashSentinel::open(format!(
+        "{}/in-flight-{run_name}.json",
+        onnx_adapter::FINDINGS_ROOT
+    ))
+    .expect("sentinel");
     if let Some(in_flight) = &recovered {
         log.say(format!(
             "*** a previous run died on {} / {} (seed {}) — that case is itself a finding ***",

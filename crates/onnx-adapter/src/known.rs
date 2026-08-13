@@ -146,6 +146,23 @@ pub const CATALOG: &[LegalDifference] = &[
                changed between its 2008 and 2019 revisions. Neither document pins it down.",
     },
     LegalDifference {
+        id: "integer-division-overflow",
+        operators: &[OpKind::Div],
+        elem_types: &[ElemType::I32, ElemType::I64],
+        what: "the result of MIN / -1, whose true value is not representable",
+        handling: Handling::DeclinedByGenerator,
+        citation: Citation {
+            specs_section: "2.11",
+            url: "https://onnx.ai/onnx/operators/onnx__Div.html",
+            kind: SourceKind::Primary,
+        },
+        note: "The Div page specifies truncating division and says nothing about overflow. \
+               onnx.reference and ONNX Runtime wrap to MIN; tract panics with \"attempt to divide \
+               with overflow\". Declined by keeping -1 out of integer divisors, which makes the \
+               pair unreachable. The panic is separately preserved as candidate finding F-006 — \
+               declining a case and reporting a behaviour are not in conflict.",
+    },
+    LegalDifference {
         id: "max-min-signed-zero",
         operators: &[OpKind::Max, OpKind::Min],
         elem_types: &[ElemType::F32, ElemType::F64],
@@ -393,6 +410,7 @@ mod tests {
 
         let generator = OnnxGenerator::new(Bounds::default().with_special_values());
         let mut divisor_zeros = 0;
+        let mut divisor_minus_ones = 0;
         let mut maxmin_nans = 0;
         let mut maxmin_negative_zeros = 0;
         let mut sign_nans = 0;
@@ -405,6 +423,13 @@ mod tests {
                         divisor_zeros += match &divisor.data {
                             TensorData::I32(v) => v.iter().filter(|x| **x == 0).count(),
                             TensorData::I64(v) => v.iter().filter(|x| **x == 0).count(),
+                            _ => 0,
+                        };
+                        // `-1` too: paired with a `MIN` dividend it overflows, and ONNX does not
+                        // say what that produces.
+                        divisor_minus_ones += match &divisor.data {
+                            TensorData::I32(v) => v.iter().filter(|x| **x == -1).count(),
+                            TensorData::I64(v) => v.iter().filter(|x| **x == -1).count(),
                             _ => 0,
                         };
                     }
@@ -446,6 +471,10 @@ mod tests {
             }
         }
         assert_eq!(divisor_zeros, 0, "integer-division-by-zero was generated");
+        assert_eq!(
+            divisor_minus_ones, 0,
+            "integer-division-overflow was reachable: a -1 divisor can pair with a MIN dividend"
+        );
         assert_eq!(maxmin_nans, 0, "max-min-nan was generated");
         assert_eq!(
             maxmin_negative_zeros, 0,

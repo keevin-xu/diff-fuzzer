@@ -272,20 +272,41 @@ pub fn cast_safe(elem: ElemType, count: usize, rate: f64, rng: &mut SeededRng) -
 /// Floats are **not** restricted: division by zero is defined by IEEE-754 and produces
 /// `±inf`/`NaN`, which is specified behaviour and exactly the surface this domain wants.
 pub fn nonzero(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData {
+    // **Neither `0` nor `-1`.**
+    //
+    // `0` because ONNX never says what integer division by zero produces (`SPECS.md` §2.2b).
+    //
+    // `-1` because of a *correlated* case the per-value exclusions cannot express: `MIN / -1`
+    // overflows, since the true result is `2^31` and does not fit. ONNX specifies truncating
+    // division and is **silent on overflow** (`SPECS.md` §2.11), so the answer is undetermined —
+    // `onnx.reference` and ONNX Runtime wrap, `tract` panics with "attempt to divide with
+    // overflow". Excluding `-1` from the divisor is the cheapest way to make the pair
+    // unreachable; excluding `MIN` from the dividend would cost a boundary value that matters
+    // elsewhere, while `-1` as a divisor is only a sign flip.
+    //
+    // The behaviour itself is preserved as a candidate finding (F-006) rather than discarded —
+    // declining to generate it and reporting it are not in conflict.
+    let avoid = |value: i64| value == 0 || value == -1;
     match elem {
         ElemType::I32 => TensorData::I32(
             (0..count)
                 .map(|_| {
-                    let value = rng.random_range(-100..99);
-                    if value >= 0 { value + 1 } else { value }
+                    let mut value = rng.random_range(-100..100);
+                    while avoid(i64::from(value)) {
+                        value = rng.random_range(-100..100);
+                    }
+                    value
                 })
                 .collect(),
         ),
         ElemType::I64 => TensorData::I64(
             (0..count)
                 .map(|_| {
-                    let value = rng.random_range(-100i64..99);
-                    if value >= 0 { value + 1 } else { value }
+                    let mut value = rng.random_range(-100i64..100);
+                    while avoid(value) {
+                        value = rng.random_range(-100i64..100);
+                    }
+                    value
                 })
                 .collect(),
         ),
