@@ -440,15 +440,17 @@ pub fn generate_case(
             let dims = shape(bounds, rng);
             // The output type, chosen here because the zero-point carries it (§2q.1).
             let target = *pick(&ElemType::QUANTIZED, rng);
+            // **The scale is chosen before the values, so the values can be aligned to it.**
+            // Reversing this was the reason the rounding-mode probe did not exist: with the
+            // values drawn first, there is nothing to be exactly halfway *between*.
+            let scale = scale_tensor(bounds, rng);
+            let scale_value = scale_of(&scale);
             OnnxCase::new(
                 op,
                 opset,
                 vec![
-                    // Finite for the same reason as `DynamicQuantize` above: `x / scale` with a
-                    // non-finite `x` is non-finite, and what saturating *that* to an 8-bit range
-                    // produces is not something ONNX states. `SPECS.md` §2q.6.
-                    finite_tensor("a", &dims, elem, rng),
-                    scale_tensor(bounds, rng),
+                    quantize_input("a", &dims, elem, scale_value, bounds, rng),
+                    scale,
                     zero_point_tensor("zero_point", target, rng),
                 ],
             )
@@ -514,7 +516,11 @@ pub fn generate_case(
         // "ONNX is silent, so two runtimes differ". `SPECS.md` §2q.6.
         Family::DynamicQuantize => {
             let dims = non_empty_shape(bounds, rng);
-            OnnxCase::new(op, opset, vec![finite_tensor("a", &dims, elem, rng)])
+            OnnxCase::new(
+                op,
+                opset,
+                vec![dynamic_quantize_input("a", &dims, elem, bounds, rng)],
+            )
         }
 
         Family::BinaryElementwise | Family::Comparison => {
@@ -853,6 +859,135 @@ fn factorization(total: i64, bounds: &Bounds, rng: &mut SeededRng) -> Vec<i64> {
 /// `NaN` exclusions apply everywhere rather than at whichever call site remembered them. That
 /// is the same rule as `shape_bounded`: a property belongs in the construction path, not at the
 /// sites where it was first needed.
+/// Values for a quantizer's input, **some of them exactly halfway between two levels**.
+///
+/// # The rounding-mode probe
+///
+/// `PHASE-N9` names this explicitly: *"values exactly halfway between quantization levels (the
+/// rounding-mode probe)"*. It is the single most discriminating input a quantizer can be given,
+/// because half-to-even and half-away-from-zero agree on **every other value** and differ only
+/// here (`SPECS.md` §2q.1).
+///
+/// **It was missing, and the cost was measurable.** F-008 — `tract` adding the zero-point before
+/// rounding rather than after — is visible *only* on an exact tie, and was found by a uniformly
+/// random value happening to land on one: about **1 in 57,000 cases**. Generating ties on purpose
+/// turns a coincidence into a probe.
+///
+/// # Why ties are exact here, and would not otherwise be
+///
+/// A tie must survive `x / scale` in `f32`. For an arbitrary scale it does not: `(n + 0.5) * scale`
+/// rounds, and dividing back gives something merely *near* `n + 0.5`, which rounds unambiguously
+/// and probes nothing.
+///
+/// So a tie is only emitted when the scale is a **power of two**, where multiplication and division
+/// are exact in binary floating point and `x / scale` recovers `n + 0.5` bit for bit. That is why
+/// [`scale_tensor`] offers powers of two at all.
+fn quantize_input(
+    name: &str,
+    dims: &[i64],
+    elem: ElemType,
+    scale: f32,
+    bounds: &Bounds,
+    rng: &mut SeededRng,
+) -> TensorValue {
+    let count = element_count(dims) as usize;
+    let mut data = gen_value::ordinary(elem, count, rng);
+
+    // Only meaningful when the values are floats and the scale is an exact power of two.
+    if bounds.special_values
+        && scale.is_finite()
+        && scale > 0.0
+        && is_power_of_two(scale)
+        && let TensorData::F32(values) = &mut data
+    {
+        for value in values.iter_mut() {
+            if rng.random_bool(bounds.special_value_rate) {
+                // n + 0.5 for a small n, so the quantized result stays well inside the
+                // 8-bit range whatever the zero-point turns out to be.
+                let n = rng.random_range(-60..60) as f32;
+                *value = (n + 0.5) * scale;
+            }
+        }
+    }
+    TensorValue::new(name, dims.to_vec(), data)
+}
+
+/// Values for `DynamicQuantizeLinear`, constructed so the **derived** scale is a power of two
+/// and the values sit exactly on rounding ties.
+///
+/// # Why this needs constructing rather than sampling
+///
+/// `DynamicQuantizeLinear` takes no parameters — it derives `y_scale` from the data
+/// (`SPECS.md` §2q.4):
+///
+/// ```text
+/// y_scale = (max(0, max(x)) - min(0, min(x))) / 255
+/// ```
+///
+/// So the rounding-mode probe cannot be aimed at a scale that was chosen; the scale has to be
+/// *arranged* by choosing the data. Pick a power of two `s`, split `255 * s` across the minimum
+/// and maximum, and the derived scale is exactly `s`:
+///
+/// ```text
+/// min = -m*s,  max = (255-m)*s   =>   (max - min) / 255 = 255*s / 255 = s
+/// ```
+///
+/// Every step is exact in `f32`: `255 * s` is exact for a power-of-two `s`, and dividing it by 255
+/// returns exactly `s`. The remaining values are then `(n + 0.5) * s`, which divide back to exactly
+/// `n + 0.5` — real ties, not near misses.
+///
+/// **This is what turns F-008 from a coincidence into a probe.** That defect is visible only on an
+/// exact tie with an odd zero-point, and was found by a uniform draw landing on one at roughly 1 in
+/// 57,000 cases.
+fn dynamic_quantize_input(
+    name: &str,
+    dims: &[i64],
+    elem: ElemType,
+    bounds: &Bounds,
+    rng: &mut SeededRng,
+) -> TensorValue {
+    let count = element_count(dims) as usize;
+    if !bounds.special_values || elem != ElemType::F32 || count < 2 {
+        return finite_tensor(name, dims, elem, rng);
+    }
+
+    const POWERS_OF_TWO: [f32; 6] = [0.015_625, 0.062_5, 0.25, 0.5, 1.0, 2.0];
+    let scale = *pick(&POWERS_OF_TWO, rng);
+    // How much of the 255-step range sits below zero. Kept off both ends so the derived
+    // zero-point is interior, and **often odd** — the parity is half of what F-008 needs.
+    let below = rng.random_range(1..255) as f32;
+
+    let mut values = vec![-below * scale, (255.0 - below) * scale];
+    for _ in 2..count {
+        if rng.random_bool(bounds.special_value_rate.max(0.5)) {
+            // An exact tie, kept inside the range the two extremes established.
+            let n = rng.random_range(-(below as i64) + 1..(255.0 - below) as i64);
+            values.push((n as f32 + 0.5) * scale);
+        } else {
+            values.push(rng.random_range(-below * scale..(255.0 - below) * scale));
+        }
+    }
+    // The extremes must not sit predictably first, or every case shares a layout.
+    let n = values.len();
+    for i in (1..n).rev() {
+        values.swap(i, rng.random_range(0..=i));
+    }
+    TensorValue::new(name, dims.to_vec(), TensorData::F32(values))
+}
+
+/// Whether an `f32` is an exact power of two — mantissa all zero and the exponent normal.
+fn is_power_of_two(value: f32) -> bool {
+    value > 0.0 && value.is_finite() && (value.to_bits() & 0x007f_ffff) == 0
+}
+
+/// Read a scale back out of the tensor it was built into.
+fn scale_of(tensor: &TensorValue) -> f32 {
+    match &tensor.data {
+        TensorData::F32(v) => v.first().copied().unwrap_or(1.0),
+        _ => 1.0,
+    }
+}
+
 /// A tensor of **finite** values only.
 ///
 /// The quantization operators divide by a scale and saturate into an 8-bit range; an infinity or
@@ -899,7 +1034,22 @@ fn pick<'a, T>(choices: &'a [T], rng: &mut SeededRng) -> &'a T {
 /// past the boundary) and coarse quantization (a large scale collapses distinct inputs onto one
 /// level) are reachable.
 fn scale_tensor(bounds: &Bounds, rng: &mut SeededRng) -> TensorValue {
-    let scale = if bounds.special_values && rng.random_bool(bounds.special_value_rate) {
+    // **Powers of two are offered deliberately, not decoratively.** They are the only scales for
+    // which `(n + 0.5) * scale` divides back to exactly `n + 0.5` in `f32`, so they are what makes
+    // the rounding-mode probe in `quantize_input` an exact tie rather than a near miss.
+    const POWERS_OF_TWO: [f32; 8] = [
+        0.003_906_25, // 2^-8
+        0.015_625,    // 2^-6
+        0.062_5,      // 2^-4
+        0.25,         // 2^-2
+        0.5,
+        1.0,
+        2.0,
+        4.0,
+    ];
+    let scale = if bounds.special_values && rng.random_bool(0.5) {
+        *pick(&POWERS_OF_TWO, rng)
+    } else if bounds.special_values && rng.random_bool(bounds.special_value_rate) {
         *pick(&[1.0e-3_f32, 1.0e-2, 0.5, 1.0, 1.0e2], rng)
     } else {
         rng.random_range(0.01_f32..2.0)
