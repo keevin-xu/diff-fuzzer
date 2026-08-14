@@ -44,6 +44,7 @@ use std::collections::BTreeMap;
 use diff_fuzzer_core::axes::GenerationAxes;
 use diff_fuzzer_core::rng::SeededRng;
 use diff_fuzzer_core::traits::{Generator, Implementation};
+use onnx_adapter::capability::{Capabilities, WithCapabilities};
 use onnx_adapter::case::{OnnxCase, TensorValue};
 use onnx_adapter::findings::{CampaignLog, Run, StoredFinding};
 use onnx_adapter::gen_shape::Bounds;
@@ -248,21 +249,76 @@ fn main() {
 
     let generator = OnnxGenerator::new(bounds.clone());
 
+    // **Every participant is capability-gated, exactly as the differential campaign gates them.**
+    //
+    // This example originally used the bare runtimes. For `tract` and ONNX Runtime that is
+    // provably inert — the census records both as representing all seven element types, so the
+    // representability gate never fires, and the wrapper's only other effect is to reclassify
+    // `Rejected` as `Unsupported`, which the relations map to `NotApplicable` either way.
+    //
+    // For candle it is decisive. The census measures its representable types as **`F32`, `F64`
+    // and `I64` only** — it has no `Bool`. Run ungated, candle answers `Less` with a `uint8`
+    // tensor, and `shape_matches_inference` correctly observes that the inferred type was
+    // `Bool`: **1,501 violations in 20,000 cases, every one of them ours.** `capability.rs` had
+    // already written this hazard down, about `Cast` to `int32`.
+    //
+    // The gate must wrap the runtime *inside* the saboteur, not outside it: `WithCapabilities`
+    // keys on `inner.name()`, and a saboteur renames its inner runtime, so an outer gate would
+    // look up "candle-wrong-shape", find nothing measured, and conclude nothing.
+    let caps = Capabilities::load(&format!("{}/census.json", onnx_adapter::FINDINGS_ROOT))
+        .expect("run the n2_census example first");
+    let drift = caps.is_stale_for(&onnx_adapter::environment::environment().components);
+    assert!(drift.is_empty(), "the census is stale: {drift:?}");
+
+    let tract = WithCapabilities::new(TractRuntime, &caps);
+    let ort = WithCapabilities::new(OrtRuntime, &caps);
+
     // All three saboteurs are built regardless of which is used, so each binding outlives the
     // trait-object references taken below. A `match` returning them directly would drop the
     // unselected ones at the end of the arm.
-    let shape_tract = WrongShape::new(TractRuntime);
-    let shape_ort = WrongShape::new(OrtRuntime);
+    let shape_tract = WrongShape::new(WithCapabilities::new(TractRuntime, &caps));
+    let shape_ort = WrongShape::new(WithCapabilities::new(OrtRuntime, &caps));
     // A delta far larger than any rounding difference, for the same reason `WrongValues` documents:
     // a fault the oracle might mistake for noise proves nothing.
-    let values_tract = WrongValues::new(TractRuntime, 7.0);
-    let values_ort = WrongValues::new(OrtRuntime, 7.0);
+    let values_tract = WrongValues::new(WithCapabilities::new(TractRuntime, &caps), 7.0);
+    let values_ort = WrongValues::new(WithCapabilities::new(OrtRuntime, &caps), 7.0);
     // Corrupt at opset 22 and above. Cases are generated at 22 and `opset-invariance` derives the
     // *older* twin, so exactly one side of that comparison is corrupted.
-    let opset_tract = WrongAtOpset::new(TractRuntime, 22, 7.0);
-    let opset_ort = WrongAtOpset::new(OrtRuntime, 22, 7.0);
+    let opset_tract = WrongAtOpset::new(WithCapabilities::new(TractRuntime, &caps), 22, 7.0);
+    let opset_ort = WrongAtOpset::new(WithCapabilities::new(OrtRuntime, &caps), 22, 7.0);
 
-    let participants: Vec<(&str, &dyn Implementation<In = OnnxCase, Out = OnnxOutcome>)> =
+    // **candle, the runtime the relations had never been asked about.**
+    //
+    // The first metamorphic campaign ran on `tract` and ONNX Runtime — the two most mature
+    // participants — and returned 0 violations over 11,750,917 checks. A zero drawn only from the
+    // strongest implementations is the weakest form of that zero, and candle is the one already
+    // implicated in two findings (`Reshape` of a zero-size tensor, and `allowzero`).
+    //
+    // It is also where the relations' structural advantage lies: a relation judges **one**
+    // implementation against a rule, so it can reach a case only candle supports — 159,711 cases
+    // (5.3%) of the differential campaign were skipped for having fewer than two runtimes to
+    // compare. `PENDING` 2.12.
+    #[cfg(feature = "candle")]
+    let candle = WithCapabilities::new(onnx_adapter::runtimes::CandleRuntime, &caps);
+    #[cfg(feature = "candle")]
+    let shape_candle = WrongShape::new(WithCapabilities::new(
+        onnx_adapter::runtimes::CandleRuntime,
+        &caps,
+    ));
+    #[cfg(feature = "candle")]
+    let values_candle = WrongValues::new(
+        WithCapabilities::new(onnx_adapter::runtimes::CandleRuntime, &caps),
+        7.0,
+    );
+    #[cfg(feature = "candle")]
+    let opset_candle = WrongAtOpset::new(
+        WithCapabilities::new(onnx_adapter::runtimes::CandleRuntime, &caps),
+        22,
+        7.0,
+    );
+
+    #[cfg_attr(not(feature = "candle"), allow(unused_mut))]
+    let mut participants: Vec<(&str, &dyn Implementation<In = OnnxCase, Out = OnnxOutcome>)> =
         if args.control {
             match args.fault {
                 Fault::Shape => vec![("tract", &shape_tract), ("onnxruntime", &shape_ort)],
@@ -270,8 +326,22 @@ fn main() {
                 Fault::AtOpset => vec![("tract", &opset_tract), ("onnxruntime", &opset_ort)],
             }
         } else {
-            vec![("tract", &TractRuntime), ("onnxruntime", &OrtRuntime)]
+            vec![("tract", &tract), ("onnxruntime", &ort)]
         };
+
+    // Appended rather than written into each arm, so the sabotaged and real paths cannot drift
+    // apart on which runtimes take part — the failure the differential campaign's participant
+    // list has already had once.
+    #[cfg(feature = "candle")]
+    if args.control {
+        participants.push(match args.fault {
+            Fault::Shape => ("candle", &shape_candle),
+            Fault::Values => ("candle", &values_candle),
+            Fault::AtOpset => ("candle", &opset_candle),
+        });
+    } else {
+        participants.push(("candle", &candle));
+    }
 
     let mut log = CampaignLog::open(&run_name).expect("opening the campaign log");
     log.header(&run_name, &bounds.description())
