@@ -15,6 +15,7 @@ directory follows it.
 | `tract-002-*` | [sonos/tract](https://github.com/sonos/tract) | `Reshape` of a zero-size tensor fails to load | `../FINDING-002-reshape-empty-tensor.md` |
 | `candle-001-*` | [huggingface/candle](https://github.com/huggingface/candle) | `Reshape` appears to ignore `allowzero=1` | `../FINDING-007-candle-reshape-allowzero.md` |
 | `tract-003-*` | [sonos/tract](https://github.com/sonos/tract) | `DynamicQuantizeLinear` rounds ties away from zero | `../FINDING-008-tract-dynamicquantize-rounding-mode.md` |
+| `tract-004-*` | [sonos/tract](https://github.com/sonos/tract) | `Div` on `int32` panics on `int32::MIN / -1` | `../FINDING-006-tract-div-overflow.md` |
 
 ## Not here, and why
 
@@ -22,13 +23,14 @@ directory follows it.
 |---|---|
 | F-001 — `tract` `Sign(0) = 1` for integers | **Fixed upstream** by tract#2533, merged three weeks after our pinned release. Correct finding, wrong thing to send. |
 | F-003 — candle at rank 0 | candle's operator coverage is openly incomplete; telling its maintainers so is not worth their time. |
-| F-006 — `tract` panics on `int32::MIN / -1` | **Not a triage gap — a judgement.** Minimised to one element, root-caused to Rust's division operator, tracker searched, no duplicate. ONNX specifies truncating division and says nothing about overflow, so whether a panic is a defect or one legal response among several is a call somebody has to make. Awaiting Kevin. |
 
 ## Form notes
 
 **tract** has no issue template — a plain body.
 
 **F-002 became two reports**, not one: `tract` and candle fail the same model for different reasons, and one issue describing both would ask each maintainer to read about the other's runtime.
+
+**F-006 is written as a question too**, and for the same reason: ONNX is silent on integer overflow, so the honest form is "the reference and ONNX Runtime both wrap; is a panic intended?" It costs nothing if the answer is that the input is nonsense.
 
 **Both F-002 reports are written as questions**, not assertions — the specification does not address zero-size tensors directly, so the honest form is "the reference and ONNX Runtime both execute this; should it load?"
 

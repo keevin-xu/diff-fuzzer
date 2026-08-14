@@ -1,0 +1,1 @@
+Div on int32 panics on int32::MIN / -1 — is a panic intended for an unrepresentable quotient?
