@@ -405,3 +405,53 @@ fn tract_003_an_even_zero_point_shows_it_is_the_rounding_mode_not_the_order() {
         "5 means half-away-from-zero rounding; 4 would have meant the zero-point was added first"
     );
 }
+
+/// **F-006 minimised: one element each side.**
+///
+/// `Div` on `int32` where the dividend is `int32::MIN` and the divisor is `-1`. The true quotient
+/// `2147483648` is not representable, and ONNX specifies truncating division while saying nothing
+/// about overflow (`SPECS.md` §2.11).
+///
+/// **Built by hand rather than shrunk**, because the generator now declines this exact pair
+/// (`gen_value::decline_min_over_negative_one`) — so the case cannot be reached from a seed, and
+/// the draft's "minimise" item could only ever be discharged this way. The observed cases were
+/// 245 and 252 elements.
+///
+/// The assertion is deliberately about the **class** of outcome rather than the panic message:
+/// `tract` crashing is the finding, and the wording of a Rust panic is not something a report
+/// should depend on.
+#[test]
+fn f006_int32_min_divided_by_negative_one_still_crashes_tract() {
+    let case = OnnxCase::new(
+        OpKind::Div,
+        22,
+        vec![
+            TensorValue::new("a", vec![1], TensorData::I32(vec![i32::MIN])),
+            TensorValue::new("b", vec![1], TensorData::I32(vec![-1])),
+        ],
+    );
+
+    let reference = ReferenceRuntime::start()
+        .expect("reference")
+        .run(&case)
+        .expect("never Err");
+    let ort = OrtRuntime.run(&case).expect("never Err");
+    let tract = TractRuntime.run(&case).expect("never Err");
+
+    // Both wrap, and they agree — which is what makes tract's behaviour stand out rather than
+    // being one of three different answers.
+    let wrapped = |outcome: &OnnxOutcome| match outcome {
+        OnnxOutcome::Ok(tensors) => match &tensors[0].data {
+            TensorData::I32(v) => v.clone(),
+            other => panic!("expected int32, got {other:?}"),
+        },
+        other => panic!("expected a result, got {other:?}"),
+    };
+    assert_eq!(wrapped(&reference), vec![i32::MIN]);
+    assert_eq!(wrapped(&ort), vec![i32::MIN]);
+
+    assert!(
+        matches!(tract, OnnxOutcome::Crashed { .. }),
+        "the whole finding is that tract does not return a value here; got {tract:?}"
+    );
+}
