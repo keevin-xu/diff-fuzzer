@@ -43,8 +43,8 @@ use crate::census::{Census, Support};
 /// What the runtimes claim, derived from a census.
 #[derive(Debug, Clone)]
 pub struct Capabilities {
-    claimed: BTreeSet<(String, String, ElemType, usize)>,
-    measured: BTreeSet<(String, String, ElemType, usize)>,
+    claimed: BTreeSet<(String, String, ElemType, usize, i64)>,
+    measured: BTreeSet<(String, String, ElemType, usize, i64)>,
     environment: Vec<(String, String)>,
     taken: String,
     opset: i64,
@@ -66,6 +66,7 @@ impl Capabilities {
                 cell.op.clone(),
                 cell.elem_type,
                 cell.rank,
+                cell.opset,
             );
             measured.insert(key.clone());
             if cell.support == Support::Supported {
@@ -98,14 +99,42 @@ impl Capabilities {
     /// A rank the census never probed — anything above [`crate::ops::PROBED_RANKS`] — falls
     /// back to the **highest probed rank**, since implementations that work at rank 3 do not
     /// generally break at rank 4, while rank 0 and 1 are the genuine boundaries.
-    pub fn claims(&self, runtime: &str, op: OpKind, elem: ElemType, rank: usize) -> bool {
+    pub fn claims(
+        &self,
+        runtime: &str,
+        op: OpKind,
+        elem: ElemType,
+        rank: usize,
+        opset: i64,
+    ) -> bool {
         let probed = rank.min(*crate::ops::PROBED_RANKS.last().expect("non-empty"));
-        self.claimed.contains(&(
-            runtime.to_string(),
-            op.onnx_name().to_string(),
-            elem,
-            probed,
-        ))
+        let claimed_at = |probe_opset: i64| {
+            self.claimed.contains(&(
+                runtime.to_string(),
+                op.onnx_name().to_string(),
+                elem,
+                probed,
+                probe_opset,
+            ))
+        };
+
+        // **The census probes the ends of an operator's span; a case may sit anywhere in it.**
+        //
+        // An exact hit answers directly. Otherwise the claim is the conjunction of the ends: a
+        // runtime that implements the operator at both the oldest and the newest revision of an
+        // *unchanged* definition is taken to implement it throughout.
+        //
+        // The assumption is deliberately one that fails **loudly**. If a runtime does refuse an
+        // interior opset, this returns `true`, so `run` below leaves the outcome as `Rejected`
+        // rather than reclassifying it as `Unsupported` — and a comparable `Rejected` against two
+        // runtimes that answered is a `rejected-vs-ok` divergence, triaged like any other. The
+        // alternative, probing every opset in every span, costs roughly eight times the census
+        // and must be re-taken on every runtime version bump. `PENDING` 2.6.
+        let probes = crate::ops::probed_opsets(op);
+        if probes.contains(&opset) {
+            return claimed_at(opset);
+        }
+        probes.iter().all(|probe| claimed_at(*probe))
     }
 
     /// Was this combination ever measured?
@@ -115,12 +144,11 @@ impl Capabilities {
     /// statement about a runtime.
     pub fn was_measured(&self, runtime: &str, op: OpKind, elem: ElemType, rank: usize) -> bool {
         let probed = rank.min(*crate::ops::PROBED_RANKS.last().expect("non-empty"));
-        self.measured.contains(&(
-            runtime.to_string(),
-            op.onnx_name().to_string(),
-            elem,
-            probed,
-        ))
+        // **Opset-agnostic**, unlike `claims`. The question is whether the census covered this
+        // combination at all; a combination probed at either end of the span was covered.
+        self.measured.iter().any(|(r, o, e, k, _)| {
+            r == runtime && o == op.onnx_name() && *e == elem && *k == probed
+        })
     }
 
     /// **The question N5 asks.** A runtime failed on a case — may that be reported as a crash?
@@ -134,8 +162,9 @@ impl Capabilities {
         op: OpKind,
         elem: ElemType,
         rank: usize,
+        opset: i64,
     ) -> bool {
-        self.claims(runtime, op, elem, rank)
+        self.claims(runtime, op, elem, rank, opset)
     }
 
     /// Which element types a runtime was ever measured to handle successfully.
@@ -150,8 +179,8 @@ impl Capabilities {
     pub fn representable_types(&self, runtime: &str) -> BTreeSet<ElemType> {
         self.claimed
             .iter()
-            .filter(|(r, _, _, _)| r == runtime)
-            .map(|(_, _, elem, _)| *elem)
+            .filter(|(r, _, _, _, _)| r == runtime)
+            .map(|(_, _, elem, _, _)| *elem)
             .collect()
     }
 
@@ -181,7 +210,7 @@ impl Capabilities {
     pub fn runtimes(&self) -> BTreeSet<&str> {
         self.measured
             .iter()
-            .map(|(r, _, _, _)| r.as_str())
+            .map(|(r, _, _, _, _)| r.as_str())
             .collect()
     }
 
@@ -189,7 +218,7 @@ impl Capabilities {
     pub fn claim_count(&self, runtime: &str) -> usize {
         self.claimed
             .iter()
-            .filter(|(r, _, _, _)| r == runtime)
+            .filter(|(r, _, _, _, _)| r == runtime)
             .count()
     }
 
@@ -327,7 +356,7 @@ where
 
         if self
             .capabilities
-            .claims(self.inner.name(), input.op, elem, rank)
+            .claims(self.inner.name(), input.op, elem, rank, input.opset)
         {
             // It claims the operator and still refused this case. That is a statement about
             // *this input*, and stays a comparable value — rows-versus-error was one of the SQL
@@ -336,9 +365,10 @@ where
         } else {
             Ok(OnnxOutcome::Unsupported {
                 reason: format!(
-                    "{} does not implement {} at {elem:?} rank {rank} (census {}): {}",
+                    "{} does not implement {} at {elem:?} rank {rank} opset {} (census {}): {}",
                     self.inner.name(),
                     input.op.onnx_name(),
+                    input.opset,
                     self.capabilities.taken(),
                     detail.lines().next().unwrap_or("")
                 ),
@@ -367,13 +397,19 @@ mod tests {
         let caps = sample();
 
         // ONNX Runtime answered `Add` on f32 in the census, so it claims it.
-        assert!(caps.claims("onnxruntime", OpKind::Add, ElemType::F32, 2));
-        assert!(caps.failure_is_reportable("onnxruntime", OpKind::Add, ElemType::F32, 2));
+        assert!(caps.claims("onnxruntime", OpKind::Add, ElemType::F32, 2, OPSET));
+        assert!(caps.failure_is_reportable("onnxruntime", OpKind::Add, ElemType::F32, 2, OPSET));
 
         // It declined `Where` on bool — measured, but not a claim.
         assert!(caps.was_measured("onnxruntime", OpKind::Where, ElemType::Bool, 2));
-        assert!(!caps.claims("onnxruntime", OpKind::Where, ElemType::Bool, 2));
-        assert!(!caps.failure_is_reportable("onnxruntime", OpKind::Where, ElemType::Bool, 2));
+        assert!(!caps.claims("onnxruntime", OpKind::Where, ElemType::Bool, 2, OPSET));
+        assert!(!caps.failure_is_reportable(
+            "onnxruntime",
+            OpKind::Where,
+            ElemType::Bool,
+            2,
+            OPSET
+        ));
     }
 
     /// An unmeasured combination is treated as *not claimed*. The safe direction: an absent
@@ -391,7 +427,8 @@ mod tests {
             "a-runtime-that-was-not-in-the-census",
             OpKind::Add,
             ElemType::F32,
-            2
+            2,
+            OPSET
         ));
     }
 
@@ -403,7 +440,7 @@ mod tests {
         // Sqrt has no integer probe at all — the specification forbids it — so it was never
         // measured, as opposed to having been measured and refused.
         assert!(!caps.was_measured("tract", OpKind::Sqrt, ElemType::I64, 2));
-        assert!(!caps.claims("tract", OpKind::Sqrt, ElemType::I64, 2));
+        assert!(!caps.claims("tract", OpKind::Sqrt, ElemType::I64, 2, OPSET));
     }
 
     /// A stale matrix must be detectable. Classifying crashes against versions that are no
@@ -635,7 +672,7 @@ mod tests {
             eprintln!("note: no census at {path}; run the n2_census example to generate it");
             return;
         };
-        assert!(stored.claims("onnxruntime", OpKind::Add, ElemType::F32, 2));
+        assert!(stored.claims("onnxruntime", OpKind::Add, ElemType::F32, 2, OPSET));
         assert!(stored.opset() > 0);
     }
 }

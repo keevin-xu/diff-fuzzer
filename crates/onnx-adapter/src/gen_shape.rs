@@ -148,6 +148,24 @@ pub struct Bounds {
     pub special_values: bool,
     /// Rank-0 scalars and zero-length dimensions. Legal ONNX, and where implementations differ.
     pub degenerate_shapes: bool,
+    /// Draw each case's opset from the operator's own span instead of pinning [`Self::opset`].
+    ///
+    /// # What this reaches that nothing else does
+    ///
+    /// The opset-22 corpus is **saturated**: N8 reached 40 signatures by ~50,000 seeds and
+    /// 3,000,000 cases later yield 44. More seeds at one opset buy a bound, not information, and
+    /// the roadmap's answer to that is to widen. Opset is the cheapest width left, because the
+    /// valid span per operator already exists (`SPECS.md` §2.12) and costs nothing to compute.
+    ///
+    /// **Not the comparison `opset-invariance` makes.** That relation runs one runtime at two
+    /// opsets and compares it against *itself*, so it is blind to any defect that does not vary
+    /// with the version — which is all four problems this domain has found. Generating *at* opset
+    /// 13 instead puts the **differential** oracle, which compares runtimes to each other, onto
+    /// code paths it has never executed.
+    ///
+    /// Off by default, like [`Self::quantized`]: the default configuration is the baseline any
+    /// yield from this axis has to be measured against.
+    pub vary_opset: bool,
 
     // ── scalars ───────────────────────────────────────────────────────────────────
     pub max_rank: usize,
@@ -185,6 +203,9 @@ impl Default for Bounds {
             // Off so N4 can measure what they buy against this baseline.
             special_values: false,
             degenerate_shapes: true,
+            // Off by default: the default configuration is the baseline this axis is measured
+            // against, exactly as `quantized` is.
+            vary_opset: false,
 
             // These three are chosen together, and the test
             // `the_knobs_permit_more_than_the_budget_allows` is what keeps them honest.
@@ -257,6 +278,14 @@ impl Bounds {
     pub fn with_quantized(&self) -> Self {
         Self {
             quantized: true,
+            ..self.clone()
+        }
+    }
+
+    /// Draw each case's opset from the operator's span. See [`Self::vary_opset`].
+    pub fn with_opsets(&self) -> Self {
+        Self {
+            vary_opset: true,
             ..self.clone()
         }
     }
@@ -377,6 +406,7 @@ impl GenerationAxes for Bounds {
             ("bool-type", self.bool_type),
             ("special-values", self.special_values),
             ("degenerate-shapes", self.degenerate_shapes),
+            ("vary-opset", self.vary_opset),
         ]
     }
 
@@ -423,7 +453,15 @@ pub fn generate_case(
     if !ops::spec(op).data_types.contains(&elem) || bounds.opset < ops::spec(op).since {
         return None;
     }
-    let opset = bounds.opset;
+    // **The opset, drawn or pinned.** Uniform over the operator's own span, whose ends are what
+    // the census probes — see `ops::opset_span` and `PENDING` 2.6. `Round` has a single-point
+    // span, so `random_range` on an inclusive range of one value is still valid.
+    let opset = if bounds.vary_opset {
+        let span = ops::opset_span(op);
+        rng.random_range(*span.start()..=*span.end())
+    } else {
+        bounds.opset
+    };
 
     let case = match ops::spec(op).family {
         Family::UnaryElementwise => {
@@ -1128,6 +1166,78 @@ fn tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The opset axis must be additive**, like every other axis in this module.
+    ///
+    /// The rule the module comment opens with: *enabling an axis must add cases, never remove
+    /// them.* The SQL adapter learned it by enabling joins and silently losing all ordering
+    /// coverage. Here the risk is concrete — the axis changes which opset a case is built at, and
+    /// an operator whose span is a single point must still be generated.
+    ///
+    /// So: every operator reachable with the axis off is still reachable with it on.
+    #[test]
+    fn varying_the_opset_removes_no_operator() {
+        use crate::generator::OnnxGenerator;
+        use diff_fuzzer_core::rng::SeededRng;
+        use diff_fuzzer_core::traits::Generator;
+        use std::collections::BTreeSet;
+
+        let reachable = |bounds: Bounds| -> BTreeSet<&'static str> {
+            let generator = OnnxGenerator::new(bounds);
+            (0..6000u64)
+                .map(|seed| generator.generate(&mut SeededRng::from_seed(seed)))
+                .map(|case| case.op.onnx_name())
+                .collect()
+        };
+
+        let pinned = reachable(Bounds::default().with_special_values().with_quantized());
+        let varied = reachable(
+            Bounds::default()
+                .with_special_values()
+                .with_quantized()
+                .with_opsets(),
+        );
+
+        let lost: Vec<&str> = pinned.difference(&varied).copied().collect();
+        assert!(
+            lost.is_empty(),
+            "varying the opset removed operators from the corpus: {lost:?}"
+        );
+    }
+
+    /// And it must actually vary — an axis that changes nothing is worse than no axis, because
+    /// it appears in the description and in the fingerprint while buying nothing.
+    #[test]
+    fn varying_the_opset_actually_produces_older_opsets() {
+        use crate::generator::OnnxGenerator;
+        use diff_fuzzer_core::rng::SeededRng;
+        use diff_fuzzer_core::traits::Generator;
+        use std::collections::BTreeSet;
+
+        let generator = OnnxGenerator::new(
+            Bounds::default()
+                .with_special_values()
+                .with_quantized()
+                .with_opsets(),
+        );
+        let opsets: BTreeSet<i64> = (0..4000u64)
+            .map(|seed| generator.generate(&mut SeededRng::from_seed(seed)).opset)
+            .collect();
+
+        assert!(
+            opsets.len() > 1,
+            "the axis is on and every case is still at one opset: {opsets:?}"
+        );
+        assert!(
+            opsets.iter().any(|o| *o < 22),
+            "no case below opset 22, so no older code path is reached: {opsets:?}"
+        );
+        // Never outside a span: an opset below an operator's `since` is a different operator.
+        assert!(
+            opsets.iter().all(|o| (1..=22).contains(o)),
+            "an opset outside the legal range was generated: {opsets:?}"
+        );
+    }
 
     /// The trait's own rule, checked here because it is the one most easily broken.
     #[test]

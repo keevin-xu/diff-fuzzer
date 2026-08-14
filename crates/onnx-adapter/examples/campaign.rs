@@ -43,6 +43,9 @@
 //!   --announce   print what the run would do, and exit without running it
 //!   --control    inject a deliberately wrong participant; divergence is EXPECTED
 //!   --seeds A..B seed range, default 0..20000
+//!   --opsets     draw each case's opset from the operator's own span instead of pinning 22.
+//!                Off by default, for the same reason as --quantized: the pinned corpus is the
+//!                baseline this axis's yield is measured against.
 //!   --quantized  include the Tier Q surface (PHASE-N9); off by default, so the default IS
 //!                the baseline the quantized yield is measured against
 //!   --quantized-only  ONLY the Tier Q surface. Quantized operators are ~4.7% of a mixed
@@ -98,6 +101,7 @@ struct Args {
     announce: bool,
     quantized: bool,
     quantized_only: bool,
+    opsets: bool,
 }
 
 fn parse_args() -> Args {
@@ -105,6 +109,7 @@ fn parse_args() -> Args {
     let mut seeds = 0..20_000u64;
     let (mut control, mut announce, mut quantized) = (false, false, false);
     let mut quantized_only = false;
+    let mut opsets = false;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -121,6 +126,7 @@ fn parse_args() -> Args {
                 }
             }
             "--control" => control = true,
+            "--opsets" => opsets = true,
             "--quantized" => quantized = true,
             "--quantized-only" => {
                 quantized = true;
@@ -138,6 +144,7 @@ fn parse_args() -> Args {
         announce,
         quantized,
         quantized_only,
+        opsets,
     }
 }
 
@@ -167,6 +174,11 @@ fn main() {
         Bounds::default().with_special_values().with_quantized()
     } else {
         Bounds::default().with_special_values()
+    };
+    let bounds = if args.opsets {
+        bounds.with_opsets()
+    } else {
+        bounds
     };
     let cases = args.seeds.end.saturating_sub(args.seeds.start);
 

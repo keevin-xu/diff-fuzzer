@@ -888,6 +888,42 @@ pub fn candidates(opset: i64) -> Vec<(OpKind, ElemType)> {
 ///
 /// The census's real candidate list. Wider than [`candidates`] because support is a property
 /// of the combination — see [`PROBED_RANKS`].
+/// The opsets an operator's definition is **identical** across, ending at 22.
+///
+/// `spec(op).since` is the last version at which the operator changed, so between it and 22 the
+/// definition is unchanged *by construction* — that is what `SPECS.md` §2.12 records, and what
+/// `metamorphic::opset_invariant` relies on. The same span is what the generator may draw from
+/// and what the census probes the ends of.
+///
+/// `Round` was introduced at 22 and has no span; it returns `22..=22`, a single point, rather
+/// than an empty range that callers would have to special-case.
+pub fn opset_span(op: OpKind) -> std::ops::RangeInclusive<i64> {
+    let since = spec(op).since;
+    since.min(22)..=22
+}
+
+/// The opsets the census probes for an operator: **the two ends of its span**.
+///
+/// # Why the ends and not the middle
+///
+/// The definition is identical across the span, so a runtime implementing the operator at both
+/// ends almost certainly implements it throughout — and probing every opset in every span would
+/// cost roughly eight times the census, re-taken on every runtime version bump.
+///
+/// **The assumption is deliberately left detectable rather than hidden.** If a runtime does
+/// reject an interior opset, the capability layer will not reclassify it, so it stays a
+/// comparable `Rejected` and surfaces as a `rejected-vs-ok` divergence — which is arguably a real
+/// finding, since the runtime supports its own declared range inconsistently. `PENDING` 2.6.
+pub fn probed_opsets(op: OpKind) -> Vec<i64> {
+    let span = opset_span(op);
+    let (low, high) = (*span.start(), *span.end());
+    if low == high {
+        vec![low]
+    } else {
+        vec![low, high]
+    }
+}
+
 pub fn candidates_by_rank(opset: i64) -> Vec<(OpKind, ElemType, usize)> {
     let mut cells = Vec::new();
     for op in OpKind::ALL {

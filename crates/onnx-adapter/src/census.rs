@@ -93,6 +93,16 @@ pub struct Cell {
     /// treated as the rank that version probed.
     #[serde(default = "legacy_rank")]
     pub rank: usize,
+    /// The opset the probe was built at.
+    ///
+    /// **Support is a property of the combination, and the opset is part of the combination** —
+    /// the same lesson the `rank` field above records, one axis further out. A runtime may
+    /// implement an operator at opset 22 and refuse the older revision its own span claims.
+    ///
+    /// Defaulted on load so a census taken before this field existed still parses; it is treated
+    /// as the opset that version probed.
+    #[serde(default = "legacy_opset")]
+    pub opset: i64,
     pub runtime: String,
     pub support: Support,
     /// The runtime's own words, when it declined. Kept because *why* a runtime refused is
@@ -104,6 +114,11 @@ pub struct Cell {
 /// The rank a census taken before ranks existed was probed at.
 fn legacy_rank() -> usize {
     2
+}
+
+/// The opset a census taken before the opset axis existed was probed at.
+fn legacy_opset() -> i64 {
+    22
 }
 
 /// The whole matrix, plus what produced it.
@@ -251,9 +266,27 @@ pub fn take(
 ) -> Census {
     let mut cells = Vec::new();
 
-    for (op, elem, rank) in ops::candidates_by_rank(opset) {
-        let case = ops::probe_at(op, elem, opset, rank)
-            .expect("candidates_by_rank only yields buildable cells");
+    // **Every operator is probed at both ends of its own span**, not once at `opset`. The
+    // definition is identical across the span (`SPECS.md` §2.12), so the ends are where a
+    // runtime's *version gating* — as opposed to its arithmetic — can differ. `PENDING` 2.6.
+    let combinations: Vec<(OpKind, ElemType, usize, i64)> = ops::candidates_by_rank(opset)
+        .into_iter()
+        .flat_map(|(op, elem, rank)| {
+            ops::probed_opsets(op)
+                .into_iter()
+                .map(move |probe_opset| (op, elem, rank, probe_opset))
+        })
+        .collect();
+
+    for (op, elem, rank, opset) in combinations {
+        // A probe *could* fail to build at the older end, if a schema type constraint post-dated
+        // the span minimum. **Measured: that happens for no operator in scope**, so this skip is
+        // defensive rather than load-bearing — `every_candidate_builds_at_both_ends_of_its_span`
+        // is what will notice if it ever starts firing. Skipped rather than panicked either way:
+        // an unbuildable cell is a fact about the schema, not a failure.
+        let Some(case) = ops::probe_at(op, elem, opset, rank) else {
+            continue;
+        };
         // Derived from the case by the same function the capability model uses, rather than
         // taken from the loop variable. Two paths computing a key independently is how they
         // come to disagree — and for `Where` they did, since its first input is the boolean
@@ -277,6 +310,7 @@ pub fn take(
                 op: op.onnx_name().to_string(),
                 elem_type: elem,
                 rank,
+                opset,
                 runtime: runtime.name().to_string(),
                 support: Support::from(&outcome),
                 detail,
@@ -336,14 +370,57 @@ mod tests {
         assert_eq!(MIN_PARTICIPANTS, 3);
     }
 
-    /// A census over two runtimes must produce one cell per candidate **cell** per runtime —
-    /// no silent drops. Keyed by rank as well as element type since `PENDING` 1.14.
+    /// A census over two runtimes must produce one cell per candidate **per probed opset** per
+    /// runtime — no silent drops. Keyed by rank since `PENDING` 1.14 and by opset since 2.6.
+    ///
+    /// The expected count is computed from the same two functions the census itself walks, so it
+    /// tracks the schema rather than a number someone has to remember to update. What it still
+    /// catches is a *drop*: a cell that builds and is silently not probed.
     #[test]
-    fn the_census_covers_every_candidate() {
+    fn the_census_covers_every_candidate_at_every_probed_opset() {
         let census = take(&[&OrtRuntime, &TractRuntime], OPSET);
-        assert_eq!(census.cells.len(), ops::candidates_by_rank(OPSET).len() * 2);
+
+        let expected: usize = ops::candidates_by_rank(OPSET)
+            .into_iter()
+            .map(|(op, elem, rank)| {
+                ops::probed_opsets(op)
+                    .into_iter()
+                    .filter(|o| ops::probe_at(op, elem, *o, rank).is_some())
+                    .count()
+            })
+            .sum();
+
+        assert_eq!(census.cells.len(), expected * 2);
         assert_eq!(census.runtimes, vec!["onnxruntime", "tract"]);
         assert!(!census.taken.is_empty());
+    }
+
+    /// **Every candidate builds at both ends of its span** — measured, not assumed.
+    ///
+    /// The worry was that a schema type constraint could post-date the span minimum even where
+    /// the operator *definition* did not change, since `since_version` tracks the operator and
+    /// the accepted types are a separate history. If that happened, the older probe would fail to
+    /// build and the cell would be silently absent.
+    ///
+    /// It does not happen for any operator in scope: **988 buildable probe-cells from 498
+    /// candidates**, zero unbuildable. The `continue` in `take` is therefore defensive rather
+    /// than load-bearing today, and this test is what will notice if that changes — a drop from
+    /// two probes to one would otherwise look like an ordinary census.
+    #[test]
+    fn every_candidate_builds_at_both_ends_of_its_span() {
+        let mut unbuildable = Vec::new();
+        for (op, elem, rank) in ops::candidates_by_rank(OPSET) {
+            for probe_opset in ops::probed_opsets(op) {
+                if ops::probe_at(op, elem, probe_opset, rank).is_none() {
+                    unbuildable.push((op, elem, rank, probe_opset));
+                }
+            }
+        }
+        assert!(
+            unbuildable.is_empty(),
+            "a probe stopped building at an end of its span, so the census silently lost cells: \
+             {unbuildable:?}"
+        );
     }
 
     /// **The bug the negative control caught.** Adding the rank axis multiplied the cells per
