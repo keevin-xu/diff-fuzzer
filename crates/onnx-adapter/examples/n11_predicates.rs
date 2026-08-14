@@ -162,16 +162,23 @@ fn main() {
 
     // Rebuild the bounds the campaign ran under. The quantized axis is the one that changes what
     // is reachable, and it is visible in the description the findings recorded.
-    let bounds = if description.contains("quantized=on") {
-        Bounds::default().with_special_values().with_quantized()
-    } else {
-        Bounds::default().with_special_values()
-    };
+    // **Rebuilt axis by axis from the description the findings recorded**, then checked against
+    // it. Every axis must be listed here; the assertion below is what makes forgetting one a loud
+    // failure rather than a silent distribution mismatch — which is exactly what it caught when
+    // `vary-opset` was added and this was not updated.
+    let mut bounds = Bounds::default().with_special_values();
+    if description.contains("quantized=on") {
+        bounds = bounds.with_quantized();
+    }
+    if description.contains("vary-opset=on") {
+        bounds = bounds.with_opsets();
+    }
     assert_eq!(
         bounds.description(),
         description,
-        "the reconstructed bounds must be the ones the findings recorded, or the negatives are \
-         drawn from a different distribution than the positives"
+        "the reconstructed bounds are not the ones the findings recorded, so the negatives would \
+         be drawn from a different distribution than the positives. A new generation axis was \
+         probably added without a matching branch above."
     );
 
     // ── the runtimes, gated exactly as the campaign gates them ────────────────────────
