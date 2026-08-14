@@ -520,6 +520,31 @@ fn main() {
     say("  ── problems, not signatures (N8.3, PENDING 2.7) ──".to_string());
     say(format!("  {:>8}  occurrences", diverged));
     say(format!("  {:>8}  distinct signatures", signatures.len()));
+    // **The coarse count, and why it is here.**
+    //
+    // The signature key includes the opset — deliberately, since the scheme errs finer rather
+    // than coarser. With `--opsets` on, a defect present at every version of an operator produces
+    // one signature per version: measured at 60,000 seeds, **44 signatures pinned at 22 became
+    // 243, for the same four problems**.
+    //
+    // So the fine count stopped being comparable with earlier runs. Dropping the opset gives the
+    // number a reader actually reaches for — 43 against the pinned corpus's 44 — while the fine
+    // count still shows how much surface each behaviour was seen across.
+    let behaviours: std::collections::BTreeSet<(String, String, usize, &str)> = signatures
+        .values()
+        .map(|(signature, _, _, _)| {
+            (
+                signature.operator.to_string(),
+                format!("{:?}", signature.elem_type),
+                signature.rank,
+                signature.kind.token(),
+            )
+        })
+        .collect();
+    say(format!(
+        "  {:>8}  distinct behaviours (operator/type/rank/kind — comparable across opsets)",
+        behaviours.len()
+    ));
     say(format!(
         "  {:>8}  distinct PROBLEMS  <- the number to quote",
         grouping.problems()
