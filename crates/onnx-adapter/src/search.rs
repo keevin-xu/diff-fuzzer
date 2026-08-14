@@ -8,7 +8,7 @@
 //!
 //! # Why brute force
 //!
-//! Fifty-one features give 23,426 feature combinations and 171,802 signed predicates. That is
+//! Fifty-five features give 27,775 feature combinations and 215,930 signed predicates. That is
 //! nothing — the search runs in milliseconds. Anything cleverer (greedy feature selection,
 //! a decision tree, an SAT encoding) would buy no speed that matters and would cost the one
 //! property that does: **the developer must be able to describe the algorithm without
@@ -100,7 +100,7 @@ pub struct SearchResult {
 /// each chosen feature is either required or forbidden. `k = 0` is skipped because the
 /// empty predicate matches everything.
 ///
-/// Rust note: this returns an owned `Vec` rather than an iterator. 171,802 predicates at 16
+/// Rust note: this returns an owned `Vec` rather than an iterator. 215,930 predicates at 16
 /// bytes each is 48 KB — the simple thing is free here, and a hand-written iterator over
 /// combinations-with-signs would be the clever way this module exists to avoid.
 pub fn enumerate() -> Vec<Predicate> {
@@ -153,7 +153,7 @@ fn push_signed(out: &mut Vec<Predicate>, bits: &[usize]) {
 /// were drawn from the same distribution as the findings — see `negatives::Pool::matched`.
 pub fn search(findings: &[OnnxCase], pool: &Pool) -> SearchResult {
     let positives: Vec<FeatureVec> = findings.iter().map(features).collect();
-    // Extract once, not once per predicate: 171,802 × |negatives| computations would be the
+    // Extract once, not once per predicate: 215,930 × |negatives| computations would be the
     // one place where brute force actually costs something.
     let negatives: Vec<(Source, FeatureVec)> = pool
         .negatives()
@@ -255,7 +255,7 @@ fn best_for(
 /// `(source, matched, total)` per source, omitting sources with no members.
 ///
 /// Mirrors `Pool::matched_by_source`, but over pre-extracted features so the covering loop
-/// does not re-extract on every one of its 171,802 evaluations.
+/// does not re-extract on every one of its 215,930 evaluations.
 fn negatives_by_source(
     negatives: &[(Source, FeatureVec)],
     predicate: Predicate,
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn the_search_space_is_the_size_it_claims() {
         let all = enumerate();
-        assert_eq!(all.len(), 171802);
+        assert_eq!(all.len(), 215930);
         assert!(
             all.iter().all(|p| !p.is_vacuous()),
             "the empty rule must never enter the space — it matches everything and claims nothing"
@@ -393,7 +393,7 @@ mod tests {
             vec![1],
             "the inseparable finding must survive as a gap"
         );
-        assert_eq!(result.considered, 171802);
+        assert_eq!(result.considered, 215930);
     }
 
     /// The covering loop can commit more than one rule, which is how distinct classes surface.

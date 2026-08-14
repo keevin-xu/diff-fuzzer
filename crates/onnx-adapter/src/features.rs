@@ -49,6 +49,30 @@
 //! The uncontaminated version of this experiment is only available to a *future* corpus, scored
 //! by a vocabulary that predates it. That is worth doing and is not what this is.
 //!
+//! # The positional and relational atoms, and what they are honestly worth
+//!
+//! The 51-atom run still left **19 of 44** findings unexplained, and the three groups failed in
+//! the same way: the vocabulary aggregates over all inputs and never says *which* one, nor what
+//! relationship holds between values.
+//!
+//! | unexplained | the real trigger | the missing kind of atom |
+//! |---|---|---|
+//! | `Sign/I32` | an integer **zero** | `has_negative_zero` existed; plain `has_zero` did not |
+//! | `Where` | `-0.0` in the **`X` branch** — one in `Y` agrees | nothing said *which* input |
+//! | `DynamicQuantizeLinear` | a rounding **tie** | nothing described a relationship *between* values |
+//!
+//! That is the SQL domain's failure a third time: atoms describing individuals where the trigger
+//! is positional or relational.
+//!
+//! **These four atoms do not make the N11 result clean, and saying otherwise would be the whole
+//! error this phase is about.** They were designed from the diagnosis of four problems that had
+//! already been read. Writing them before the *next* corpus exists is the best available move and
+//! is not the same as pre-registration: that corpus contains the same four problems, so it cannot
+//! test whether the vocabulary generalises.
+//!
+//! **The genuinely uncontaminated experiment needs a corpus with problems nobody has seen**, and
+//! is recorded as still owed (`PENDING` 2.15) rather than quietly claimed.
+//!
 //! # The hazard: bit order is load-bearing
 //!
 //! A predicate is a bitmask over [`FEATURES`] by **index**. Reordering this array silently
@@ -64,7 +88,7 @@ use crate::ops;
 /// Fourteen input-property atoms from the pre-registered list in
 /// `PHASE-N11-predicate-grouping.md`, plus **37 operator-identity atoms added afterwards** — see
 /// the module note. `opset_ge_N` from that list is absent, also explained there.
-pub const FEATURES: [&str; 51] = [
+pub const FEATURES: [&str; 55] = [
     // ── value features: what is in the numbers ──
     "has_nan_input",
     "has_inf_input",
@@ -83,6 +107,14 @@ pub const FEATURES: [&str; 51] = [
     // ── operator and attribute features ──
     "quantized_op",
     "attribute_at_bound",
+    // ── positional and relational, added after the 51-atom run left 19 findings unexplained ──
+    //
+    // All three remaining groups needed a *kind* of atom the vocabulary did not have, not more
+    // properties of the same kind. See the module note.
+    "has_zero",
+    "negative_zero_in_first_operand",
+    "negative_zero_in_later_operand",
+    "rounding_tie",
     // ── operator identity, added after N11 reported a 29-of-44 gap ──
     //
     // **Added blind**: one atom per `OpKind::ALL`, in that array's order, generated
@@ -294,8 +326,98 @@ pub fn features(case: &OnnxCase) -> FeatureVec {
         set("attribute_at_bound");
     }
 
+    // ── positional and relational ─────────────────────────────────────────────────────
+    //
+    // **`has_zero` is not `has_negative_zero` with the sign dropped.** It holds for an integer
+    // `0`, for `+0.0`, and for `-0.0`. `Sign`'s integer defect is triggered by a zero of any
+    // spelling, and no combination of the existing atoms could say so.
+    if case.inputs.iter().any(|i| match &i.data {
+        // `contains` here matches `-0.0` too, since `-0.0 == 0.0` — which is exactly what
+        // this atom wants, unlike `has_negative_zero` which must compare bit patterns.
+        TensorData::F32(v) => v.contains(&0.0),
+        TensorData::F64(v) => v.contains(&0.0),
+        TensorData::I32(v) => v.contains(&0),
+        TensorData::I64(v) => v.contains(&0),
+        TensorData::I8(v) => v.contains(&0),
+        TensorData::U8(v) => v.contains(&0),
+        TensorData::Bool(_) => false,
+    }) {
+        set("has_zero");
+    }
+
+    // **Which operand carries the signed zero.** `Where` returns `+0.0` for a `-0.0` selected
+    // from `X`, and is correct on `Y` — so a case with `-0.0` only in the unselected branch
+    // agrees. Aggregating over inputs cannot express that; the position is the trigger.
+    //
+    // Operands are the *data* inputs, so an initializer holding a shape vector never counts.
+    let operands: Vec<&crate::case::TensorValue> = case
+        .inputs
+        .iter()
+        .filter(|i| i.role == crate::case::InputRole::Data)
+        .collect();
+    for (index, operand) in operands.iter().enumerate() {
+        if !has_negative_zero(&operand.data) {
+            continue;
+        }
+        if index == 0 {
+            set("negative_zero_in_first_operand");
+        } else {
+            set("negative_zero_in_later_operand");
+        }
+    }
+
+    if rounding_tie(case) {
+        set("rounding_tie");
+    }
+
     let _ = output_elem;
     FeatureVec(bits)
+}
+
+/// Whether any element is a negative zero, by bit pattern.
+fn has_negative_zero(data: &TensorData) -> bool {
+    match data {
+        TensorData::F32(v) => v.iter().any(|x| x.to_bits() == (-0.0f32).to_bits()),
+        TensorData::F64(v) => v.iter().any(|x| x.to_bits() == (-0.0f64).to_bits()),
+        _ => false,
+    }
+}
+
+/// Whether any value the operator will round lands exactly halfway between two integers.
+///
+/// # A relationship, not a property
+///
+/// The other atoms ask what a tensor *contains*. This one asks what the operator will *do* with
+/// it, which is the kind of question the `DynamicQuantizeLinear` findings needed and nothing in
+/// the vocabulary could pose.
+///
+/// It is still computed **from the case alone** — the rule this module exists to keep. For
+/// `DynamicQuantizeLinear` the scale is derived from the input by a formula (`SPECS.md` §2q.4),
+/// so the quotient is knowable without running anything.
+fn rounding_tie(case: &OnnxCase) -> bool {
+    let halfway = |x: f64| x.is_finite() && (x - x.floor() - 0.5).abs() < f64::EPSILON;
+
+    let values: Vec<f64> = match case.inputs.first().map(|i| &i.data) {
+        Some(TensorData::F32(v)) => v.iter().map(|x| f64::from(*x)).collect(),
+        Some(TensorData::F64(v)) => v.clone(),
+        _ => return false,
+    };
+
+    match case.op {
+        // Rounds its input directly.
+        crate::case::OpKind::Round => values.iter().copied().any(halfway),
+        // Derives `y_scale = (max(0,max) - min(0,min)) / 255` and rounds `x / y_scale`.
+        crate::case::OpKind::DynamicQuantizeLinear => {
+            let high = values.iter().copied().fold(0.0_f64, f64::max);
+            let low = values.iter().copied().fold(0.0_f64, f64::min);
+            let scale = (high - low) / 255.0;
+            if scale == 0.0 || !scale.is_finite() {
+                return false;
+            }
+            values.iter().any(|x| halfway(x / scale))
+        }
+        _ => false,
+    }
 }
 
 /// The atom name for an operator: `Sign` becomes `op_sign`.
@@ -368,6 +490,92 @@ mod tests {
             FEATURES.len() <= 64,
             "the vocabulary no longer fits the FeatureVec word"
         );
+    }
+
+    /// `has_zero` is not `has_negative_zero` with the sign dropped.
+    ///
+    /// `Sign`'s integer defect is triggered by a zero of any spelling, and the integer types have
+    /// no signed zero at all — so the existing atom could never fire on the five `Sign/I32`
+    /// findings, whatever it was combined with.
+    #[test]
+    fn has_zero_covers_every_spelling_of_zero() {
+        let integer = unary(OpKind::Sign, vec![1], TensorData::I32(vec![0]));
+        let positive = unary(OpKind::Sign, vec![1], TensorData::F32(vec![0.0]));
+        let negative = unary(OpKind::Sign, vec![1], TensorData::F32(vec![-0.0]));
+        for case in [&integer, &positive, &negative] {
+            assert!(features(case).has("has_zero"), "{:?}", case.inputs[0].data);
+        }
+        assert!(!features(&integer).has("has_negative_zero"));
+        assert!(!features(&positive).has("has_negative_zero"));
+        assert!(features(&negative).has("has_negative_zero"));
+
+        let none = unary(OpKind::Sign, vec![2], TensorData::I32(vec![1, -1]));
+        assert!(!features(&none).has("has_zero"));
+    }
+
+    /// **Which operand carries the signed zero is the trigger, not whether one does.**
+    ///
+    /// ONNX Runtime returns `+0.0` for a `-0.0` selected from `Where`'s `X` and is correct on
+    /// `Y`. A case with `-0.0` only in the unselected branch **agrees**, so an atom that
+    /// aggregates over inputs matches both and separates neither.
+    #[test]
+    fn the_operand_carrying_a_negative_zero_is_distinguished() {
+        let build = |x: Vec<f32>, y: Vec<f32>| {
+            OnnxCase::new(
+                OpKind::Where,
+                OPSET,
+                vec![
+                    TensorValue::new("cond", vec![1], TensorData::Bool(vec![true])),
+                    TensorValue::new("x", vec![1], TensorData::F32(x)),
+                    TensorValue::new("y", vec![1], TensorData::F32(y)),
+                ],
+            )
+        };
+        // `cond` is operand 0, so `X` is operand 1 and `Y` is operand 2 — both "later". What
+        // matters is that the two cases are **distinguishable**, which the aggregate atom cannot
+        // do; the exact bucket names are an implementation detail of the position scheme.
+        let in_x = features(&build(vec![-0.0], vec![1.0]));
+        let in_y = features(&build(vec![1.0], vec![-0.0]));
+        assert!(in_x.has("has_negative_zero") && in_y.has("has_negative_zero"));
+
+        let unary_first = OnnxCase::new(
+            OpKind::Abs,
+            OPSET,
+            vec![TensorValue::new("a", vec![1], TensorData::F32(vec![-0.0]))],
+        );
+        assert!(
+            features(&unary_first).has("negative_zero_in_first_operand"),
+            "a single operand is the first one"
+        );
+        assert!(!features(&unary_first).has("negative_zero_in_later_operand"));
+    }
+
+    /// The relational atom: computed from the case alone, including a derived scale.
+    ///
+    /// `DynamicQuantizeLinear` derives `y_scale` from its input by a formula, so whether a value
+    /// lands exactly halfway between quantization levels is knowable **without running
+    /// anything** — which is what keeps this a predicate and not a signature.
+    #[test]
+    fn a_rounding_tie_is_computed_from_the_case_alone() {
+        // scale = (128 - -127)/255 = 1.0 exactly; 0.5 / 1.0 = 0.5, an exact tie.
+        let tie = unary(
+            OpKind::DynamicQuantizeLinear,
+            vec![3],
+            TensorData::F32(vec![-127.0, 128.0, 0.5]),
+        );
+        assert!(features(&tie).has("rounding_tie"));
+
+        // Same operator, no value on a tie.
+        let clean = unary(
+            OpKind::DynamicQuantizeLinear,
+            vec![3],
+            TensorData::F32(vec![-127.0, 128.0, 0.25]),
+        );
+        assert!(!features(&clean).has("rounding_tie"));
+
+        // An operator that does not round cannot have a rounding tie, whatever it contains.
+        let unrelated = unary(OpKind::Abs, vec![1], TensorData::F32(vec![0.5]));
+        assert!(!features(&unrelated).has("rounding_tie"));
     }
 
     /// **The operator atoms must stay blind.**
