@@ -113,7 +113,7 @@ pub const PROBLEMS: &[Problem] = &[
         id: "P-005",
         finding: "F-008",
         implementation: "tract",
-        what: "DynamicQuantizeLinear adds the zero-point before rounding; the spec rounds first",
+        what: "DynamicQuantizeLinear rounds ties away from zero; ONNX specifies ties to even",
         status: Status::Ready,
         operator: OpKind::DynamicQuantizeLinear,
         kind: Kind::Value,
