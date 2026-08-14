@@ -66,6 +66,13 @@ struct Args {
     run: String,
     negatives: usize,
     validate: usize,
+    /// Feature names to validate as a hand-written rule, instead of searching.
+    ///
+    /// **The search ranks by fit, and fit cannot see prediction.** Two rules covering the same
+    /// findings with the same number of terms tie, and enumeration order breaks it — so the
+    /// committed rule may be the coincidence and its twin the real trigger. This flag exists to
+    /// measure the twin rather than argue about it.
+    probe: Vec<String>,
 }
 
 fn parse_args() -> Args {
@@ -73,6 +80,7 @@ fn parse_args() -> Args {
         run: "n10-diff".to_string(),
         negatives: 20_000,
         validate: 20_000,
+        probe: Vec::new(),
     };
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -95,6 +103,13 @@ fn parse_args() -> Args {
                     .get(i)
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(args.validate);
+            }
+            "--probe" => {
+                i += 1;
+                args.probe = raw
+                    .get(i)
+                    .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default();
             }
             other => eprintln!("ignoring unrecognised argument {other}"),
         }
@@ -273,6 +288,34 @@ fn main() {
         );
     }
 
+    // ── 2b. A hand-written rule, if one was asked for ─────────────────────────────────
+    if !args.probe.is_empty() {
+        let names: Vec<&str> = args.probe.iter().map(String::as_str).collect();
+        let probe = onnx_adapter::predicate::Predicate::new(&names, &[]);
+        let covered = findings
+            .iter()
+            .filter(|c| probe.matches(features(c)))
+            .count();
+        let matched_negatives = negative_features
+            .iter()
+            .filter(|f| probe.matches(**f))
+            .count();
+        println!("\n  ── probe: {} ──", probe.describe());
+        println!(
+            "     FOR      covers {covered} of {} findings",
+            findings.len()
+        );
+        println!(
+            "     AGAINST  matches {matched_negatives} of {} negatives",
+            pool.len()
+        );
+        let validation = validate(probe, &generator, VALIDATION_SEED, args.validate, diverges);
+        println!("     PREDICTS {}", validation.describe());
+        std::panic::set_hook(previous);
+        println!();
+        return;
+    }
+
     // ── 3. The search ─────────────────────────────────────────────────────────────────
     println!("\n  ── search ──");
     let result = search(&findings, &pool);
@@ -334,6 +377,27 @@ fn main() {
             println!(
                 "                  ^ the rule described the findings, not the trigger. Discard."
             );
+        }
+
+        // **Every rule that tied is validated too.** The scoring cannot tell a coincidence from a
+        // trigger when both fit identically, so the choice is deferred to the reader with the
+        // prediction beside each one — measured, not argued.
+        for alternate in &class.tied_with {
+            let alt = validate(
+                *alternate,
+                &generator,
+                VALIDATION_SEED,
+                args.validate,
+                diverges,
+            );
+            let marker =
+                if alt.outcome == Outcome::Trigger && validation.outcome != Outcome::Trigger {
+                    "  <- TIED ON FIT, AND THIS ONE PREDICTS"
+                } else {
+                    ""
+                };
+            println!("         TIED     {}{marker}", alternate.describe());
+            println!("                  {}", alt.describe());
         }
     }
 

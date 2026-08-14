@@ -27,6 +27,28 @@
 //! and constrains nothing. It is omitted until opset becomes a generation axis (`PENDING` 2.6,
 //! decided but not implemented), at which point it becomes meaningful and should be added.
 //!
+//! # The operator atoms were added *after* seeing the results, and that is a hazard
+//!
+//! The first N11 run separated **15 of 44** findings. The gap named its own cause: every real
+//! trigger in this domain includes an operator — `Sign ∧ has_negative_zero`,
+//! `Where ∧ has_negative_zero`, `DynamicQuantizeLinear ∧ rounding-tie` — and the pre-registered
+//! list described *operands* while never naming the *operation*. In a single-node corpus the
+//! operator is most of what an input is, and the omission was simply not noticed.
+//!
+//! Adding the atoms now is **exactly the fitting hazard the phase file warns about**: they are
+//! proposed because they would explain findings that have already been read. Two things are done
+//! about that, and neither makes the result clean:
+//!
+//! 1. **They are added blind.** One atom per `OpKind::ALL`, in that array's order, generated
+//!    mechanically. Nobody picked `Sign` and `Where` — every operator gets a bit, including the
+//!    twenty-odd that have never produced a finding. `every_operator_has_exactly_one_atom`
+//!    enforces this, so the set cannot later be quietly trimmed to the ones that paid off.
+//! 2. **Both results are reported.** 15/44 before and whatever comes after, side by side, with
+//!    the ordering stated. A reader can discount the second number as much as they like.
+//!
+//! The uncontaminated version of this experiment is only available to a *future* corpus, scored
+//! by a vocabulary that predates it. That is worth doing and is not what this is.
+//!
 //! # The hazard: bit order is load-bearing
 //!
 //! A predicate is a bitmask over [`FEATURES`] by **index**. Reordering this array silently
@@ -39,9 +61,10 @@ use crate::ops;
 
 /// The feature vocabulary. **Order is part of the format** — append only, never reorder.
 ///
-/// Fourteen atoms, from the pre-registered list in `PHASE-N11-predicate-grouping.md`. See the
-/// module note for why `opset_ge_N` is absent.
-pub const FEATURES: [&str; 14] = [
+/// Fourteen input-property atoms from the pre-registered list in
+/// `PHASE-N11-predicate-grouping.md`, plus **37 operator-identity atoms added afterwards** — see
+/// the module note. `opset_ge_N` from that list is absent, also explained there.
+pub const FEATURES: [&str; 51] = [
     // ── value features: what is in the numbers ──
     "has_nan_input",
     "has_inf_input",
@@ -60,6 +83,48 @@ pub const FEATURES: [&str; 14] = [
     // ── operator and attribute features ──
     "quantized_op",
     "attribute_at_bound",
+    // ── operator identity, added after N11 reported a 29-of-44 gap ──
+    //
+    // **Added blind**: one atom per `OpKind::ALL`, in that array's order, generated
+    // mechanically. Nobody chose which operators get one, which is the only defence available
+    // against the hazard named below.
+    "op_identity",
+    "op_reshape",
+    "op_transpose",
+    "op_concat",
+    "op_squeeze",
+    "op_unsqueeze",
+    "op_shape",
+    "op_size",
+    "op_slice",
+    "op_pad",
+    "op_quantize_linear",
+    "op_dequantize_linear",
+    "op_mat_mul_integer",
+    "op_dynamic_quantize_linear",
+    "op_gather",
+    "op_where",
+    "op_cast",
+    "op_equal",
+    "op_greater",
+    "op_less",
+    "op_and",
+    "op_or",
+    "op_xor",
+    "op_not",
+    "op_add",
+    "op_sub",
+    "op_mul",
+    "op_div",
+    "op_min",
+    "op_max",
+    "op_abs",
+    "op_neg",
+    "op_sign",
+    "op_sqrt",
+    "op_floor",
+    "op_ceil",
+    "op_round",
 ];
 
 /// A case's features as a bitmask over [`FEATURES`].
@@ -221,12 +286,33 @@ pub fn features(case: &OnnxCase) -> FeatureVec {
     if ops::spec(case.op).tier == ops::Tier::Q {
         set("quantized_op");
     }
+    // The operator's own atom. Derived from the same name the atoms were generated from, so a new
+    // operator cannot acquire a bit in `FEATURES` without also setting it here, or vice versa —
+    // the registry test checks both directions.
+    set(&operator_atom(case.op));
     if attribute_at_bound(case) {
         set("attribute_at_bound");
     }
 
     let _ = output_elem;
     FeatureVec(bits)
+}
+
+/// The atom name for an operator: `Sign` becomes `op_sign`.
+///
+/// One mapping, used both to generate the names in [`FEATURES`] and to set the bit, so the two
+/// cannot disagree. Returns an owned `String` because the transformation is not `const`; the cost
+/// is one small allocation per case, which is nothing beside running three ONNX runtimes.
+pub fn operator_atom(op: crate::case::OpKind) -> String {
+    let name = op.onnx_name();
+    let mut out = String::from("op_");
+    for (i, c) in name.char_indices() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 /// Whether any integer attribute sits at an extreme of its legal range.
@@ -282,6 +368,72 @@ mod tests {
             FEATURES.len() <= 64,
             "the vocabulary no longer fits the FeatureVec word"
         );
+    }
+
+    /// **The operator atoms must stay blind.**
+    ///
+    /// They were added after reading a result, so the one defence available is that *every*
+    /// operator got one — including the twenty-odd that have never produced a finding. This test
+    /// is what stops the set being quietly trimmed later to the handful that paid off, which
+    /// would convert a declared bias into a hidden one.
+    ///
+    /// Checked in both directions: every operator has an atom, and every `op_` atom belongs to a
+    /// real operator.
+    #[test]
+    fn every_operator_has_exactly_one_atom_and_no_atom_is_orphaned() {
+        for op in OpKind::ALL {
+            let atom = operator_atom(op);
+            assert!(
+                FEATURES.contains(&atom.as_str()),
+                "{op:?} has no atom — the operator set must be complete, not curated"
+            );
+        }
+
+        let declared: Vec<&str> = FEATURES
+            .iter()
+            .copied()
+            .filter(|f| f.starts_with("op_"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            OpKind::ALL.len(),
+            "there are {} op_ atoms for {} operators",
+            declared.len(),
+            OpKind::ALL.len()
+        );
+        for atom in declared {
+            assert!(
+                OpKind::ALL.iter().any(|op| operator_atom(*op) == atom),
+                "{atom} names no operator"
+            );
+        }
+    }
+
+    /// A case sets its own operator's atom and no other's.
+    #[test]
+    fn a_case_sets_exactly_its_own_operator_atom() {
+        let case = unary(OpKind::Sign, vec![1], TensorData::F32(vec![-0.0]));
+        let held = features(&case);
+        assert!(held.has("op_sign"));
+        assert!(!held.has("op_abs"));
+        assert!(!held.has("op_where"));
+        let operator_atoms_held = held
+            .names()
+            .into_iter()
+            .filter(|n| n.starts_with("op_"))
+            .count();
+        assert_eq!(operator_atoms_held, 1, "a case is exactly one operator");
+    }
+
+    /// The name mapping splits on capitals: `DynamicQuantizeLinear` → `op_dynamic_quantize_linear`.
+    #[test]
+    fn multi_word_operator_names_become_readable_atoms() {
+        assert_eq!(operator_atom(OpKind::Sign), "op_sign");
+        assert_eq!(
+            operator_atom(OpKind::DynamicQuantizeLinear),
+            "op_dynamic_quantize_linear"
+        );
+        assert_eq!(operator_atom(OpKind::MatMulInteger), "op_mat_mul_integer");
     }
 
     /// `-0.0` must be found by its bit pattern, not by comparison.

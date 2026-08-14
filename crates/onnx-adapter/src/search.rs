@@ -8,7 +8,7 @@
 //!
 //! # Why brute force
 //!
-//! Fourteen features give 469 feature combinations and 3304 signed predicates. That is
+//! Fifty-one features give 23,426 feature combinations and 171,802 signed predicates. That is
 //! nothing — the search runs in milliseconds. Anything cleverer (greedy feature selection,
 //! a decision tree, an SAT encoding) would buy no speed that matters and would cost the one
 //! property that does: **the developer must be able to describe the algorithm without
@@ -53,6 +53,24 @@ pub struct Candidate {
     pub covered: Vec<usize>,
     /// Negatives matched, broken down by source. **Never summed** — see [`Source`].
     pub negatives_by_source: Vec<(Source, usize, usize)>,
+    /// Other rules that scored **identically** and lost only on enumeration order.
+    ///
+    /// # Why this field exists
+    ///
+    /// The scoring order — fewest negatives, then most covered, then fewest features — can leave
+    /// several rules exactly tied, and the loop used to commit whichever the enumeration reached
+    /// first. **Measured, on this domain's first real run:**
+    ///
+    /// | rule | covers | negatives | predicts |
+    /// |---|---|---|---|
+    /// | `empty_tensor ∧ ¬output_larger_than_input` | 15/44 | 0/30,738 | 322/6,482 = **5%** |
+    /// | `empty_tensor ∧ op_reshape` | 15/44 | 0/30,738 | 322/352 = **91%** |
+    ///
+    /// Identical on every criterion the search has, and one is a coincidence while the other is
+    /// a trigger. **Fit cannot see prediction**, so the search has no basis for choosing — and
+    /// silently choosing anyway reported the wrong rule. They are all surfaced now and the
+    /// caller validates each.
+    pub tied_with: Vec<Predicate>,
 }
 
 impl Candidate {
@@ -82,7 +100,7 @@ pub struct SearchResult {
 /// each chosen feature is either required or forbidden. `k = 0` is skipped because the
 /// empty predicate matches everything.
 ///
-/// Rust note: this returns an owned `Vec` rather than an iterator. 3,304 predicates at 16
+/// Rust note: this returns an owned `Vec` rather than an iterator. 171,802 predicates at 16
 /// bytes each is 48 KB — the simple thing is free here, and a hand-written iterator over
 /// combinations-with-signs would be the clever way this module exists to avoid.
 pub fn enumerate() -> Vec<Predicate> {
@@ -135,7 +153,7 @@ fn push_signed(out: &mut Vec<Predicate>, bits: &[usize]) {
 /// were drawn from the same distribution as the findings — see `negatives::Pool::matched`.
 pub fn search(findings: &[OnnxCase], pool: &Pool) -> SearchResult {
     let positives: Vec<FeatureVec> = findings.iter().map(features).collect();
-    // Extract once, not once per predicate: 3,304 × |negatives| computations would be the
+    // Extract once, not once per predicate: 171,802 × |negatives| computations would be the
     // one place where brute force actually costs something.
     let negatives: Vec<(Source, FeatureVec)> = pool
         .negatives()
@@ -182,6 +200,7 @@ fn best_for(
     negatives: &[(Source, FeatureVec)],
 ) -> Option<Candidate> {
     let mut best: Option<Candidate> = None;
+    let mut tied: Vec<Predicate> = Vec::new();
 
     for &predicate in predicates {
         // Rust note: `debug_assert` rather than `assert` — `enumerate` cannot produce a
@@ -202,31 +221,41 @@ fn best_for(
             predicate,
             covered,
             negatives_by_source: by_source,
+            tied_with: Vec::new(),
         };
         if candidate.negatives_matched() > 0 {
             continue;
         }
 
-        // Ties broken by: more covered, then fewer features.
-        let better = match &best {
-            None => true,
+        // Ties broken by: more covered, then fewer features — and a genuine tie is **recorded**
+        // rather than resolved by enumeration order. See `Candidate::tied_with`.
+        match &best {
+            None => best = Some(candidate),
             Some(current) => {
-                (candidate.covered.len(), current.predicate.size())
-                    > (current.covered.len(), candidate.predicate.size())
+                let mine = (candidate.covered.len(), current.predicate.size());
+                let theirs = (current.covered.len(), candidate.predicate.size());
+                if mine > theirs {
+                    tied.clear();
+                    best = Some(candidate);
+                } else if candidate.covered.len() == current.covered.len()
+                    && candidate.predicate.size() == current.predicate.size()
+                {
+                    tied.push(candidate.predicate);
+                }
             }
-        };
-        if better {
-            best = Some(candidate);
         }
     }
 
-    best
+    best.map(|mut winner| {
+        winner.tied_with = tied;
+        winner
+    })
 }
 
 /// `(source, matched, total)` per source, omitting sources with no members.
 ///
 /// Mirrors `Pool::matched_by_source`, but over pre-extracted features so the covering loop
-/// does not re-extract on every one of its 3,304 evaluations.
+/// does not re-extract on every one of its 171,802 evaluations.
 fn negatives_by_source(
     negatives: &[(Source, FeatureVec)],
     predicate: Predicate,
@@ -289,12 +318,12 @@ mod tests {
 
     /// The whole search space is enumerated, and it is small enough to state.
     ///
-    /// Fourteen features give 3,304 signed predicates. Reported so the space is not a mystery,
+    /// Fifty-one features give 171,802 signed predicates. Reported so the space is not a mystery,
     /// and asserted so that adding a feature is a visible event rather than a silent one.
     #[test]
     fn the_search_space_is_the_size_it_claims() {
         let all = enumerate();
-        assert_eq!(all.len(), 3304);
+        assert_eq!(all.len(), 171802);
         assert!(
             all.iter().all(|p| !p.is_vacuous()),
             "the empty rule must never enter the space — it matches everything and claims nothing"
@@ -364,7 +393,7 @@ mod tests {
             vec![1],
             "the inseparable finding must survive as a gap"
         );
-        assert_eq!(result.considered, 3304);
+        assert_eq!(result.considered, 171802);
     }
 
     /// The covering loop can commit more than one rule, which is how distinct classes surface.
@@ -418,6 +447,41 @@ mod tests {
         let by_source = &result.classes[0].negatives_by_source;
         assert_eq!(by_source.len(), 2, "both sources must appear separately");
         assert!(by_source.iter().all(|(_, matched, _)| *matched == 0));
+    }
+
+    /// **A tie must be reported, not resolved by enumeration order.**
+    ///
+    /// Two rules covering the same findings with the same number of terms and the same (empty)
+    /// negative record are indistinguishable to the scoring, and the loop used to keep whichever
+    /// it saw first. On this domain's first real run that silently discarded a 91%-predictive
+    /// rule in favour of a 5% one. The search still cannot choose — fit cannot see prediction —
+    /// but it can decline to hide the alternatives.
+    #[test]
+    fn rules_that_tie_are_all_surfaced() {
+        // Two findings that share `has_negative_zero` and `op_sign`; both atoms separate them
+        // from the negative equally well, so the two one-term rules tie exactly.
+        let findings = vec![
+            scalar(OpKind::Sign, TensorData::F32(vec![-0.0])),
+            scalar(OpKind::Sign, TensorData::F32(vec![-0.0, -0.0])),
+        ];
+        let negatives = pool(vec![scalar(OpKind::Abs, TensorData::F32(vec![1.0]))]);
+
+        let result = search(&findings, &negatives);
+        let committed = &result.classes[0];
+        let all: Vec<String> = std::iter::once(committed.predicate)
+            .chain(committed.tied_with.iter().copied())
+            .map(|p| p.describe())
+            .collect();
+
+        assert!(
+            all.len() > 1,
+            "two equally-scoring rules exist here; only {} was surfaced",
+            all[0]
+        );
+        assert!(
+            all.iter().any(|r| r.contains("op_sign")),
+            "the operator-keyed alternative must survive the tie: {all:?}"
+        );
     }
 
     /// Same inputs, same result. A search that cannot be replayed is not evidence.
