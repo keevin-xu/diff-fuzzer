@@ -24,7 +24,17 @@
 //!
 //! `--control` substitutes a runtime whose outputs are deliberately reshaped. A relation suite that
 //! stays clean against *that* could not have detected anything, and its zero would mean nothing.
-//! `WrongShape` is the right injection here: the dominant relation is about shapes.
+//! **One fault is not enough, and the numbers say so.** `WrongShape` was chosen because the
+//! dominant relation is about shapes — and a 3,000,000-case control with it moved
+//! `shape-inference` (49.1% of judging) and `cast-round-trip` (0.8%) while leaving
+//! `opset-invariance` (48.2%) and `transpose-inverse` (1.9%) at **exactly zero**. Half the
+//! judging behind an 11,750,917-check zero had never been shown able to fire.
+//!
+//! `opset-invariance` compares two runs of the **same** runtime, so any fault applied equally to
+//! both is invisible to it; `transpose-inverse` *declined to apply* under a broken shape, its
+//! judged count falling from 113,947 to 28,577 — the fault removing the check rather than
+//! tripping it. So the control takes a `--fault`, and the gate asks that **every** relation have
+//! one that fires.
 //!
 //! Run with:
 //!   cargo run --release -p onnx-adapter --example n10_metamorphic --features candle -- \
@@ -41,7 +51,7 @@ use onnx_adapter::generator::OnnxGenerator;
 use onnx_adapter::metamorphic::{self, Tally, Verdict};
 use onnx_adapter::outcome::OnnxOutcome;
 use onnx_adapter::runtimes::{OrtRuntime, TractRuntime};
-use onnx_adapter::testing::WrongShape;
+use onnx_adapter::testing::{WrongAtOpset, WrongShape, WrongValues};
 
 /// Log every this many cases; print to stdout far less often. A background process here is
 /// reclaimed after ~1,029 printed lines, which cost two campaigns before it was diagnosed.
@@ -52,12 +62,59 @@ struct Args {
     name: String,
     seeds: std::ops::Range<u64>,
     control: bool,
+    fault: Fault,
+}
+
+/// Which deliberate fault a control run injects.
+///
+/// **A relation is only controlled by a fault it can see.** Listed with what each one moves,
+/// measured rather than assumed — see the module note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// Flatten the output shape. Moves `shape-inference` and `cast-round-trip`.
+    Shape,
+    /// Perturb one element of every output. Moves `transpose-inverse`, which composes two runs
+    /// and therefore accumulates the perturbation, and `cast-round-trip`.
+    Values,
+    /// Perturb one element **only at opset 22 and above**. The one fault `opset-invariance` can
+    /// see, because it compares two runs of the same runtime at different opsets.
+    AtOpset,
+}
+
+impl Fault {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "shape" => Some(Fault::Shape),
+            "values" => Some(Fault::Values),
+            "opset" => Some(Fault::AtOpset),
+            _ => None,
+        }
+    }
+
+    /// The relations this fault is expected to move. Named so the run can *check* rather than
+    /// leave it to a reader to notice a zero in the wrong column.
+    fn expected_to_move(self) -> &'static [&'static str] {
+        match self {
+            Fault::Shape => &["shape-inference", "cast-round-trip"],
+            Fault::Values => &["transpose-inverse", "cast-round-trip"],
+            Fault::AtOpset => &["opset-invariance"],
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Fault::Shape => "shape",
+            Fault::Values => "values",
+            Fault::AtOpset => "opset",
+        }
+    }
 }
 
 fn parse_args() -> Args {
     let mut name = "metamorphic".to_string();
     let mut seeds = 0..20_000u64;
     let mut control = false;
+    let mut fault = Fault::Shape;
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
@@ -73,6 +130,13 @@ fn parse_args() -> Args {
                 }
             }
             "--control" => control = true,
+            "--fault" => {
+                i += 1;
+                match raw.get(i).and_then(|r| Fault::parse(r)) {
+                    Some(chosen) => fault = chosen,
+                    None => eprintln!("unrecognised --fault; keeping {}", fault.label()),
+                }
+            }
             other => eprintln!("ignoring unrecognised argument {other}"),
         }
         i += 1;
@@ -81,6 +145,7 @@ fn parse_args() -> Args {
         name,
         seeds,
         control,
+        fault,
     }
 }
 
@@ -143,7 +208,9 @@ fn record_violation(
 fn main() {
     let args = parse_args();
     let run_name = if args.control {
-        format!("{}-control", args.name)
+        // The fault is in the name, because three controls must not overwrite each other's
+        // findings — and because a control's result is a claim about *one* fault.
+        format!("{}-control-{}", args.name, args.fault.label())
     } else {
         args.name.clone()
     };
@@ -163,9 +230,12 @@ fn main() {
     );
     if args.control {
         println!(
-            "  MODE         CONTROL — every output is deliberately reshaped.\n\
-             \x20              Violations are EXPECTED; a clean control means the relations\n\
-             \x20              could not have detected anything and their zero means nothing."
+            "  MODE         CONTROL, fault = {}. Violations are EXPECTED.\n\
+             \x20              Expected to move: {}\n\
+             \x20              A relation this fault cannot see keeps an UNCONTROLLED zero;\n\
+             \x20              only the relations listed above are validated by this run.",
+            args.fault.label(),
+            args.fault.expected_to_move().join(", ")
         );
     }
     println!("  writes       findings/onnx/runs/metamorphic/{run_name}/*.json");
@@ -178,11 +248,27 @@ fn main() {
 
     let generator = OnnxGenerator::new(bounds.clone());
 
-    let saboteur_tract = WrongShape::new(TractRuntime);
-    let saboteur_ort = WrongShape::new(OrtRuntime);
+    // All three saboteurs are built regardless of which is used, so each binding outlives the
+    // trait-object references taken below. A `match` returning them directly would drop the
+    // unselected ones at the end of the arm.
+    let shape_tract = WrongShape::new(TractRuntime);
+    let shape_ort = WrongShape::new(OrtRuntime);
+    // A delta far larger than any rounding difference, for the same reason `WrongValues` documents:
+    // a fault the oracle might mistake for noise proves nothing.
+    let values_tract = WrongValues::new(TractRuntime, 7.0);
+    let values_ort = WrongValues::new(OrtRuntime, 7.0);
+    // Corrupt at opset 22 and above. Cases are generated at 22 and `opset-invariance` derives the
+    // *older* twin, so exactly one side of that comparison is corrupted.
+    let opset_tract = WrongAtOpset::new(TractRuntime, 22, 7.0);
+    let opset_ort = WrongAtOpset::new(OrtRuntime, 22, 7.0);
+
     let participants: Vec<(&str, &dyn Implementation<In = OnnxCase, Out = OnnxOutcome>)> =
         if args.control {
-            vec![("tract", &saboteur_tract), ("onnxruntime", &saboteur_ort)]
+            match args.fault {
+                Fault::Shape => vec![("tract", &shape_tract), ("onnxruntime", &shape_ort)],
+                Fault::Values => vec![("tract", &values_tract), ("onnxruntime", &values_ort)],
+                Fault::AtOpset => vec![("tract", &opset_tract), ("onnxruntime", &opset_ort)],
+            }
         } else {
             vec![("tract", &TractRuntime), ("onnxruntime", &OrtRuntime)]
         };
@@ -475,14 +561,58 @@ fn main() {
             .to_string(),
     );
 
-    if violations.is_empty() {
-        say(if args.control {
-            "\n  *** CONTROL FAILED — the relations could not detect a deliberately reshaped\n  \
-             output, so a clean real run proves NOTHING ***"
-                .to_string()
+    // **A control passes when the relations it targets moved, not when *something* moved.**
+    //
+    // The first version asked only whether the violation list was non-empty. Against a shape
+    // fault that is satisfied by `shape-inference` alone — and `shape-inference` is 49% of the
+    // judging, so "CONTROL PASSED" was printed over `opset-invariance` and `transpose-inverse`
+    // sitting at exactly zero, uncontrolled, for a full 3,000,000-case run.
+    if args.control {
+        let moved: Vec<&str> = args
+            .fault
+            .expected_to_move()
+            .iter()
+            .copied()
+            .filter(|relation| {
+                results
+                    .get(*relation)
+                    .is_some_and(|per| per.values().any(|tally| tally.violated > 0))
+            })
+            .collect();
+        let missed: Vec<&str> = args
+            .fault
+            .expected_to_move()
+            .iter()
+            .copied()
+            .filter(|relation| !moved.contains(relation))
+            .collect();
+        say(format!(
+            "\n  fault `{}` moved: [{}]   did NOT move: [{}]",
+            args.fault.label(),
+            moved.join(", "),
+            missed.join(", ")
+        ));
+        if missed.is_empty() {
+            say("  CONTROL PASSED — every relation this fault targets was violated.".to_string());
         } else {
-            "\nno relation was violated".to_string()
-        });
+            say(
+                "  *** CONTROL FAILED — a relation this fault should have tripped did not.\n  \
+                 Its zero in the real run proves NOTHING ***"
+                    .to_string(),
+            );
+        }
+        // Which relations remain unvalidated *by any fault* is not knowable from one run, so the
+        // reminder is unconditional rather than a computed claim this run cannot support.
+        say(
+            "  Relations outside that list keep an uncontrolled zero until another fault moves \n               them. See the module note for the measured fault-to-relation map."
+                .to_string(),
+        );
+    }
+
+    if violations.is_empty() {
+        if !args.control {
+            say("\nno relation was violated".to_string());
+        }
     } else {
         say(format!(
             "\n{} VIOLATIONS (first 10 shown):",
@@ -490,9 +620,6 @@ fn main() {
         ));
         for v in &violations {
             say(format!("  {v}"));
-        }
-        if args.control {
-            say("\n  CONTROL PASSED — the relations detect a broken implementation.".to_string());
         }
     }
     say(format!("\n  findings: {}", findings_path));

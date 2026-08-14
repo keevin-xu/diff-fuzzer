@@ -20,17 +20,25 @@
 //! not because the implementations agreed, but because the tolerance was so wide that
 //! nothing could fail it, and the tool reported that as agreement.
 //!
-//! # The three kinds of wrongness, and why three
+//! # The four kinds of wrongness, and why four
 //!
 //! | wrapper | breaks | catches an oracle that… |
 //! |---|---|---|
 //! | [`WrongValues`] | one element's value | ignores values, or compares with a bound that accepts anything |
 //! | [`WrongShape`] | the output shape | compares values only, element by element, without checking shape |
+//! | [`WrongAtOpset`] | values, **only above an opset** | compares two runs of the *same* implementation |
 //! | [`Panicking`] | the process | routes crashes into the skip path — **the domain's thesis** |
 //!
 //! One wrapper would not be enough. An oracle that compares values but ignores shape passes
 //! a `WrongValues` test and fails silently on real shape bugs, and that is a plausible bug
 //! to write.
+//!
+//! **The fourth was added because three were not enough either, and a campaign proved it.** A
+//! metamorphic relation may compare an implementation against *itself* rather than against a
+//! peer, and every fault above is then applied to both sides equally and cancels. A 3,000,000-
+//! case control reported CONTROL PASSED with `opset-invariance` — 48.2% of all judging — at
+//! exactly zero violations. A fault must vary with something the relation varies, or the
+//! relation cannot see it.
 //!
 //! # The classification that fault injection must respect
 //!
@@ -165,6 +173,83 @@ fn corrupt_element(data: &mut TensorData, index: usize, delta: f32) {
                 *x = !*x;
             }
         }
+    }
+}
+
+/// Wraps a real implementation and corrupts values **only at or above a given opset**.
+///
+/// # The fault the other two cannot express
+///
+/// A differential oracle compares two *different* implementations, so any fault in one of them
+/// shows up. A metamorphic relation often compares two runs of the **same** implementation —
+/// `opset-invariance` runs one runtime at an old opset and at opset 22 and requires the answers
+/// to match. Against that relation, [`WrongValues`] is **invisible**: it corrupts both runs
+/// identically, the two corrupted answers still agree, and the relation reports `Held`.
+///
+/// Measured, not argued. A 3,000,000-case metamorphic control using [`WrongShape`] reported:
+///
+/// | relation | share of judging | violations |
+/// |---|---|---|
+/// | `shape-inference` | 49.1% | 4,386,098 |
+/// | `cast-round-trip` | 0.8% | 72,926 |
+/// | `opset-invariance` | **48.2%** | **0** |
+/// | `transpose-inverse` | **1.9%** | **0** |
+///
+/// So **half the judging behind an 11,750,917-check zero had never been shown able to fire**.
+///
+/// `transpose-inverse` was worse than merely unmoved: its `judged` count *fell* from 113,947 to
+/// 28,577 under sabotage, because a broken shape makes the relation decline to apply. **The fault
+/// removed the check instead of tripping it** — coverage silently lost, reported as a clean zero.
+///
+/// This corruptor is therefore a **function of the input**, which is exactly what makes a
+/// same-implementation relation able to see it: run the identical case at two opsets and only one
+/// side changes.
+pub struct WrongAtOpset<I> {
+    inner: I,
+    name: String,
+    /// Corrupt only when `case.opset >= from_opset`.
+    from_opset: i64,
+    delta: f32,
+}
+
+impl<I> WrongAtOpset<I> {
+    /// Corrupt results at `from_opset` and above, leaving older opsets untouched.
+    pub fn new(inner: I, from_opset: i64, delta: f32) -> Self
+    where
+        I: Implementation,
+    {
+        Self {
+            name: format!("{}-wrong-at-opset-{from_opset}", inner.name()),
+            inner,
+            from_opset,
+            delta,
+        }
+    }
+}
+
+impl<I> Implementation for WrongAtOpset<I>
+where
+    I: Implementation<In = OnnxCase, Out = OnnxOutcome>,
+{
+    type In = OnnxCase;
+    type Out = OnnxOutcome;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn run(&self, input: &OnnxCase) -> Result<OnnxOutcome, RunError> {
+        let outcome = self.inner.run(input)?;
+        if input.opset < self.from_opset {
+            return Ok(outcome);
+        }
+        let OnnxOutcome::Ok(mut tensors) = outcome else {
+            return Ok(outcome);
+        };
+        if let Some(tensor) = tensors.first_mut() {
+            corrupt_element(&mut tensor.data, 0, self.delta);
+        }
+        Ok(OnnxOutcome::Ok(tensors))
     }
 }
 
@@ -364,6 +449,77 @@ mod tests {
             })
             .collect();
         OnnxOracle.check(case, &outputs)
+    }
+
+    /// **The saboteur that a same-implementation relation can see.**
+    ///
+    /// `opset-invariance` runs one runtime twice, at two opsets, and compares the results to each
+    /// other. A fault applied equally to both runs is invisible to it — which is why a
+    /// 3,000,000-case control using `WrongShape` left that relation, 48.2% of all judging, at
+    /// exactly zero violations while reporting CONTROL PASSED.
+    ///
+    /// So the property under test is not "it corrupts" but **"it corrupts asymmetrically"**: the
+    /// same case at opset 21 and opset 22 must come back different.
+    #[test]
+    fn a_fault_keyed_on_the_opset_is_visible_across_opsets() {
+        let saboteur = WrongAtOpset::new(TractRuntime, 22, 7.0);
+        let at = |opset: i64| {
+            let case = OnnxCase::new(
+                OpKind::Abs,
+                opset,
+                vec![TensorValue::new(
+                    "a",
+                    vec![2],
+                    crate::case::TensorData::F32(vec![1.0, 2.0]),
+                )],
+            );
+            match saboteur.run(&case).expect("never Err") {
+                OnnxOutcome::Ok(tensors) => tensors[0].data.clone(),
+                other => panic!("expected Ok, got {other:?}"),
+            }
+        };
+
+        let old_opset = at(21);
+        let new_opset = at(22);
+        assert_ne!(
+            old_opset, new_opset,
+            "the fault must differ across the opset boundary, or opset-invariance cannot see it"
+        );
+        // Below the threshold the result must be the *untouched* one, not merely a different
+        // corruption — otherwise the relation would fire for the wrong reason.
+        assert_eq!(
+            old_opset,
+            crate::case::TensorData::F32(vec![1.0, 2.0]),
+            "an opset below the threshold must pass through unchanged"
+        );
+    }
+
+    /// The contrast that makes the test above meaningful: `WrongValues` corrupts *both* sides
+    /// identically, so a same-implementation comparison sees nothing wrong. This is the measured
+    /// blind spot, pinned so it cannot be forgotten and re-discovered by a campaign.
+    #[test]
+    fn a_plain_value_fault_is_invisible_across_opsets() {
+        let saboteur = WrongValues::new(TractRuntime, 7.0);
+        let at = |opset: i64| {
+            let case = OnnxCase::new(
+                OpKind::Abs,
+                opset,
+                vec![TensorValue::new(
+                    "a",
+                    vec![2],
+                    crate::case::TensorData::F32(vec![1.0, 2.0]),
+                )],
+            );
+            match saboteur.run(&case).expect("never Err") {
+                OnnxOutcome::Ok(tensors) => tensors[0].data.clone(),
+                other => panic!("expected Ok, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            at(21),
+            at(22),
+            "a fault independent of the opset is by construction invisible to opset-invariance"
+        );
     }
 
     /// **The control.** Real implementations, no fault: the oracle must stay silent.
