@@ -898,7 +898,15 @@ pub fn candidates(opset: i64) -> Vec<(OpKind, ElemType)> {
 /// `Round` was introduced at 22 and has no span; it returns `22..=22`, a single point, rather
 /// than an empty range that callers would have to special-case.
 pub fn opset_span(op: OpKind) -> std::ops::RangeInclusive<i64> {
-    let since = spec(op).since;
+    // **Clamped to the lowest opset this adapter builds models at, not just to the operator's
+    // own history.** `Not` has `since = 1`, so an unclamped span reaches opset 1 — and the model
+    // builder's floor is 7, so every draw below it produced an invalid model.
+    //
+    // Caught by the campaign's own `invalid by our own validator (must be 0)` line, which read
+    // **6,108** on the first 3,000,000-case run with this axis on. That line exists for exactly
+    // this: a generator that produces cases the domain considers malformed is broken whether or
+    // not the malformed cases happen to be skipped safely afterwards.
+    let since = spec(op).since.max(crate::validation::MIN_OPSET);
     since.min(22)..=22
 }
 

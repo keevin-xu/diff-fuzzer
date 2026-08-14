@@ -1205,6 +1205,66 @@ mod tests {
         );
     }
 
+    /// **Every generated case must be valid, with the opset axis on.**
+    ///
+    /// The campaign prints `invalid by our own validator (must be 0)` and it read **6,108** on
+    /// the first 3,000,000-case run with this axis enabled. Cause: `Not` has `since = 1`, so its
+    /// span reached opset 1, while the model builder's floor is `MIN_OPSET = 7`. Every draw below
+    /// the floor built a model the domain itself calls malformed.
+    ///
+    /// **The campaign caught it and no test did**, which is the wrong way round for a 24-minute
+    /// run — hence this. An operator's own history is not the only constraint on its opset; the
+    /// adapter's model floor is the other, and `opset_span` now takes the maximum of the two.
+    #[test]
+    fn every_case_the_opset_axis_produces_is_valid() {
+        use crate::generator::OnnxGenerator;
+        use diff_fuzzer_core::rng::SeededRng;
+        use diff_fuzzer_core::traits::Generator;
+
+        let generator = OnnxGenerator::new(
+            Bounds::default()
+                .with_special_values()
+                .with_quantized()
+                .with_opsets(),
+        );
+        let mut invalid = Vec::new();
+        for seed in 0..20_000u64 {
+            let case = generator.generate(&mut SeededRng::from_seed(seed));
+            if !crate::validation::is_valid(&case) {
+                invalid.push((
+                    seed,
+                    case.op.onnx_name(),
+                    case.opset,
+                    crate::validation::validate(&case),
+                ));
+                if invalid.len() >= 5 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            invalid.is_empty(),
+            "the generator produced invalid cases: {invalid:?}"
+        );
+    }
+
+    /// No span may start below the opset this adapter can build a model at.
+    ///
+    /// The direct statement of the same rule, so a failure names the operator rather than a seed.
+    #[test]
+    fn no_opset_span_starts_below_the_model_floor() {
+        for op in crate::case::OpKind::ALL {
+            let span = ops::opset_span(op);
+            assert!(
+                *span.start() >= crate::validation::MIN_OPSET,
+                "{op:?} spans from {} — below the model floor of {}",
+                span.start(),
+                crate::validation::MIN_OPSET
+            );
+            assert!(*span.start() <= *span.end(), "{op:?} has an empty span");
+        }
+    }
+
     /// And it must actually vary — an axis that changes nothing is worse than no axis, because
     /// it appears in the description and in the fingerprint while buying nothing.
     #[test]
