@@ -535,9 +535,17 @@ pub fn generate_case(
             // Two runtimes panic on it; the reference returns numpy's `0`. Floats keep their
             // zeros — division by zero there is IEEE-754 defined and is exactly the surface this
             // domain wants. `SPECS.md` §2.2b, `PENDING` 1.11.
+            let mut left = left;
             let right = if op == OpKind::Div {
                 let count = element_count(&dims) as usize;
-                TensorValue::new("b", dims.clone(), gen_value::nonzero(elem, count, rng))
+                let divisor =
+                    TensorValue::new("b", dims.clone(), gen_value::nonzero(elem, count, rng));
+                // **`MIN / -1` is declined as a pair, not by banning `-1`.** The overflow is
+                // undetermined (`SPECS.md` §2.11) but `-1` alone is an ordinary divisor, and
+                // excluding it removed integer division by `-1` from the corpus entirely.
+                // Shapes match here by construction, so the pairing is exact.
+                gen_value::decline_min_over_negative_one(&mut left.data, &divisor.data);
+                divisor
             } else {
                 tensor("b", &dims, elem, op, bounds, rng)
             };

@@ -302,12 +302,35 @@ pub fn is_undetermined(case: &crate::case::OnnxCase) -> bool {
     let data_elem = crate::ops::data_elem_type(case);
     match case.op {
         // `integer-division-by-zero` and `integer-division-overflow` (SPECS 2.2b, 2.11).
+        //
+        // **Zero is a property of the divisor; overflow is a property of the pair.** This tested
+        // `*x == 0 || *x == -1` on the divisor alone, which declined every `-1` divisor when only
+        // `MIN / -1` is undetermined — integer division by `-1` was then untested across nine
+        // million cases. The pair is now checked at matching indices, which is exact because
+        // `Family::BinaryElementwise` gives both operands one shape.
         OpKind::Div if !data_elem.is_floating() => {
-            case.inputs.get(1).is_some_and(|d| match &d.data {
-                TensorData::I32(v) => v.iter().any(|x| *x == 0 || *x == -1),
-                TensorData::I64(v) => v.iter().any(|x| *x == 0 || *x == -1),
+            let dividend = case.inputs.first().map(|d| &d.data);
+            let divisor = case.inputs.get(1).map(|d| &d.data);
+            match (dividend, divisor) {
+                (Some(TensorData::I32(left)), Some(TensorData::I32(right))) => {
+                    right.contains(&0)
+                        || left
+                            .iter()
+                            .zip(right.iter())
+                            .any(|(l, r)| *l == i32::MIN && *r == -1)
+                }
+                (Some(TensorData::I64(left)), Some(TensorData::I64(right))) => {
+                    right.contains(&0)
+                        || left
+                            .iter()
+                            .zip(right.iter())
+                            .any(|(l, r)| *l == i64::MIN && *r == -1)
+                }
+                // A divisor with no matching dividend can still carry a zero.
+                (_, Some(TensorData::I32(right))) => right.contains(&0),
+                (_, Some(TensorData::I64(right))) => right.contains(&0),
                 _ => false,
-            })
+            }
         }
 
         // `max-min-nan` and `max-min-signed-zero` (SPECS 2.2c, 2.9).
@@ -660,7 +683,8 @@ mod tests {
 
         let generator = OnnxGenerator::new(Bounds::default().with_special_values());
         let mut divisor_zeros = 0;
-        let mut divisor_minus_ones = 0;
+        let mut overflowing_pairs = 0;
+        let mut minus_one_divisors = 0;
         let mut maxmin_nans = 0;
         let mut maxmin_negative_zeros = 0;
         let mut sign_nans = 0;
@@ -669,19 +693,37 @@ mod tests {
             let case = generator.generate(&mut SeededRng::from_seed(seed));
             match case.op {
                 OpKind::Div if !crate::ops::data_elem_type(&case).is_floating() => {
-                    if let Some(divisor) = case.inputs.get(1) {
+                    if let (Some(dividend), Some(divisor)) =
+                        (case.inputs.first(), case.inputs.get(1))
+                    {
                         divisor_zeros += match &divisor.data {
                             TensorData::I32(v) => v.iter().filter(|x| **x == 0).count(),
                             TensorData::I64(v) => v.iter().filter(|x| **x == 0).count(),
                             _ => 0,
                         };
-                        // `-1` too: paired with a `MIN` dividend it overflows, and ONNX does not
-                        // say what that produces.
-                        divisor_minus_ones += match &divisor.data {
-                            TensorData::I32(v) => v.iter().filter(|x| **x == -1).count(),
-                            TensorData::I64(v) => v.iter().filter(|x| **x == -1).count(),
-                            _ => 0,
+                        // **The undetermined case is the pair, not the divisor.** `MIN / -1`
+                        // overflows; every other `-1` divisor is an ordinary sign flip. Counting
+                        // `-1` alone is what the old, over-broad decline asserted, and it made
+                        // integer division by `-1` untestable.
+                        let (pairs, minus_ones) = match (&dividend.data, &divisor.data) {
+                            (TensorData::I32(l), TensorData::I32(r)) => (
+                                l.iter()
+                                    .zip(r.iter())
+                                    .filter(|(l, r)| **l == i32::MIN && **r == -1)
+                                    .count(),
+                                r.iter().filter(|x| **x == -1).count(),
+                            ),
+                            (TensorData::I64(l), TensorData::I64(r)) => (
+                                l.iter()
+                                    .zip(r.iter())
+                                    .filter(|(l, r)| **l == i64::MIN && **r == -1)
+                                    .count(),
+                                r.iter().filter(|x| **x == -1).count(),
+                            ),
+                            _ => (0, 0),
                         };
+                        overflowing_pairs += pairs;
+                        minus_one_divisors += minus_ones;
                     }
                 }
                 OpKind::Max | OpKind::Min => {
@@ -722,8 +764,16 @@ mod tests {
         }
         assert_eq!(divisor_zeros, 0, "integer-division-by-zero was generated");
         assert_eq!(
-            divisor_minus_ones, 0,
-            "integer-division-overflow was reachable: a -1 divisor can pair with a MIN dividend"
+            overflowing_pairs, 0,
+            "integer-division-overflow was generated: a MIN dividend met a -1 divisor"
+        );
+        // **The positive half, and the reason the decline was narrowed.** Asserting only that the
+        // undetermined pair is absent is satisfied by banning `-1` outright, which is exactly what
+        // this used to do — and integer division by `-1` was then tested nowhere. A decline that
+        // removes more than it must should fail here rather than look like success.
+        assert!(
+            minus_one_divisors > 0,
+            "no -1 divisor was generated in 3,000 seeds: the decline is over-broad again"
         );
         assert_eq!(maxmin_nans, 0, "max-min-nan was generated");
         assert_eq!(

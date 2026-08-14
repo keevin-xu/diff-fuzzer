@@ -91,7 +91,7 @@ pub fn undetermined_for(op: OpKind) -> Excluded {
     }
 }
 
-const SPECIAL_F32: [f32; 10] = [
+const SPECIAL_F32: [f32; 11] = [
     0.0,
     -0.0,
     1.0,
@@ -99,10 +99,28 @@ const SPECIAL_F32: [f32; 10] = [
     f32::INFINITY,
     f32::NEG_INFINITY,
     f32::NAN,
-    f32::MIN_POSITIVE, // the smallest normal — the subnormal boundary
+    f32::MIN_POSITIVE, // the smallest normal — the subnormal *boundary*
+    // **An actual subnormal**, which the pool did not contain for nine million cases.
+    //
+    // `MIN_POSITIVE` above is the smallest *normal* float. The pool was built to probe the
+    // subnormal boundary and never crossed it, so no draw was ever subnormal — measured, not
+    // suspected: the `has_subnormal` feature held for **0 of 44 findings and 0 of 30,738
+    // negatives**, the only feature zero on both sides.
+    //
+    // This matters because flush-to-zero is a classic cross-implementation divergence: a runtime
+    // built with fast-math, or on hardware that flushes subnormals, returns `0` where the
+    // specification requires the subnormal. That surface was untested here.
+    //
+    // `from_bits(1)` is the smallest positive subnormal (~1.4e-45), the furthest possible from a
+    // normal float and therefore the most likely to be flushed.
+    SMALLEST_SUBNORMAL,
     f32::MAX,
     f32::MIN,
 ];
+
+/// The smallest positive subnormal `f32`, written as a bit pattern because no decimal literal
+/// spells it unambiguously.
+const SMALLEST_SUBNORMAL: f32 = f32::from_bits(1);
 
 /// The integer equivalents: boundaries where wrapping and saturation differ.
 const SPECIAL_I64: [i64; 7] = [
@@ -228,7 +246,16 @@ fn pick_f32(exclude: Excluded, rng: &mut SeededRng) -> f32 {
 ///
 /// **Finite is necessary and not sufficient**: `-1.0` is finite and out of range for `uint8`.
 /// The pool is filtered again per target in [`cast_safe`].
-const CAST_SAFE_F32: [f32; 5] = [0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE];
+const CAST_SAFE_F32: [f32; 6] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    f32::MIN_POSITIVE,
+    // In range for every integer target — it converts to `0` — so the subnormal surface is
+    // reachable through `Cast` as well as through arithmetic.
+    SMALLEST_SUBNORMAL,
+];
 
 /// The magnitude ordinary `Cast` draws reach for, before the target's range narrows it.
 const CAST_DRAW_MAGNITUDE: f64 = 100.0;
@@ -326,21 +353,22 @@ pub fn cast_safe(
 /// Floats are **not** restricted: division by zero is defined by IEEE-754 and produces
 /// `±inf`/`NaN`, which is specified behaviour and exactly the surface this domain wants.
 pub fn nonzero(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData {
-    // **Neither `0` nor `-1`.**
+    // **`0` only.**
     //
-    // `0` because ONNX never says what integer division by zero produces (`SPECS.md` §2.2b).
+    // ONNX never says what integer division by zero produces (`SPECS.md` §2.2b), so the answer is
+    // undetermined and the case must not be generated.
     //
-    // `-1` because of a *correlated* case the per-value exclusions cannot express: `MIN / -1`
-    // overflows, since the true result is `2^31` and does not fit. ONNX specifies truncating
-    // division and is **silent on overflow** (`SPECS.md` §2.11), so the answer is undetermined —
-    // `onnx.reference` and ONNX Runtime wrap, `tract` panics with "attempt to divide with
-    // overflow". Excluding `-1` from the divisor is the cheapest way to make the pair
-    // unreachable; excluding `MIN` from the dividend would cost a boundary value that matters
-    // elsewhere, while `-1` as a divisor is only a sign flip.
+    // **`-1` used to be excluded here too, and that was too broad.** The undetermined case is the
+    // *pair* `MIN / -1`, which overflows because the true result `2^31` does not fit; ONNX
+    // specifies truncating division and is silent on overflow (`SPECS.md` §2.11). Excluding every
+    // `-1` divisor made the pair unreachable, and also removed integer division by `-1`
+    // altogether — a sign flip, tested nowhere across nine million cases. The pair is now declined
+    // exactly, by [`decline_min_over_negative_one`], which needs both operands and so belongs to
+    // the caller.
     //
     // The behaviour itself is preserved as a candidate finding (F-006) rather than discarded —
     // declining to generate it and reporting it are not in conflict.
-    let avoid = |value: i64| value == 0 || value == -1;
+    let avoid = |value: i64| value == 0;
     match elem {
         ElemType::I32 => TensorData::I32(
             (0..count)
@@ -367,6 +395,50 @@ pub fn nonzero(elem: ElemType, count: usize, rng: &mut SeededRng) -> TensorData 
         // Floats and booleans are unrestricted: float division by zero is IEEE-754 defined,
         // and `Div` does not accept booleans at all.
         other => ordinary(other, count, rng),
+    }
+}
+
+/// Make `MIN / -1` unreachable **as a pair**, leaving both values available separately.
+///
+/// # Why this takes two tensors
+///
+/// Every other decline in this project is a property of a single tensor: a `NaN`, an empty shape,
+/// an out-of-range float. This one is not. `MIN` is a perfectly good dividend and `-1` a perfectly
+/// good divisor; only the two of them *at the same index* are undetermined.
+///
+/// The earlier version declined every `-1` divisor because a per-value rule was all the generator
+/// had. That was sound — declining is safe either way — and cost integer division by `-1`
+/// entirely, which nine million cases never tested.
+///
+/// # Why the indices can be paired at all
+///
+/// `Family::BinaryElementwise` gives both operands **one shape**, deliberately: broadcasting would
+/// change the output shape and needs its own rule. So element *i* of the dividend really is
+/// divided by element *i* of the divisor, and the pair check is exact rather than conservative.
+/// If broadcasting is ever admitted here, this becomes wrong and must be revisited.
+///
+/// The dividend is nudged rather than the divisor, and by one, so a boundary value stays a
+/// boundary value: `MIN` becomes `MIN + 1`, which is still the most negative representable value
+/// but one and still exercises the sign-asymmetry that makes `MIN` interesting.
+pub fn decline_min_over_negative_one(dividend: &mut TensorData, divisor: &TensorData) {
+    match (dividend, divisor) {
+        (TensorData::I32(left), TensorData::I32(right)) => {
+            for (l, r) in left.iter_mut().zip(right.iter()) {
+                if *l == i32::MIN && *r == -1 {
+                    *l = i32::MIN + 1;
+                }
+            }
+        }
+        (TensorData::I64(left), TensorData::I64(right)) => {
+            for (l, r) in left.iter_mut().zip(right.iter()) {
+                if *l == i64::MIN && *r == -1 {
+                    *l = i64::MIN + 1;
+                }
+            }
+        }
+        // Floats have no overflowing division — `MIN / -1` is finite — and the narrow integer
+        // types are not division operands in this domain.
+        _ => {}
     }
 }
 

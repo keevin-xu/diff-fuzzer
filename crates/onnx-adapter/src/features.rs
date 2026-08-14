@@ -453,6 +453,32 @@ mod tests {
         );
     }
 
+    /// **The generator must be able to reach every feature it claims to have.**
+    ///
+    /// `has_subnormal` held for 0 of 44 findings *and* 0 of 30,738 negatives — the only atom zero
+    /// on both sides. The special-value pool contained `f32::MIN_POSITIVE`, the smallest
+    /// **normal** float: it probed the subnormal boundary without ever crossing it, so no draw
+    /// was subnormal and the feature was unreachable rather than merely unused.
+    ///
+    /// An unreachable feature is worse than a missing one — it appears in the vocabulary, is
+    /// enumerated into thousands of candidate rules, and can never separate anything.
+    #[test]
+    fn a_subnormal_is_actually_reachable() {
+        use crate::gen_shape::Bounds;
+        use crate::generator::OnnxGenerator;
+        use diff_fuzzer_core::rng::SeededRng;
+        use diff_fuzzer_core::traits::Generator;
+
+        let generator = OnnxGenerator::new(Bounds::default().with_special_values());
+        let reached = (0..4000u64)
+            .map(|seed| generator.generate(&mut SeededRng::from_seed(seed)))
+            .any(|case| features(&case).has("has_subnormal"));
+        assert!(
+            reached,
+            "no generated case is subnormal — the pool holds only the smallest NORMAL float again"
+        );
+    }
+
     /// Broadcasting needs two shapes that differ; one input can never require it.
     #[test]
     fn broadcasting_is_a_property_of_a_pair() {
