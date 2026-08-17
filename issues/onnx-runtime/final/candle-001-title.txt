@@ -1,1 +1,1 @@
-Reshape appears to ignore allowzero=1 for a zero-length dimension
+Reshape ignores the allowzero attribute (candle-onnx)

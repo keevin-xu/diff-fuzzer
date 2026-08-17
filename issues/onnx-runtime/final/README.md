@@ -13,7 +13,7 @@ directory follows it.
 | `tract-001-*` | [sonos/tract](https://github.com/sonos/tract) | `Sign(-0.0)` returns `-0.0` instead of `0` | `../FINDING-005-tract-sign-negative-zero.md` |
 | `onnxruntime-001-*` | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) | `Where` loses the sign of `-0.0` selected from `X` | `../FINDING-004-onnxruntime-where-signed-zero.md` |
 | `tract-002-*` | [sonos/tract](https://github.com/sonos/tract) | `Reshape` of a zero-size tensor fails to load | `../FINDING-002-reshape-empty-tensor.md` |
-| `candle-001-*` | [huggingface/candle](https://github.com/huggingface/candle) | `Reshape` appears to ignore `allowzero=1` | `../FINDING-007-candle-reshape-allowzero.md` |
+| `candle-001-*` | [huggingface/candle](https://github.com/huggingface/candle) | `Reshape` ignores `allowzero` — **root-caused in the source** | `../FINDING-007-candle-reshape-allowzero.md` |
 | `tract-003-*` | [sonos/tract](https://github.com/sonos/tract) | `DynamicQuantizeLinear` rounds ties away from zero | `../FINDING-008-tract-dynamicquantize-rounding-mode.md` |
 | `tract-004-*` | [sonos/tract](https://github.com/sonos/tract) | `Div` on `int32` panics on `int32::MIN / -1` | `../FINDING-006-tract-div-overflow.md` |
 
