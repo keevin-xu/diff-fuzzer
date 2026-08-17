@@ -45,7 +45,7 @@ one that survives this column.
 | `max`/`min` return `±f32::MAX` | 196 | **fileable** — `burn-002`. `-inf` is representable and is the correct answer; no convention permits a finite sentinel |
 | `max`/`min` `NaN` ordering | 1,639 | **legal, not filed.** IEEE-754 defines *both* conventions — `maxNum` ignores `NaN`, `maximum` propagates it. CPUs take one, the GPU the other. Recorded as an observation |
 | `cumprod` saturating intermediate | 46 | **legal, not filed.** A cumulative product has no specified association, and PyTorch documents that backends may differ between finite and non-finite results (`SPECS.md` §3.3). The oracle now declines these rather than reporting them |
-| `conv2d` padding with a non-finite weight | 23 | **candidate** — `burn-003`. Drafted as a question: the specification is silent (`SPECS.md` §3.4), and it needs a non-finite weight to reach |
+| `conv2d` padding with a non-finite weight | 23 | **fileable** — `burn-003`. Re-verified 2026-08-17: reproduces, control with a finite weight agrees on all three, no duplicate in burn's tracker, and **both mechanisms now confirmed in source** — `burn-tch` forwards to libtorch, `burn-flex` analytically skips the pad. Stays question-shaped because `SPECS.md` §3.4 records the specification as genuinely silent |
 
 **The 837 findings under `findings/tensor/runs/archive/` are excluded entirely.** They predate
 the `ndarray`→`flex` swap, and 810 of 814 no longer reproduce — a recorded finding that cannot be
