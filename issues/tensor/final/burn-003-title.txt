@@ -1,1 +1,1 @@
-conv2d: padded positions become NaN on burn-tch but 0 on burn-flex/burn-wgpu when a weight is non-finite — which is intended?
+conv2d: padded positions become NaN on burn-tch but 0 on burn-flex/burn-wgpu when a weight is non-finite. Which is intended?

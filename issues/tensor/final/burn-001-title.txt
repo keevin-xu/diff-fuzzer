@@ -1,1 +1,1 @@
-matmul: ndarray and tch backends disagree when intermediate products overflow f32 — is this expected?
+matmul: ndarray and tch backends disagree when intermediate products overflow f32. Is this expected?
