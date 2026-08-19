@@ -111,6 +111,23 @@ fn main() {
             Ok(Ok(out)) => format!("{:?}", out.values().next()),
         };
         println!("\ncandle on the same Reshape file\n  reshape  {line}");
+
+        // The spec's own `zero_and_negative_dim` shape, with allowzero UNSET.
+        let bytes = std::fs::read(format!("{d}/zeroneg.onnx")).expect("read zeroneg.onnx");
+        let model = candle_onnx::onnx::ModelProto::decode(bytes.as_slice()).expect("decode");
+        let x = candle_core::Tensor::from_vec((0..24).map(|i| i as f32).collect::<Vec<_>>(),
+            (2usize, 3usize, 1usize, 4usize), &candle_core::Device::Cpu).expect("tensor");
+        let mut feeds = std::collections::HashMap::new();
+        feeds.insert("a".to_string(), x);
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            candle_onnx::simple_eval(&model, feeds)
+        }));
+        let line = match got {
+            Err(_) => "CRASHED (panic)".to_string(),
+            Ok(Err(e)) => format!("REJECTED: {}", e.to_string().lines().next().unwrap_or("")),
+            Ok(Ok(out)) => format!("{:?}", out.values().next().map(|t| t.dims().to_vec())),
+        };
+        println!("\ncandle on target [2,0,1,-1], allowzero unset (expect [2,3,1,4])\n  zeroneg  {line}");
     }
 
     std::panic::set_hook(previous);
