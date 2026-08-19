@@ -1,0 +1,1 @@
+conv2d: burn-flex returns a finite value or NaN at padded positions for the same convolution, depending on channel count
