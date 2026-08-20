@@ -1,1 +1,0 @@
-max/min on cubecl backends return ±f32::MAX instead of ±inf

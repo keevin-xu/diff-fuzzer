@@ -1,1 +1,0 @@
-Reshape of a zero-size tensor fails to load: float32[3,0] -> [0] with allowzero=1

@@ -1,1 +1,0 @@
-DynamicQuantizeLinear rounds half away from zero; ONNX specifies half to even
