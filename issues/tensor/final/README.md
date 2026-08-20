@@ -31,7 +31,7 @@ Anything still uncertain stays in the parent.
 |---|---|---|
 | `burn-001-*` | `matmul` disagrees when intermediate products overflow `f32` | `../burn-001-matmul-overflow.md` — **FILED** as [#5284](https://github.com/tracel-ai/burn/issues/5284) |
 | `burn-002-*` | `max`/`min` on cubecl backends return `±f32::MAX` instead of `±inf` | `../burn-002-reduce-infinity-sentinel.md` |
-| `burn-003-*` | `conv2d` padded positions become `NaN` on `burn-tch` only, with a non-finite weight | `../burn-003-conv2d-padding-nonfinite.md` |
+| `burn-003-*` | `conv2d` padded positions become `NaN` on `burn-tch` only, with a non-finite weight | `../burn-003-conv2d-padding-nonfinite.md` — **FILED** as [#5385](https://github.com/tracel-ai/burn/issues/5385) |
 
 ## Not here, and why
 

@@ -6,6 +6,22 @@ notes to ourselves. The working drafts in `../` hold all of that.
 The shared convention is `issues/final` as described in `../../tensor/final/README.md`; this
 directory follows it.
 
+## Status, 2026-08-20
+
+| report | issue | PR | outcome |
+|---|---|---|---|
+| `tract-001` `Sign(-0.0)` | [#2670](https://github.com/sonos/tract/issues/2670) | [#2671](https://github.com/sonos/tract/pull/2671) | **merged** |
+| `tract-003` `DynamicQuantizeLinear` rounding | none needed | [#2672](https://github.com/sonos/tract/pull/2672) | **merged** |
+| `candle-001` `Reshape`/`allowzero` | [#3907](https://github.com/huggingface/candle/issues/3907) | [#3908](https://github.com/huggingface/candle/pull/3908) | open |
+| `tract-002` zero-size `Reshape` | — | — | not filed |
+| `tract-004` `Div` overflow panic | — | — | not filed |
+| `onnxruntime-001` `Where` signed zero | — | — | not filed |
+
+**A fix we prompted but did not write.** `tract-001`'s PR carried a comment that
+`q: [i8, u8, i32] => f32::signum` on the same line looked wrong at zero too, explicitly flagged
+as untested. A maintainer fixed it in [#2673](https://github.com/sonos/tract/pull/2673) with a
+quantized test. Asking rather than bundling is what made that a separate, better-tested change.
+
 ## Contents
 
 | Files | Project | Subject | Working draft |
