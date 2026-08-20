@@ -15,9 +15,29 @@ A deliberately faulty backend is kept in the codebase and the test suite fails i
 does not catch it. Without that, "no divergences found" would be indistinguishable from a
 comparison that had quietly stopped working.
 
+### Reported upstream
+
+Across two domains — `burn`'s tensor backends, and four ONNX runtimes compared on single-node
+models — **five reports filed and three fixes merged**.
+
+| report | project | subject | outcome |
+|---|---|---|---|
+| `burn-001` | tracel-ai/burn | `matmul` returns `inf` against `NaN` when products overflow | [#5284](https://github.com/tracel-ai/burn/issues/5284) filed |
+| `burn-003` | tracel-ai/burn | `conv2d` padded positions become `NaN` with a non-finite weight | [#5385](https://github.com/tracel-ai/burn/issues/5385) filed as a question |
+| `tract-001` | sonos/tract | `Sign(-0.0)` returns `-0.0` where ONNX specifies `0` | [#2670](https://github.com/sonos/tract/issues/2670) → [#2671](https://github.com/sonos/tract/pull/2671) **merged** |
+| `tract-003` | sonos/tract | `DynamicQuantizeLinear` rounds ties away from zero | [#2672](https://github.com/sonos/tract/pull/2672) **merged** |
+| `candle-001` | huggingface/candle | `Reshape` ignores `allowzero=1`, and infers `-1` against the wrong volume | [#3907](https://github.com/huggingface/candle/issues/3907) → [#3908](https://github.com/huggingface/candle/pull/3908) open |
+
+**A third fix merged that this project did not write.** The `tract-001` pull request carried a
+comment that the neighbouring quantized `Sign` path looked wrong at zero too — flagged
+explicitly as *untested*, and kept out of the diff. A maintainer fixed exactly that in
+[#2673](https://github.com/sonos/tract/pull/2673), with a quantized regression test. Asking
+rather than bundling an unverified guess is what turned it into a separate, better-tested
+change than either of us would have written alone.
+
 ### What it found
 
-**One issue filed upstream:** [tracel-ai/burn#5284](https://github.com/tracel-ai/burn/issues/5284)
+**The tensor campaign's first report:** [tracel-ai/burn#5284](https://github.com/tracel-ai/burn/issues/5284)
 — `matmul` returns `inf` on one backend and `NaN` on another when intermediate products
 overflow `f32`.
 
