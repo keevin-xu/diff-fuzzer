@@ -5,7 +5,7 @@ A **differential testing + fuzzing framework**, written in **Rust**.
 ### Reported upstream
 
 Across two domains — `burn`'s tensor backends, and four ONNX runtimes compared on single-node
-models — **seven reports filed and five fixes merged**, two of them written by other people in
+models — **eight reports filed and six fixes merged**, two of them written by other people in
 response to the report.
 
 | report | project | subject | outcome |
@@ -14,9 +14,10 @@ response to the report.
 | `burn-003` | tracel-ai/burn | `conv2d` padded positions become `NaN` with a non-finite weight | [#5385](https://github.com/tracel-ai/burn/issues/5385) **fixed**, by another contributor |
 | `tract-001` | sonos/tract | `Sign(-0.0)` returns `-0.0` where ONNX specifies `0` | [#2670](https://github.com/sonos/tract/issues/2670) → [#2671](https://github.com/sonos/tract/pull/2671) **merged** |
 | `tract-003` | sonos/tract | `DynamicQuantizeLinear` rounds ties away from zero | [#2672](https://github.com/sonos/tract/pull/2672) **merged** |
-| `candle-001` | huggingface/candle | `Reshape` ignores `allowzero=1`, and infers `-1` against the wrong volume | [#3907](https://github.com/huggingface/candle/issues/3907) → [#3908](https://github.com/huggingface/candle/pull/3908) open |
+| `candle-001` | huggingface/candle | `Reshape` ignores `allowzero=1`, and infers `-1` against the wrong volume | [#3907](https://github.com/huggingface/candle/issues/3907) → [#3908](https://github.com/huggingface/candle/pull/3908) **merged** |
 | `onnxruntime-001` | microsoft/onnxruntime | `Where` returns `+0.0` for a selected `-0.0`, on both branches | [#32191](https://github.com/microsoft/onnxruntime/issues/32191) → [#32192](https://github.com/microsoft/onnxruntime/pull/32192) open |
 | `tract-002` | sonos/tract | `Reshape` ignores `allowzero`, so a literal zero-length dimension is overwritten | [#2699](https://github.com/sonos/tract/pull/2699) **merged** |
+| `tract-005` | sonos/tract | `Reshape` hangs or panics on a target shape inference cannot resolve | [#2707](https://github.com/sonos/tract/issues/2707) → [#2708](https://github.com/sonos/tract/pull/2708) open |
 
 **Two of the four fixes were written by other people.** `burn-003` was filed as a question,
 labelled `bug` by a maintainer, and closed by someone else's pull request, *Fix non-finite padding
