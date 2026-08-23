@@ -5,7 +5,7 @@ A **differential testing + fuzzing framework**, written in **Rust**.
 ### Reported upstream
 
 Across two domains — `burn`'s tensor backends, and four ONNX runtimes compared on single-node
-models — **six reports filed and four fixes merged**, two of them written by other people in
+models — **seven reports filed and five fixes merged**, two of them written by other people in
 response to the report.
 
 | report | project | subject | outcome |
@@ -16,6 +16,7 @@ response to the report.
 | `tract-003` | sonos/tract | `DynamicQuantizeLinear` rounds ties away from zero | [#2672](https://github.com/sonos/tract/pull/2672) **merged** |
 | `candle-001` | huggingface/candle | `Reshape` ignores `allowzero=1`, and infers `-1` against the wrong volume | [#3907](https://github.com/huggingface/candle/issues/3907) → [#3908](https://github.com/huggingface/candle/pull/3908) open |
 | `onnxruntime-001` | microsoft/onnxruntime | `Where` returns `+0.0` for a selected `-0.0`, on both branches | [#32191](https://github.com/microsoft/onnxruntime/issues/32191) → [#32192](https://github.com/microsoft/onnxruntime/pull/32192) open |
+| `tract-002` | sonos/tract | `Reshape` ignores `allowzero`, so a literal zero-length dimension is overwritten | [#2699](https://github.com/sonos/tract/pull/2699) **merged** |
 
 **Two of the four fixes were written by other people.** `burn-003` was filed as a question,
 labelled `bug` by a maintainer, and closed by someone else's pull request, *Fix non-finite padding
