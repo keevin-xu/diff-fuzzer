@@ -5,7 +5,7 @@ A **differential testing + fuzzing framework**, written in **Rust**.
 ### Reported upstream
 
 Across two domains — `burn`'s tensor backends, and four ONNX runtimes compared on single-node
-models — **eight reports filed and six fixes merged**, two of them written by other people in
+models — **nine reports filed and six fixes merged**, two of them written by other people in
 response to the report.
 
 | report | project | subject | outcome |
@@ -18,6 +18,7 @@ response to the report.
 | `onnxruntime-001` | microsoft/onnxruntime | `Where` returns `+0.0` for a selected `-0.0`, on both branches | [#32191](https://github.com/microsoft/onnxruntime/issues/32191) → [#32192](https://github.com/microsoft/onnxruntime/pull/32192) open |
 | `tract-002` | sonos/tract | `Reshape` ignores `allowzero`, so a literal zero-length dimension is overwritten | [#2699](https://github.com/sonos/tract/pull/2699) **merged** |
 | `tract-005` | sonos/tract | `Reshape` hangs or panics on a target shape inference cannot resolve | [#2707](https://github.com/sonos/tract/issues/2707) → [#2708](https://github.com/sonos/tract/pull/2708) open |
+| `tract-004` | sonos/tract | integer `Div` and `Mod` panic on `MIN / -1`, where `Mul` already wraps | [#2712](https://github.com/sonos/tract/issues/2712) → [#2713](https://github.com/sonos/tract/pull/2713) open |
 
 **Two of the four fixes were written by other people.** `burn-003` was filed as a question,
 labelled `bug` by a maintainer, and closed by someone else's pull request, *Fix non-finite padding
@@ -34,8 +35,5 @@ change than either of us would have written alone.
 
 ## Background Information
 
-- **Language:** Rust, throughout the whole project.
-- **First software type:** deep-learning / tensor libraries.
-- **First oracle:** differential (metamorphic added later — designed for from day one).
-- **Implementations (Route A):** the `burn` framework across three backends — `burn-flex` (pure-Rust CPU), `burn-tch` (libtorch/CPU), and `burn-wgpu` (Metal GPU). Adding the third cost **4 lines of production code and no changes to the engine**. *Replacing* one CPU backend with another later touched 25 files — all of them the adapter, its examples, and the fuzz target, mostly mechanical renames — and **still not one line of the engine**, which is the claim the split exists to support.
-- **Future (documented, not built yet):** metamorphic oracles (autodiff vs. numerical gradient), and a second software type (SQL engines) as a second adapter on the same core.
+- **Language:** Rust
+- **Software types:** tensor libraries (the `burn` framework's `burn-flex`, `burn-tch` and `burn-wgpu` backends), ONNX runtimes (`onnx.reference`, ONNX Runtime, `tract`, `candle-onnx`), and SQL engines (SQLite, DuckDB).
