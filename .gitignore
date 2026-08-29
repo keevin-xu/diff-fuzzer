@@ -65,3 +65,5 @@ fuzz-sql/corpus/
 # from those scripts in one command, so they are artifacts rather than sources.
 repro.onnx
 issues/
+agent_handoff/
+primers/
