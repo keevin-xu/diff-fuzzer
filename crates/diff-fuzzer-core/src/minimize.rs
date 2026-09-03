@@ -5,9 +5,13 @@
 //! with the failure. Nobody can act on that. A maintainer receiving it has to first
 //! work out which part matters, which is work we are better placed to do automatically.
 //!
-//! The technique is **delta debugging**: given a failing input and a predicate that says
-//! whether a candidate still fails, repeatedly try simpler candidates and keep any that
-//! preserve the failure. Repeat until nothing simpler works — a local minimum.
+//! The search is a **greedy first-improvement hill climb** over domain-proposed moves: try
+//! candidates in order, accept the first that still fails, and restart from it. It stops when
+//! no candidate improves, which is a **local** minimum.
+//!
+//! This is the same predicate-guided idea as delta debugging, but not Zeller's `ddmin`: there is
+//! no partition into subsets, no complement testing, no granularity schedule, and therefore no
+//! 1-minimality guarantee. Do not describe the result as minimal, only as locally minimal.
 //!
 //! This module holds the [`Shrink`] capability, which asks a domain "what simpler
 //! versions of this are there?". The search that uses it lives alongside, and the moves
